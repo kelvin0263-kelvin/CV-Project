@@ -9,6 +9,7 @@ import SystemConfiguration from './components/SystemConfiguration';
 import Login from './components/Login';
 import FallDetection from './components/FallDetection';
 import AccountSettings from './components/AccountSettings';
+import VideoUpload from './components/VideoUpload';
 
 function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(() => {
@@ -42,6 +43,7 @@ function App() {
           <Route path="reports" element={<Reporting />} />
           <Route path="settings" element={<SystemConfiguration />} />
           <Route path="account" element={<AccountSettings />} />
+          <Route path="upload" element={<VideoUpload />} />
         </Route>
       </Routes>
     </Router>

@@ -1,15 +1,19 @@
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
 venv/
 .env
+
+# Uploads and Static Video Files
+backend/static/uploads/*
+backend/static/processed/*
+!backend/static/uploads/.gitkeep
+!backend/static/processed/.gitkeep
 
 # Node
 node_modules/
 dist/
-.DS_Store
-.idea/
-.vscode/
 
-# Frontend git (if any remnants)
-frontend/.git
+# IDE
+.vscode/
+.idea/

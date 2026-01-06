@@ -1,20 +1,23 @@
-import React, { useState } from 'react';
-import { Camera, FolderUp, Plus, Edit2, Trash2, Save, X } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Camera, FolderUp, Plus, Edit2, Trash2, Save, X, Loader2 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardContent } from './ui/card';
 import { Button } from './ui/button';
 import { cn } from '../lib/utils';
+import { Checkbox } from './ui/checkbox';
+import { Label } from './ui/label';
+import WebSocketPlayer from './WebSocketPlayer';
 
 const SystemConfiguration = () => {
-    const [cameras, setCameras] = useState([
-        { id: 1, name: 'Camera Source 1', location: 'Main Lobby', type: 'RTSP', status: 'Online', mode: 'People Counting', ip: '192.168.1.101', resolution: '1080p', fps: 30, enabled: true, image: '/1.png' },
-        { id: 2, name: 'Camera Source 2', location: 'Factory Floor A', type: 'RTSP', status: 'Online', mode: 'Dress Code', ip: '192.168.1.102', resolution: '1080p', fps: 24, enabled: true, image: '/2.png' },
-        { id: 3, name: 'Camera Source 3', location: 'Corridor B', type: 'RTSP', status: 'Online', mode: 'Intrusion', ip: '192.168.1.103', resolution: '720p', fps: 15, enabled: true, image: '/3.png' },
-        { id: 4, name: 'Camera Source 4', location: 'Parking Lot', type: 'RTSP', status: 'Online', mode: 'People Counting', ip: '192.168.1.104', resolution: '1080p', fps: 30, enabled: true, image: '/4.png' },
-    ]);
+    const [cameras, setCameras] = useState([]);
     const [isAddMode, setIsAddMode] = useState(false);
     const [isEditMode, setIsEditMode] = useState(false);
     const [selectedCamera, setSelectedCamera] = useState(null);
     const [showUpload, setShowUpload] = useState(false);
+    const [isUploading, setIsUploading] = useState(false);
+
+    // File Upload State
+    const [selectedFile, setSelectedFile] = useState(null);
+    const [enableFisheye, setEnableFisheye] = useState(false);
 
     // Form State
     const [formData, setFormData] = useState({
@@ -26,6 +29,20 @@ const SystemConfiguration = () => {
         resolution: '1080p',
         enabled: true,
     });
+
+    useEffect(() => {
+        fetchCameras();
+    }, []);
+
+    const fetchCameras = async () => {
+        try {
+            const res = await fetch('http://localhost:8000/api/cameras');
+            const data = await res.json();
+            setCameras(data);
+        } catch (error) {
+            console.error("Failed to fetch cameras:", error);
+        }
+    };
 
     const resetForm = () => {
         setFormData({
@@ -41,6 +58,8 @@ const SystemConfiguration = () => {
         setIsEditMode(false);
         setSelectedCamera(null);
         setShowUpload(false);
+        setSelectedFile(null);
+        setEnableFisheye(false);
     };
 
     const handleAddClick = () => {
@@ -72,39 +91,93 @@ const SystemConfiguration = () => {
         setFormData(prev => ({ ...prev, [name]: type === 'checkbox' ? checked : value }));
     };
 
-    const handleSave = (e) => {
+    const handleFileChange = (e) => {
+        if (e.target.files && e.target.files[0]) {
+            setSelectedFile(e.target.files[0]);
+        }
+    };
+
+    const handleSave = async (e) => {
         e.preventDefault();
-        if (!formData.name || !formData.location) {
-            alert("Please fill in required fields.");
+
+        if (showUpload) {
+            if (!selectedFile) return alert("Please select a file");
+
+            setIsUploading(true);
+            const uploadData = new FormData();
+            uploadData.append('file', selectedFile);
+            uploadData.append('enable_fisheye', enableFisheye);
+            uploadData.append('camera_name_prefix', formData.name || 'Uploaded Camera');
+
+            try {
+                const res = await fetch('http://localhost:8000/api/upload_and_process', {
+                    method: 'POST',
+                    body: uploadData
+                });
+                if (!res.ok) throw new Error("Upload failed");
+                const data = await res.json();
+                console.log("Upload success:", data);
+                await fetchCameras(); // Refresh list
+                resetForm();
+            } catch (err) {
+                alert("Error Uploading: " + err.message);
+            } finally {
+                setIsUploading(false);
+            }
             return;
         }
 
-        if (isEditMode && selectedCamera) {
-            setCameras(prev => prev.map(c => c.id === selectedCamera.id ? { ...c, ...formData, ip: formData.rtspUrl, mode: formData.analysisMode, fps: formData.frameRate } : c));
-        } else {
-            const newCam = {
-                id: cameras.length + 1,
-                name: formData.name,
-                location: formData.location,
-                type: showUpload ? 'File' : 'RTSP',
-                status: formData.enabled ? 'Online' : 'Disabled',
-                mode: formData.analysisMode,
-                ip: formData.rtspUrl || 'Uploaded File',
-                resolution: formData.resolution,
-                fps: formData.frameRate,
-                enabled: formData.enabled,
-            };
-            setCameras(prev => [...prev, newCam]);
+        // Standard Add/Edit
+        const payload = {
+            id: selectedCamera ? selectedCamera.id : Date.now().toString(),
+            name: formData.name,
+            location: formData.location,
+            type: 'RTSP',
+            status: formData.enabled ? 'Online' : 'Disabled',
+            mode: formData.analysisMode,
+            ip: formData.rtspUrl,
+            resolution: formData.resolution,
+            fps: parseInt(formData.frameRate),
+            enabled: formData.enabled,
+            image: '/placeholder.png'
+        };
+
+        try {
+            if (isEditMode) {
+                // For MVP: Delete old and add new as 'update' logic is simple on backend
+                await fetch(`http://localhost:8000/api/cameras/${selectedCamera.id}`, { method: 'DELETE' });
+                await fetch('http://localhost:8000/api/cameras', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+            } else {
+                await fetch('http://localhost:8000/api/cameras', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+            }
+            await fetchCameras();
+            resetForm();
+        } catch (error) {
+            console.error("Save error:", error);
+            alert("Failed to save camera");
         }
-        resetForm();
     };
 
-    const handleDelete = (id) => {
-        if (window.confirm("Are you sure you want to remove this camera?")) {
-            setCameras(prev => prev.filter(c => c.id !== id));
+    const handleDelete = async (id) => {
+        if (window.confirm("Are you sure you want to remove this camera Source? This will remove it from the dashboard.")) {
+            try {
+                await fetch(`http://localhost:8000/api/cameras/${id}`, { method: 'DELETE' });
+                await fetchCameras();
+            } catch (e) {
+                alert("Failed to delete");
+            }
         }
     };
 
+    // ... existing test connection ...
     const handleTestConnection = () => {
         if (!formData.rtspUrl) {
             alert("Please enter a RTSP URL.");
@@ -119,6 +192,7 @@ const SystemConfiguration = () => {
         }
     };
 
+
     return (
         <div className="flex flex-col h-full bg-background text-foreground">
             <div className="flex items-center justify-between mb-6">
@@ -130,10 +204,10 @@ const SystemConfiguration = () => {
                 <div className="flex items-center justify-between mb-4">
                     <div className="flex gap-2">
                         <Button onClick={handleAddClick} className="flex items-center gap-2">
-                            <Plus className="w-4 h-4" /> Add Camera
+                            <Plus className="w-4 h-4" /> Add RTSP Camera
                         </Button>
                         <Button variant="outline" onClick={handleUploadClick} className="flex items-center gap-2">
-                            <FolderUp className="w-4 h-4" /> Upload Video
+                            <FolderUp className="w-4 h-4" /> Upload Video Source
                         </Button>
                     </div>
                     <div className="text-sm text-muted-foreground">
@@ -147,27 +221,34 @@ const SystemConfiguration = () => {
                         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
                             {cameras.map((cam) => (
                                 <Card key={cam.id} className={cn("relative group overflow-hidden hover:border-primary/50 transition-all cursor-pointer border-muted", !cam.enabled && "opacity-60")}>
-                                    <div className="aspect-video bg-muted relative flex items-center justify-center">
-                                        {/* Placeholder for camera preview */}
-                                        <img src={cam.image} alt={cam.name} className="w-full h-full object-cover opacity-80" />
+                                    <div className="aspect-video bg-muted relative flex items-center justify-center bg-black">
+                                        {cam.type.includes('File') || cam.type.includes('Fisheye') ? (
+                                            <WebSocketPlayer
+                                                wsUrl={cam.ws_url}
+                                                className="w-full h-full"
+                                                alt="Live Stream"
+                                            />
+                                        ) : (
+                                            <div className="flex flex-col items-center">
+                                                <Camera className="w-8 h-8 text-muted-foreground mb-2" />
+                                                <span className="text-xs text-muted-foreground">RTSP Stream</span>
+                                            </div>
+                                        )}
+
                                         <div className="absolute top-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                                            <Button size="icon" variant="secondary" className="h-8 w-8" onClick={() => handleEditClick(cam)}>
-                                                <Edit2 className="w-4 h-4" />
-                                            </Button>
                                             <Button size="icon" variant="destructive" className="h-8 w-8" onClick={() => handleDelete(cam.id)}>
                                                 <Trash2 className="w-4 h-4" />
                                             </Button>
                                         </div>
-                                        <div className={cn("absolute top-2 left-2 px-2 py-0.5 rounded text-xs font-medium", cam.enabled ? (cam.status === 'Online' ? "bg-green-500/20 text-green-500" : "bg-red-500/20 text-red-500") : "bg-gray-500/20 text-gray-500")}>
-                                            {cam.enabled ? cam.status : 'Disabled'}
+                                        <div className={cn("absolute top-2 left-2 px-2 py-0.5 rounded text-xs font-medium", cam.enabled ? "bg-green-500/20 text-green-500" : "bg-red-500/20 text-red-500")}>
+                                            {cam.type}
                                         </div>
                                     </div>
                                     <CardContent className="p-4">
-                                        <h3 className="font-semibold text-lg truncate">{cam.name}</h3>
+                                        <h3 className="font-semibold text-lg truncate" title={cam.name}>{cam.name}</h3>
                                         <p className="text-sm text-muted-foreground truncate">{cam.location}</p>
                                         <div className="mt-3 flex flex-wrap gap-2">
                                             <span className="text-xs px-2 py-1 bg-secondary rounded-full">{cam.mode}</span>
-                                            <span className="text-xs px-2 py-1 bg-secondary rounded-full">{cam.resolution}</span>
                                         </div>
                                     </CardContent>
                                 </Card>
@@ -175,12 +256,12 @@ const SystemConfiguration = () => {
                         </div>
                     )}
 
-                    {/* Edit/Add Form Overlay */}
+                    {/* Edit/Add/Upload Form Overlay */}
                     {(isAddMode || isEditMode || showUpload) && (
                         <Card className="max-w-2xl mx-auto">
                             <CardHeader className="flex flex-row items-center justify-between">
                                 <CardTitle>
-                                    {showUpload ? "Upload Video Source" : (isEditMode ? "Modify Camera Source" : "Add Camera Source")}
+                                    {showUpload ? "Upload Video Source" : (isEditMode ? "Modify Camera Source" : "Add RTSP Camera")}
                                 </CardTitle>
                                 <Button variant="ghost" size="icon" onClick={resetForm}>
                                     <X className="w-4 h-4" />
@@ -188,51 +269,77 @@ const SystemConfiguration = () => {
                             </CardHeader>
                             <CardContent>
                                 <form onSubmit={handleSave} className="space-y-4">
-                                    {showUpload && (
-                                        <div className="p-8 border-2 border-dashed rounded-lg flex flex-col items-center justify-center bg-muted/20 hover:bg-muted/40 transition-colors cursor-pointer">
-                                            <FolderUp className="w-12 h-12 text-muted-foreground mb-2" />
-                                            <p className="text-sm text-muted-foreground">Click or Drag to Upload Video File</p>
-                                            <input type="file" className="hidden" />
-                                        </div>
-                                    )}
 
+                                    {/* Basic Info needed for both */}
                                     <div className="grid grid-cols-2 gap-4">
                                         <div className="space-y-2">
-                                            <label className="text-sm font-medium">Camera Name</label>
+                                            <Label>Camera Name / Prefix</Label>
                                             <input
                                                 type="text"
                                                 name="name"
                                                 value={formData.name}
                                                 onChange={handleInputChange}
-                                                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-                                                placeholder="e.g. Front Entrance"
-                                                required
+                                                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                                placeholder={showUpload ? "e.g. Fisheye Cam 01" : "e.g. Front Entrance"}
+                                                required={!showUpload}
                                             />
                                         </div>
                                         <div className="space-y-2">
-                                            <label className="text-sm font-medium">Location</label>
+                                            <Label>Location</Label>
                                             <input
                                                 type="text"
                                                 name="location"
                                                 value={formData.location}
                                                 onChange={handleInputChange}
-                                                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                                                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                                                 placeholder="e.g. Building A"
-                                                required
                                             />
                                         </div>
                                     </div>
 
-                                    {!showUpload && (
+                                    {showUpload ? (
+                                        // Upload Specific UI
+                                        <div className="space-y-4 border rounded-lg p-4 bg-muted/30">
+                                            <div className="flex flex-col items-center justify-center p-6 border-2 border-dashed rounded-lg cursor-pointer hover:bg-muted/50 transition-colors relative">
+                                                <input
+                                                    type="file"
+                                                    className="absolute inset-0 opacity-0 cursor-pointer"
+                                                    onChange={handleFileChange}
+                                                    accept="video/*"
+                                                />
+                                                <FolderUp className="w-10 h-10 text-muted-foreground mb-2" />
+                                                <p className="text-sm font-medium">
+                                                    {selectedFile ? selectedFile.name : "Click to Select Video File"}
+                                                </p>
+                                            </div>
+
+                                            <div className="flex items-center space-x-2">
+                                                <Checkbox
+                                                    id="fisheye"
+                                                    checked={enableFisheye}
+                                                    onCheckedChange={setEnableFisheye}
+                                                />
+                                                <Label htmlFor="fisheye">Enable Fisheye Processing (Generates 8 Views)</Label>
+                                            </div>
+
+                                            {enableFisheye && (
+                                                <p className="text-xs text-muted-foreground">
+                                                    Note: Processing 8 views for a large video may take some time.
+                                                    This demo limits processing to the first 10 seconds.
+                                                </p>
+                                            )}
+                                        </div>
+                                    ) : (
+                                        // RTSP Specific UI
                                         <div className="space-y-2">
-                                            <label className="text-sm font-medium">RTSP URL</label>
+                                            <Label>RTSP URL</Label>
                                             <div className="flex gap-2">
                                                 <input
                                                     type="text"
                                                     name="rtspUrl"
                                                     value={formData.rtspUrl}
                                                     onChange={handleInputChange}
-                                                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                                                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                                                     placeholder="rtsp://admin:password@192.168.1.1:554/stream"
                                                 />
                                                 <Button type="button" variant="secondary" onClick={handleTestConnection}>Test</Button>
@@ -240,71 +347,37 @@ const SystemConfiguration = () => {
                                         </div>
                                     )}
 
+                                    {/* Common Settings */}
                                     <div className="grid grid-cols-2 gap-4">
                                         <div className="space-y-2">
-                                            <label className="text-sm font-medium">Analysis Mode</label>
+                                            <Label>Analysis Mode</Label>
                                             <select
                                                 name="analysisMode"
                                                 value={formData.analysisMode}
                                                 onChange={handleInputChange}
-                                                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                                                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                                             >
                                                 <option>People Counting</option>
                                                 <option>Dress Code</option>
                                                 <option>Fall Detection</option>
                                             </select>
                                         </div>
-                                        <div className="space-y-2">
-                                            <label className="text-sm font-medium">Frame Rate</label>
-                                            <select
-                                                name="frameRate"
-                                                value={formData.frameRate}
-                                                onChange={handleInputChange}
-                                                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-                                            >
-                                                <option>15</option>
-                                                <option>24</option>
-                                                <option>30</option>
-                                                <option>60</option>
-                                            </select>
-                                        </div>
-                                        <div className="space-y-2">
-                                            <label className="text-sm font-medium">Resolution</label>
-                                            <select
-                                                name="resolution"
-                                                value={formData.resolution}
-                                                onChange={handleInputChange}
-                                                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-                                            >
-                                                <option>720p</option>
-                                                <option>1080p</option>
-                                                <option>1440p</option>
-                                                <option>4K</option>
-                                            </select>
-                                        </div>
                                     </div>
 
-                                    <div className="flex items-center space-x-2">
-                                        <input
-                                            type="checkbox"
-                                            id="enabled"
-                                            name="enabled"
-                                            checked={formData.enabled}
-                                            onChange={handleInputChange}
-                                            className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary"
-                                        />
-                                        <label
-                                            htmlFor="enabled"
-                                            className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
-                                        >
-                                            Camera Enabled
-                                        </label>
-                                    </div>
-
+                                    {/* Footer Actions */}
                                     <div className="flex justify-end gap-2 pt-4">
-                                        <Button type="button" variant="ghost" onClick={resetForm}>Cancel</Button>
-                                        <Button type="submit">
-                                            <Save className="w-4 h-4 mr-2" /> Save Configuration
+                                        <Button type="button" variant="ghost" onClick={resetForm} disabled={isUploading}>Cancel</Button>
+                                        <Button type="submit" disabled={isUploading}>
+                                            {isUploading ? (
+                                                <>
+                                                    <Loader2 className="w-4 h-4 mr-2 animate-spin" /> Processing...
+                                                </>
+                                            ) : (
+                                                <>
+                                                    <Save className="w-4 h-4 mr-2" />
+                                                    {showUpload ? "Upload & Create Sources" : "Save Configuration"}
+                                                </>
+                                            )}
                                         </Button>
                                     </div>
                                 </form>

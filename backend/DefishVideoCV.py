@@ -103,29 +103,38 @@ class FisheyeMultiView:
         
         return padded_img
 
-    def process_frame(self, frame, overlay):
+    def process_frame(self, frame, overlay, view_id=None):
         """
-        Processes a single raw fisheye frame and returns all configured views.
-
+        Processes a single raw fisheye frame and returns configured views.
         Args:
             frame (np.ndarray): The raw fisheye video frame.
-
-        Returns:
-            dict: A dictionary where keys are view IDs (e.g., 'original', 'partition_0')
-                  and values are the corresponding processed image frames.
+            view_id (str, optional): If set (e.g., 'partition_0'), only process this view.
         """
         processed_frames = {}
         processed_masks = {}
         processed_motion_flag = {}
+        
+        # Always return original if specifically requested or no view_id (backward compat)
+        if view_id is None or view_id == 'original':
+             processed_frames['original'] = frame.copy()
 
         # --- Crop the frame to the center square ---
         side_length = self.cropped_frame_shape[0]
+        # Safety check for crop
+        if frame.shape[1] < self.crop_offset + side_length:
+             # If frame is smaller than expected, just use center crop
+             self.crop_offset = (frame.shape[1] - side_length) // 2
+        
         cropped_frame = frame[:, self.crop_offset:self.crop_offset + side_length]
 
         # print(f"Processing fisheye frame of shape {frame.shape} into {len(self.dewarp_maps)} views...")
 
         # --- Generate each dewarped partition ---
         for i, dewarp_map in enumerate(self.dewarp_maps):
+            current_key = f"partition_{i}"
+            if view_id is not None and view_id != 'original' and view_id != current_key:
+                continue
+
             if dewarp_map is not None:
                 map_x, map_y = dewarp_map
                 planar_view = cv2.remap(
@@ -133,7 +142,9 @@ class FisheyeMultiView:
                     interpolation=cv2.INTER_LINEAR,
                     borderMode=cv2.BORDER_CONSTANT
                 )
-
+                
+                # ROTATE 180 degrees (Correct for ceiling mount)
+                planar_view = cv2.rotate(planar_view, cv2.ROTATE_180)
 
                 motion_mask = None
                 # --- Handle motion detection if enabled ---

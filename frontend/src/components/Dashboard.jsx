@@ -1,22 +1,8 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { Card, CardContent } from './ui/card';
 import { Button } from './ui/button';
 import { HardDrive, Circle, ChevronRight, LayoutGrid, Users, Shirt, AlertTriangle, ShieldCheck, Maximize2, Minimize2 } from 'lucide-react';
-
-// Mock Data
-const CAMERAS = Array.from({ length: 12 }, (_, i) => ({
-    id: i + 1,
-    name: `Camera Source ${i + 1}`,
-    people: i === 0 ? 3 : 0,
-    status: 'Active',
-    image: [
-        '/1.png',
-        '/2.png',
-        '/3.png',
-        '/4.png'
-    ][i % 4],
-    alerts: Math.random() > 0.8 ? 1 : 0
-}));
+import WebSocketPlayer from './WebSocketPlayer';
 
 const RECENT_DETECTIONS = [
     { id: 1, type: 'Dress Code', time: '10:42 AM', camera: 'Factory Floor A', image: '/factory.png', person: 'Unknown' },
@@ -24,44 +10,74 @@ const RECENT_DETECTIONS = [
     { id: 3, type: 'Person', time: '10:39 AM', camera: 'Corridor B', image: '/hallway.png', person: 'Visitor' },
 ];
 
-const CameraFeedCard = ({ camera }) => (
-    <div className="relative group overflow-hidden bg-black rounded-sm border border-border/50 h-full w-full">
-        {/* Placeholder Image */}
-        <div className="absolute inset-0 bg-muted/20 flex items-center justify-center text-muted-foreground">
-            <img src={camera.image} className="w-full h-full object-cover opacity-80" alt={camera.name} />
-            <span className="absolute hidden">Live Feed</span>
-        </div>
+const CameraFeedCard = ({ camera }) => {
+    const [stats, setStats] = useState({ fps: 0 });
 
-        {/* Simulated Overlays */}
-        <div className="absolute inset-0 p-4 pointer-events-none">
-            {/* Top Bar: Camera Info */}
-            <div className="flex justify-between items-start">
-                <div className="bg-black/60 text-white text-xs px-2 py-1 rounded backdrop-blur-sm flex items-center gap-2">
-                    <Circle className="w-2 h-2 fill-green-500 text-green-500 animate-pulse" />
-                    {camera.name}
+    return (
+        <div className="relative group overflow-hidden bg-black rounded-sm border border-border/50 h-full w-full flex items-center justify-center">
+            {/* Live Feed or Image */}
+            {camera.type.includes("File") || camera.type.includes("Fisheye") ? (
+                <WebSocketPlayer
+                    wsUrl={camera.ws_url}
+                    className="w-full h-full"
+                    alt={camera.name}
+                    onStats={setStats}
+                />
+            ) : (
+                <div className="absolute inset-0 bg-muted/20 flex items-center justify-center text-muted-foreground">
+                    <img src={camera.image} className="w-full h-full object-cover opacity-80" alt={camera.name} onError={(e) => { e.target.style.display = 'none' }} />
+                    <span className="absolute">RTSP Feed Placeholder</span>
                 </div>
-                <div className="flex gap-2">
-                    <div className="bg-black/60 text-white text-xs px-2 py-1 rounded backdrop-blur-sm flex items-center gap-1">
-                        <Users className="w-3 h-3" />
-                        {camera.people}
+            )}
+
+
+            {/* Simulated Overlays */}
+            <div className="absolute inset-0 p-4 pointer-events-none">
+                {/* Top Bar: Camera Info */}
+                <div className="flex justify-between items-start">
+                    <div className="bg-black/60 text-white text-xs px-2 py-1 rounded backdrop-blur-sm flex items-center gap-2">
+                        <Circle className="w-2 h-2 fill-green-500 text-green-500 animate-pulse" />
+                        {camera.name}
+                    </div>
+                    <div className="flex gap-2">
+                        <div className="bg-black/60 text-white text-xs px-2 py-1 rounded backdrop-blur-sm flex items-center gap-1">
+                            <Users className="w-3 h-3" />
+                            {stats.fps > 0 ? stats.fps : camera.fps} FPS
+                        </div>
                     </div>
                 </div>
             </div>
         </div>
-    </div>
-);
+    );
+};
 
 const Dashboard = () => {
+    const [cameras, setCameras] = useState([]);
     const [isFullscreen, setIsFullscreen] = useState(false);
-    const [layout, setLayout] = useState(4); // 1, 4, 9
+    const [layout, setLayout] = useState(9); // Default to 9 for multiscreen view
     const [page, setPage] = useState(0);
     const containerRef = useRef(null);
 
-    const totalCameras = CAMERAS.length;
-    const totalPages = Math.ceil(totalCameras / layout);
+    useEffect(() => {
+        fetchCameras();
+    }, []);
+
+    const fetchCameras = async () => {
+        try {
+            const res = await fetch('http://localhost:8000/api/cameras');
+            const data = await res.json();
+            // Filter only enabled cameras
+            setCameras(data.filter(c => c.enabled));
+        } catch (error) {
+            console.error("Failed to fetch cameras:", error);
+        }
+    };
+
+    const totalCameras = cameras.length;
+    const totalPages = Math.ceil(totalCameras / layout) || 1;
 
     const startIndex = page * layout;
-    const displayedCameras = CAMERAS.slice(startIndex, startIndex + layout);
+    const displayedCameras = cameras.slice(startIndex, startIndex + layout);
 
     const toggleFullscreen = () => {
         if (!document.fullscreenElement) {
@@ -124,8 +140,8 @@ const Dashboard = () => {
 
             {/* Main Grid */}
             <div className={`flex-1 grid auto-rows-fr gap-1 bg-background h-full ${layout === 1 ? 'grid-cols-1' :
-                    layout === 4 ? 'grid-cols-2' :
-                        'grid-cols-3'
+                layout === 4 ? 'grid-cols-2' :
+                    'grid-cols-3'
                 }`}>
                 {displayedCameras.map(cam => (
                     <CameraFeedCard key={cam.id} camera={cam} />
