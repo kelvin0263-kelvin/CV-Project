@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 const WebSocketPlayer = ({ wsUrl, className, alt, onStats }) => {
     const imgRef = useRef(null);
