@@ -120,7 +120,8 @@ def process_video(video_path, output_base_dir):
                 
                 # Save Full Body
                 fname = f"frame_{frame_idx}_p{i}.jpg"
-                cv2.imwrite(os.path.join(dirs['full_body'], fname), person_img)
+                if person_img is not None and person_img.size > 0:
+                    cv2.imwrite(os.path.join(dirs['full_body'], fname), person_img)
                 
                 # Check Keypoints for parts (COCO format: 17 points)
                 # 5,6: Shoulders | 11,12: Hips | 13,14: Knees | 15,16: Ankles
@@ -149,20 +150,23 @@ def process_video(video_path, output_base_dir):
                     if hip_y > py1:
                         upper_bbox = (px1, py1, px2, int(hip_y))
                         upper_img, _ = crop_with_padding(target_view, upper_bbox, 0)
-                        cv2.imwrite(os.path.join(dirs['upper_body'], fname), upper_img)
+                        if upper_img is not None and upper_img.size > 0:
+                            cv2.imwrite(os.path.join(dirs['upper_body'], fname), upper_img)
                     
                     # Lower Body (Thighs/shorts): Hip -> Knee
                     if hip_y < py2 and knee_y > hip_y:
                         lower_bbox = (px1, int(hip_y), px2, int(knee_y))
                         lower_img, _ = crop_with_padding(target_view, lower_bbox, 0)
-                        cv2.imwrite(os.path.join(dirs['lower_body'], fname), lower_img)
+                        if lower_img is not None and lower_img.size > 0:
+                            cv2.imwrite(os.path.join(dirs['lower_body'], fname), lower_img)
                     
                     # Legs (Knees -> Feet): Knee -> Box Bottom
                     if knee_y < py2:
                          legs_bbox = (px1, int(knee_y), px2, py2)
                          # Often allow 'legs' to be wider? No, keep box width.
                          legs_img, _ = crop_with_padding(target_view, legs_bbox, 0)
-                         cv2.imwrite(os.path.join(dirs['legs'], fname), legs_img)
+                         if legs_img is not None and legs_img.size > 0:
+                             cv2.imwrite(os.path.join(dirs['legs'], fname), legs_img)
 
                 saved_count += 1
 

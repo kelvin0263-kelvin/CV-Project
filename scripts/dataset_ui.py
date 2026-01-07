@@ -6,6 +6,10 @@ import tempfile
 import time
 import sys
 
+# Streamlit defaults to 200MB upload limit. To increase, use:
+# streamlit run scripts/dataset_ui.py --server.maxUploadSize 1024
+
+
 # Add current directory to path to import local modules
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
