@@ -13,7 +13,8 @@ from app.core.globals import FRAME_BUFFERS, ACTIVE_PRODUCERS
 from ultralytics import YOLO
 
 # Initialize YOLO Model
-    print("[System] Loading YOLOv11-Pose Model...")
+print("[System] Loading YOLOv11-Pose Model...")
+try:
     model = YOLO("yolo11m-pose.pt")  # Ensure yolo11m-pose.pt is downloaded
 except Exception as e:
     print(f"[System] Warning: Failed to load YOLO model: {e}")
