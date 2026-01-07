@@ -79,18 +79,17 @@ def video_producer(source_path: str, is_fisheye: bool):
             fps_frame_count = 0
             fps_start_time = time.time()
         
-        # --- Helper: Run Detection ---
+        # --- Helper: Run Detection (Person Only, Conf > 0.5) ---
         def run_yolo(img):
             if model is None:
                 return img
             try:
-                # Run inference on the image
-                results = model(img, verbose=False)
-                # Plot results (draw boxes)
+                # Run inference: classes=0 (person), conf=0.5
+                results = model(img, classes=[0], conf=0.5, verbose=False)
+                # Plot results
                 annotated_frame = results[0].plot()
                 return annotated_frame
             except Exception as e:
-                # print(f"YOLO Error: {e}")
                 return img
 
         # --- Process ---
@@ -105,11 +104,20 @@ def video_producer(source_path: str, is_fisheye: bool):
                 
                 # Encode all to Base64
                 for key, img in processed_frames.items():
-                    # Apply YOLO detection
-                    img_detected = run_yolo(img)
+                    # Logic: Only apply YOLO on specific views
+                    # key format is crucial. Assuming 'partition_3' is 135deg and 'partition_7' is 315deg
+                    # Based on view_configs order:
+                    # 0: 0deg, 1: 45deg, 2: 90deg, 3: 135deg, 4: 180deg, 5: 225deg, 6: 270deg, 7: 315deg
+                    
+                    target_views = ['partition_3', 'partition_7'] # 135 and 315
+                    
+                    if key in target_views:
+                         img_2_process = run_yolo(img)
+                    else:
+                         img_2_process = img
 
                     # Resize for web optimization
-                    img_small = cv2.resize(img_detected, (640, 360))
+                    img_small = cv2.resize(img_2_process, (640, 360))
                     _, buffer = cv2.imencode('.jpg', img_small, [cv2.IMWRITE_JPEG_QUALITY, 40])
                     current_buffer[key] = base64.b64encode(buffer).decode('utf-8')
                     
