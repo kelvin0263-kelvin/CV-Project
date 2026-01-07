@@ -110,7 +110,8 @@ def process_video(video_path, output_base_dir):
 
         # 2. Run YOLO Pose Detection
         # Using yolov8m-pose + imgsz=1280
-        results = model(target_view, verbose=False, classes=[0], conf=0.5, imgsz=1280)
+        # Ensure device='0' is used to leverage GPU
+        results = model(target_view, verbose=False, classes=[0], conf=0.5, imgsz=1280, device='0')
 
         for r in results:
             boxes = r.boxes.xyxy.cpu().numpy()

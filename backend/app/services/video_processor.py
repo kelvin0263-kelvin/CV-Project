@@ -85,7 +85,9 @@ def video_producer(source_path: str, is_fisheye: bool):
                 return img
             try:
                 # Run inference: classes=0 (person), conf=0.5
-                results = model(img, classes=[0], conf=0.5, verbose=False)
+                # Run inference: classes=0 (person), conf=0.5
+                # Ensure device='0' is used to leverage GPU
+                results = model(img, classes=[0], conf=0.5, verbose=False, device='0')
                 # Plot results
                 annotated_frame = results[0].plot()
                 return annotated_frame
