@@ -17,3 +17,7 @@ dist/
 # IDE
 .vscode/
 .idea/
+
+# Training Data Output (Do not commit large datasets)
+training_data/
+*_data/
