@@ -121,8 +121,10 @@ async def upload_video(
 
         if enable_fisheye:
             new_cameras.append(create_cam("Original", -1))
-            for i in range(8):
-                new_cameras.append(create_cam(f"View {i+1}", i))
+            # Define angles corresponding to the 8 views
+            angles = [0, 45, 90, 135, 180, 225, 270, 315]
+            for i, angle in enumerate(angles):
+                new_cameras.append(create_cam(f"View {i+1} ({angle}°)", i))
         else:
              new_cameras.append(create_cam("", -1))
              
