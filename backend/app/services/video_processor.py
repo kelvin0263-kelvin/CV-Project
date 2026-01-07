@@ -10,6 +10,15 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from DefishVideoCV import FisheyeMultiView
 from app.core.globals import FRAME_BUFFERS, ACTIVE_PRODUCERS
+from ultralytics import YOLO
+
+# Initialize YOLO Model
+print("[System] Loading YOLO Model...")
+try:
+    model = YOLO("yolov8n.pt")  # Ensure yolov8n.pt is in backend root
+except Exception as e:
+    print(f"[System] Warning: Failed to load YOLO model: {e}")
+    model = None
 
 def start_producer_thread(source_path: str, is_fisheye: bool):
     if source_path in ACTIVE_PRODUCERS:
@@ -70,6 +79,20 @@ def video_producer(source_path: str, is_fisheye: bool):
             fps_frame_count = 0
             fps_start_time = time.time()
         
+        # --- Helper: Run Detection ---
+        def run_yolo(img):
+            if model is None:
+                return img
+            try:
+                # Run inference on the image
+                results = model(img, verbose=False)
+                # Plot results (draw boxes)
+                annotated_frame = results[0].plot()
+                return annotated_frame
+            except Exception as e:
+                # print(f"YOLO Error: {e}")
+                return img
+
         # --- Process ---
         current_buffer = {}
         # Store FPS in the buffer metadata
@@ -82,8 +105,11 @@ def video_producer(source_path: str, is_fisheye: bool):
                 
                 # Encode all to Base64
                 for key, img in processed_frames.items():
+                    # Apply YOLO detection
+                    img_detected = run_yolo(img)
+
                     # Resize for web optimization
-                    img_small = cv2.resize(img, (640, 360))
+                    img_small = cv2.resize(img_detected, (640, 360))
                     _, buffer = cv2.imencode('.jpg', img_small, [cv2.IMWRITE_JPEG_QUALITY, 40])
                     current_buffer[key] = base64.b64encode(buffer).decode('utf-8')
                     
@@ -92,7 +118,10 @@ def video_producer(source_path: str, is_fisheye: bool):
         else:
              # Normal video processing
              try:
-                 img_small = cv2.resize(frame, (640, 360))
+                 # Apply YOLO detection
+                 frame_detected = run_yolo(frame)
+                 
+                 img_small = cv2.resize(frame_detected, (640, 360))
                  _, buffer = cv2.imencode('.jpg', img_small, [cv2.IMWRITE_JPEG_QUALITY, 40])
                  current_buffer['original'] = base64.b64encode(buffer).decode('utf-8')
              except Exception as e:
