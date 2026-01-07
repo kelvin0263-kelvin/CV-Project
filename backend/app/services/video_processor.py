@@ -13,9 +13,8 @@ from app.core.globals import FRAME_BUFFERS, ACTIVE_PRODUCERS
 from ultralytics import YOLO
 
 # Initialize YOLO Model
-print("[System] Loading YOLO Model...")
-try:
-    model = YOLO("yolov8n.pt")  # Ensure yolov8n.pt is in backend root
+    print("[System] Loading YOLOv11-Pose Model...")
+    model = YOLO("yolo11m-pose.pt")  # Ensure yolo11m-pose.pt is downloaded
 except Exception as e:
     print(f"[System] Warning: Failed to load YOLO model: {e}")
     model = None
@@ -111,12 +110,10 @@ def video_producer(source_path: str, is_fisheye: bool):
                     # Based on view_configs order:
                     # 0: 0deg, 1: 45deg, 2: 90deg, 3: 135deg, 4: 180deg, 5: 225deg, 6: 270deg, 7: 315deg
                     
-                    target_views = ['partition_3', 'partition_7'] # 135 and 315
+                    target_views = ['partition_3'] # Only 135 degree
                     
                     if key in target_views:
-                         # Temporarily disable YOLO to fix FPS
-                         # img_2_process = run_yolo(img)
-                         img_2_process = img
+                         img_2_process = run_yolo(img)
                     else:
                          img_2_process = img
 
