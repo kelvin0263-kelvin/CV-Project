@@ -6,7 +6,7 @@ import { cn } from '../lib/utils';
 import { Checkbox } from './ui/checkbox';
 import { Label } from './ui/label';
 import WebSocketPlayer from './WebSocketPlayer';
-import API_BASE_URL, { getWSUrl } from '../config';
+import API_BASE_URL from '../config';
 
 const SystemConfiguration = () => {
     const [cameras, setCameras] = useState([]);
