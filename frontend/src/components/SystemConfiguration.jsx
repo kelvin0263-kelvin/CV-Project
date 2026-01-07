@@ -6,7 +6,7 @@ import { cn } from '../lib/utils';
 import { Checkbox } from './ui/checkbox';
 import { Label } from './ui/label';
 import WebSocketPlayer from './WebSocketPlayer';
-import API_BASE_URL from '../config';
+import { getApiBaseUrl } from '../config';
 
 const SystemConfiguration = () => {
     const [cameras, setCameras] = useState([]);
@@ -37,7 +37,9 @@ const SystemConfiguration = () => {
 
     const fetchCameras = async () => {
         try {
-            const res = await fetch(`${API_BASE_URL}/api/cameras`);
+            const apiUrl = getApiBaseUrl();
+            console.log("SystemConfig fetching from:", apiUrl);
+            const res = await fetch(`${apiUrl}/api/cameras`);
             const data = await res.json();
             setCameras(data);
         } catch (error) {
@@ -111,7 +113,8 @@ const SystemConfiguration = () => {
             uploadData.append('camera_name_prefix', formData.name || 'Uploaded Camera');
 
             try {
-                const res = await fetch(`${API_BASE_URL}/api/upload_and_process`, {
+                const apiUrl = getApiBaseUrl();
+                const res = await fetch(`${apiUrl}/api/upload_and_process`, {
                     method: 'POST',
                     body: uploadData
                 });
@@ -146,14 +149,16 @@ const SystemConfiguration = () => {
         try {
             if (isEditMode) {
                 // For MVP: Delete old and add new as 'update' logic is simple on backend
-                await fetch(`${API_BASE_URL}/api/cameras/${selectedCamera.id}`, { method: 'DELETE' });
-                await fetch(`${API_BASE_URL}/api/cameras`, {
+                const apiUrl = getApiBaseUrl();
+                await fetch(`${apiUrl}/api/cameras/${selectedCamera.id}`, { method: 'DELETE' });
+                await fetch(`${apiUrl}/api/cameras`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
                 });
             } else {
-                await fetch(`${API_BASE_URL}/api/cameras`, {
+                const apiUrl = getApiBaseUrl();
+                await fetch(`${apiUrl}/api/cameras`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
@@ -170,7 +175,8 @@ const SystemConfiguration = () => {
     const handleDelete = async (id) => {
         if (window.confirm("Are you sure you want to remove this camera Source? This will remove it from the dashboard.")) {
             try {
-                await fetch(`${API_BASE_URL}/api/cameras/${id}`, { method: 'DELETE' });
+                const apiUrl = getApiBaseUrl();
+                await fetch(`${apiUrl}/api/cameras/${id}`, { method: 'DELETE' });
                 await fetchCameras();
             } catch (e) {
                 alert("Failed to delete");

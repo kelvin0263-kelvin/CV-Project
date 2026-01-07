@@ -1,7 +1,7 @@
 
 import React, { useState } from 'react';
 import { Upload, FileVideo, CheckCircle2, AlertCircle, Loader2 } from 'lucide-react';
-import API_BASE_URL from '@/config';
+import { getApiBaseUrl } from '@/config';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle, CardFooter } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
@@ -39,7 +39,9 @@ const VideoUpload = () => {
         formData.append('enable_fisheye', enableFisheye);
 
         try {
-            const response = await fetch(`${API_BASE_URL}/api/upload`, {
+            const apiUrl = getApiBaseUrl();
+            console.log("VideoUpload fetching from:", apiUrl);
+            const response = await fetch(`${apiUrl}/api/upload`, {
                 method: 'POST',
                 body: formData,
             });

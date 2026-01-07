@@ -3,7 +3,7 @@ import { Card, CardContent } from './ui/card';
 import { Button } from './ui/button';
 import { HardDrive, Circle, ChevronRight, LayoutGrid, Users, Shirt, AlertTriangle, ShieldCheck, Maximize2, Minimize2 } from 'lucide-react';
 import WebSocketPlayer from './WebSocketPlayer';
-import API_BASE_URL, { getWSUrl } from '../config';
+import { getApiBaseUrl, getWSUrl } from '../config';
 
 const RECENT_DETECTIONS = [
     { id: 1, type: 'Dress Code', time: '10:42 AM', camera: 'Factory Floor A', image: '/factory.png', person: 'Unknown' },
@@ -66,7 +66,9 @@ const Dashboard = () => {
 
     const fetchCameras = async () => {
         try {
-            const res = await fetch(`${API_BASE_URL}/api/cameras`);
+            const apiUrl = getApiBaseUrl();
+            console.log("Dashboard fetching from:", apiUrl);
+            const res = await fetch(`${apiUrl}/api/cameras`);
             const data = await res.json();
             // Filter only enabled cameras
             setCameras(data.filter(c => c.enabled));
