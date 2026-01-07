@@ -114,7 +114,9 @@ def video_producer(source_path: str, is_fisheye: bool):
                     target_views = ['partition_3', 'partition_7'] # 135 and 315
                     
                     if key in target_views:
-                         img_2_process = run_yolo(img)
+                         # Temporarily disable YOLO to fix FPS
+                         # img_2_process = run_yolo(img)
+                         img_2_process = img
                     else:
                          img_2_process = img
 
@@ -129,7 +131,9 @@ def video_producer(source_path: str, is_fisheye: bool):
              # Normal video processing
              try:
                  # Apply YOLO detection
-                 frame_detected = run_yolo(frame)
+                 # Temporarily disable YOLO to fix FPS
+                 # frame_detected = run_yolo(frame)
+                 frame_detected = frame
                  
                  img_small = cv2.resize(frame_detected, (640, 360))
                  _, buffer = cv2.imencode('.jpg', img_small, [cv2.IMWRITE_JPEG_QUALITY, 40])
