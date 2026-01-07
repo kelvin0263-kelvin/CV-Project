@@ -1,7 +1,7 @@
 
 import React, { useState } from 'react';
 import { Upload, FileVideo, CheckCircle2, AlertCircle, Loader2 } from 'lucide-react';
-import { getApiBaseUrl } from '@/config';
+import { getApiBaseUrl } from '../config';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle, CardFooter } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
