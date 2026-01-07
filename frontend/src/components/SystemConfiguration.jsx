@@ -5,7 +5,7 @@ import { Button } from './ui/button';
 import { cn } from '../lib/utils';
 import { Checkbox } from './ui/checkbox';
 import { Label } from './ui/label';
-import WebSocketPlayer from './WebSocketPlayer';
+import StreamPlayer from './StreamPlayer';
 import { getApiBaseUrl } from '../apiConfig';
 
 const SystemConfiguration = () => {
@@ -230,7 +230,7 @@ const SystemConfiguration = () => {
                                 <Card key={cam.id} className={cn("relative group overflow-hidden hover:border-primary/50 transition-all cursor-pointer border-muted", !cam.enabled && "opacity-60")}>
                                     <div className="aspect-video bg-muted relative flex items-center justify-center bg-black">
                                         {cam.type.includes('File') || cam.type.includes('Fisheye') ? (
-                                            <WebSocketPlayer
+                                            <StreamPlayer
                                                 wsUrl={cam.ws_url}
                                                 className="w-full h-full"
                                                 alt="Live Stream"

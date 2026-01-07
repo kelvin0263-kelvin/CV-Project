@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { Card, CardContent } from './ui/card';
 import { Button } from './ui/button';
 import { HardDrive, Circle, ChevronRight, LayoutGrid, Users, Shirt, AlertTriangle, ShieldCheck, Maximize2, Minimize2 } from 'lucide-react';
-import WebSocketPlayer from './WebSocketPlayer';
+import StreamPlayer from './StreamPlayer';
 import { getApiBaseUrl, getWSUrl } from '../apiConfig';
 
 const RECENT_DETECTIONS = [
@@ -19,7 +19,7 @@ const CameraFeedCard = ({ camera }) => {
         <div className="relative group overflow-hidden bg-black rounded-sm border border-border/50 h-full w-full flex items-center justify-center">
             {/* Live Feed or Image */}
             {camera.type.includes("File") || camera.type.includes("Fisheye") ? (
-                <WebSocketPlayer
+                <StreamPlayer
                     wsUrl={wsUrl}
                     className="w-full h-full"
                     alt={camera.name}
