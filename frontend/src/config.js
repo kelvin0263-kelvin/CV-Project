@@ -1,5 +1,6 @@
 // Dynamic API URL getter - must be called at runtime in browser
 export const getApiBaseUrl = () => {
+    // console.log("Initializing API Config check...");
     // Check browser environment
     if (typeof window === 'undefined') {
         return "http://localhost:8000";
