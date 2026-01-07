@@ -1,5 +1,5 @@
 import * as React from "react"
-import { cn } from "@/lib/utils"
+import { cn } from "../../lib/utils"
 
 const Checkbox = React.forwardRef(({ className, onCheckedChange, ...props }, ref) => {
     const handleChange = (e) => {
