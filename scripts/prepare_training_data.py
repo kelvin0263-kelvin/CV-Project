@@ -52,8 +52,8 @@ def process_video(video_path, output_base_dir):
         ensure_dir(d)
 
     # Load Model (YOLO-Pose for keypoints)
-    print("Loading YOLOv8-Pose model...")
-    model = YOLO("yolov8n-pose.pt")
+    print("Loading YOLOv8m-Pose model...")
+    model = YOLO("yolov8m-pose.pt")
 
     # Open Video
     cap = cv2.VideoCapture(video_path)
@@ -73,6 +73,7 @@ def process_video(video_path, output_base_dir):
     
     # Initialize Processor
     # Note: FisheyeMultiView expects (height, width)
+    # Backend DefishVideoCV has been updated to output 1280x720
     processor = FisheyeMultiView((height, width), view_configs, show_original=False)
 
     frame_idx = 0
@@ -108,7 +109,8 @@ def process_video(video_path, output_base_dir):
             continue
 
         # 2. Run YOLO Pose Detection
-        results = model(target_view, verbose=False, classes=[0], conf=0.5)
+        # Using yolov8m-pose + imgsz=1280
+        results = model(target_view, verbose=False, classes=[0], conf=0.5, imgsz=1280)
 
         for r in results:
             boxes = r.boxes.xyxy.cpu().numpy()
