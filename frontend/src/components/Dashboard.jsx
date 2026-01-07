@@ -3,7 +3,7 @@ import { Card, CardContent } from './ui/card';
 import { Button } from './ui/button';
 import { HardDrive, Circle, ChevronRight, LayoutGrid, Users, Shirt, AlertTriangle, ShieldCheck, Maximize2, Minimize2 } from 'lucide-react';
 import WebSocketPlayer from './WebSocketPlayer';
-import { getApiBaseUrl, getWSUrl } from '../config';
+import { getApiBaseUrl, getWSUrl } from '../apiConfig';
 
 const RECENT_DETECTIONS = [
     { id: 1, type: 'Dress Code', time: '10:42 AM', camera: 'Factory Floor A', image: '/factory.png', person: 'Unknown' },
