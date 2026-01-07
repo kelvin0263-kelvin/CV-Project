@@ -3,6 +3,7 @@ import { Card, CardContent } from './ui/card';
 import { Button } from './ui/button';
 import { HardDrive, Circle, ChevronRight, LayoutGrid, Users, Shirt, AlertTriangle, ShieldCheck, Maximize2, Minimize2 } from 'lucide-react';
 import WebSocketPlayer from './WebSocketPlayer';
+import API_BASE_URL, { getWSUrl } from '../config';
 
 const RECENT_DETECTIONS = [
     { id: 1, type: 'Dress Code', time: '10:42 AM', camera: 'Factory Floor A', image: '/factory.png', person: 'Unknown' },
@@ -12,13 +13,14 @@ const RECENT_DETECTIONS = [
 
 const CameraFeedCard = ({ camera }) => {
     const [stats, setStats] = useState({ fps: 0 });
+    const wsUrl = getWSUrl(`/ws/${camera.id}`);
 
     return (
         <div className="relative group overflow-hidden bg-black rounded-sm border border-border/50 h-full w-full flex items-center justify-center">
             {/* Live Feed or Image */}
             {camera.type.includes("File") || camera.type.includes("Fisheye") ? (
                 <WebSocketPlayer
-                    wsUrl={camera.ws_url}
+                    wsUrl={wsUrl}
                     className="w-full h-full"
                     alt={camera.name}
                     onStats={setStats}
@@ -64,7 +66,7 @@ const Dashboard = () => {
 
     const fetchCameras = async () => {
         try {
-            const res = await fetch('http://localhost:8000/api/cameras');
+            const res = await fetch(`${API_BASE_URL}/api/cameras`);
             const data = await res.json();
             // Filter only enabled cameras
             setCameras(data.filter(c => c.enabled));
