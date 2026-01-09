@@ -54,6 +54,10 @@ class FisheyeMultiView:
         output_shape = (720, 1280)  # Increased resolution for better detection (height, width)
 
         for config in self.view_configs:
+            if config is None:
+                self.dewarp_maps.append(None)
+                continue
+            
             pan_angle = config.get('angle_z', 0)
             tilt_angle = config.get('angle_up', 0)
             zoom_fov = config.get('zoom', 90)

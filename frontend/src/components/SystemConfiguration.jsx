@@ -19,6 +19,8 @@ const SystemConfiguration = () => {
     // File Upload State
     const [selectedFile, setSelectedFile] = useState(null);
     const [enableFisheye, setEnableFisheye] = useState(false);
+    // Default to all 8 views selected
+    const [selectedViews, setSelectedViews] = useState(new Set([0, 1, 2, 3, 4, 5, 6, 7]));
 
     // Form State
     const [formData, setFormData] = useState({
@@ -63,6 +65,7 @@ const SystemConfiguration = () => {
         setShowUpload(false);
         setSelectedFile(null);
         setEnableFisheye(false);
+        setSelectedViews(new Set([0, 1, 2, 3, 4, 5, 6, 7]));
     };
 
     const handleAddClick = () => {
@@ -110,6 +113,11 @@ const SystemConfiguration = () => {
             const uploadData = new FormData();
             uploadData.append('file', selectedFile);
             uploadData.append('enable_fisheye', enableFisheye);
+            if (enableFisheye) {
+                // Convert Set to comma separated string "0,3,5"
+                const views = Array.from(selectedViews).join(',');
+                uploadData.append('selected_views', views);
+            }
             uploadData.append('camera_name_prefix', formData.name || 'Uploaded Camera');
 
             try {
@@ -330,10 +338,34 @@ const SystemConfiguration = () => {
                                             </div>
 
                                             {enableFisheye && (
-                                                <p className="text-xs text-muted-foreground">
-                                                    Note: Processing 8 views for a large video may take some time.
-                                                    This demo limits processing to the first 10 seconds.
-                                                </p>
+                                                <div className="space-y-4">
+                                                    <Label>Select Enabled Views</Label>
+                                                    <div className="grid grid-cols-4 gap-2">
+                                                        {[0, 1, 2, 3, 4, 5, 6, 7].map((idx) => {
+                                                            const angle = idx * 45;
+                                                            return (
+                                                                <div key={idx} className="flex items-center space-x-2 border p-2 rounded hover:bg-muted/50">
+                                                                    <Checkbox
+                                                                        id={`view-${idx}`}
+                                                                        checked={selectedViews.has(idx)}
+                                                                        onCheckedChange={(checked) => {
+                                                                            const newSet = new Set(selectedViews);
+                                                                            if (checked) newSet.add(idx);
+                                                                            else newSet.delete(idx);
+                                                                            setSelectedViews(newSet);
+                                                                        }}
+                                                                    />
+                                                                    <Label htmlFor={`view-${idx}`} className="cursor-pointer text-xs">
+                                                                        View {idx + 1} ({angle}°)
+                                                                    </Label>
+                                                                </div>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                    <p className="text-xs text-muted-foreground">
+                                                        Only selected views will be processed and displayed.
+                                                    </p>
+                                                </div>
                                             )}
                                         </div>
                                     ) : (

@@ -83,7 +83,8 @@ def delete_camera(camera_id: str):
 async def upload_video(
     file: UploadFile = File(...),
     enable_fisheye: bool = Form(False),
-    camera_name_prefix: str = Form("Camera")
+    camera_name_prefix: str = Form("Camera"),
+    selected_views: str = Form("") # Comma separated indices, e.g. "0,2,4"
 ):
     try:
         file_id = str(uuid.uuid4())[:8]
@@ -95,8 +96,15 @@ async def upload_video(
             
         new_cameras = []
         
+        active_view_indices = None
+        if enable_fisheye and selected_views:
+             try:
+                active_view_indices = [int(x.strip()) for x in selected_views.split(",") if x.strip().isdigit()]
+             except:
+                pass
+        
         # Start the Producer Thread IMMEDIATELY
-        start_producer_thread(input_path, enable_fisheye)
+        start_producer_thread(input_path, enable_fisheye, active_view_indices)
         
         # Helper to create camera objects
         def create_cam(suffix, view_idx):
@@ -124,6 +132,10 @@ async def upload_video(
             # Define angles corresponding to the 8 views
             angles = [0, 45, 90, 135, 180, 225, 270, 315]
             for i, angle in enumerate(angles):
+                # Check if this view was selected
+                if active_view_indices is not None and i not in active_view_indices:
+                    continue
+                    
                 new_cameras.append(create_cam(f"View {i+1} ({angle}°)", i))
         else:
              new_cameras.append(create_cam("", -1))

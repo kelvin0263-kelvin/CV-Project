@@ -20,14 +20,14 @@ except Exception as e:
     print(f"[System] Warning: Failed to load YOLO model: {e}")
     model = None
 
-def start_producer_thread(source_path: str, is_fisheye: bool):
+def start_producer_thread(source_path: str, is_fisheye: bool, active_views: list = None):
     if source_path in ACTIVE_PRODUCERS:
         return # Already running
     
     ACTIVE_PRODUCERS[source_path] = True
-    threading.Thread(target=video_producer, args=(source_path, is_fisheye), daemon=True).start()
+    threading.Thread(target=video_producer, args=(source_path, is_fisheye, active_views), daemon=True).start()
 
-def video_producer(source_path: str, is_fisheye: bool):
+def video_producer(source_path: str, is_fisheye: bool, active_views: list = None):
     print(f"[Producer] Starting loop for {source_path}")
     
     cap = cv2.VideoCapture(source_path)
@@ -44,17 +44,26 @@ def video_producer(source_path: str, is_fisheye: bool):
 
     processor = None
     if is_fisheye:
-         view_configs = [
-            {'angle_z': 0,   'angle_up': 35, 'zoom': 80},
-            {'angle_z': 45,  'angle_up': 35, 'zoom': 80},
-            {'angle_z': 90,  'angle_up': 35, 'zoom': 80},
-            {'angle_z': 135, 'angle_up': 35, 'zoom': 80},
-            {'angle_z': 180, 'angle_up': 35, 'zoom': 80},
-            {'angle_z': 225, 'angle_up': 35, 'zoom': 80},
-            {'angle_z': 270, 'angle_up': 35, 'zoom': 80},
-            {'angle_z': 315, 'angle_up': 35, 'zoom': 80},
+         # Standard 8 views
+         all_configs = [
+            {'angle_z': 0,   'angle_up': 35, 'zoom': 80}, # View 0
+            {'angle_z': 45,  'angle_up': 35, 'zoom': 80}, # View 1
+            {'angle_z': 90,  'angle_up': 35, 'zoom': 80}, # View 2
+            {'angle_z': 135, 'angle_up': 35, 'zoom': 80}, # View 3
+            {'angle_z': 180, 'angle_up': 35, 'zoom': 80}, # View 4
+            {'angle_z': 225, 'angle_up': 35, 'zoom': 80}, # View 5
+            {'angle_z': 270, 'angle_up': 35, 'zoom': 80}, # View 6
+            {'angle_z': 315, 'angle_up': 35, 'zoom': 80}, # View 7
         ]
-         processor = FisheyeMultiView((height, width), view_configs, show_original=True)
+         
+         final_configs = []
+         for i in range(8):
+             if active_views is None or i in active_views:
+                 final_configs.append(all_configs[i])
+             else:
+                 final_configs.append(None) # Skip this view
+                 
+         processor = FisheyeMultiView((height, width), final_configs, show_original=True)
     
     # Init buffer for this source
     FRAME_BUFFERS[source_path] = {}
