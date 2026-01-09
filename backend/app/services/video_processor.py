@@ -11,6 +11,14 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 from DefishVideoCV import FisheyeMultiView
 from app.core.globals import FRAME_BUFFERS, ACTIVE_PRODUCERS
 from ultralytics import YOLO
+from turbojpeg import TurboJPEG
+
+# Initialize TurboJPEG
+try:
+    jpeg = TurboJPEG()
+except Exception as e:
+    print(f"[System] Warning: TurboJPEG not found: {e}. Using OpenCV fallback.")
+    jpeg = None
 
 # Initialize YOLO Model
 print("[System] Loading YOLOv11-Pose Model...")
@@ -144,21 +152,38 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
                 processed_frames, _, _ = processor.process_frame(frame, overlay=True, view_id=None)
                 t1 = time.time()
                 
-                # 2. Parallel Encoding (Utilize 64-core CPU)
-                # We use a ThreadPool to resize and encode multiple views simultaneously.
-                import concurrent.futures
+                # 2. Sequential Encoding (Optimized)
+                # Reverting Parallel due to GIL overhead.
+                # Optimization: 
+                # 1. Skip YOLO if not needed
+                # 2. Encode sequentially but efficiently
                 
                 current_buffer = {}
                 current_buffer['__meta__'] = { 'fps': round(current_real_fps, 1) }
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                    # Submit all encoding tasks
-                    future_to_key = {executor.submit(process_and_encode_view, k, v): k for k, v in processed_frames.items()}
-                    
-                    for future in concurrent.futures.as_completed(future_to_key):
-                        key, result_b64 = future.result()
-                        if result_b64:
-                            current_buffer[key] = result_b64
+                for key, img in processed_frames.items():
+                    try:
+                        # Logic: Only apply YOLO on specific views
+                        target_views = ['partition_3'] # Only 135 degree
+                        
+                        img_2_process = img
+                        if key in target_views:
+                             img_2_process = run_yolo(img)
+                        
+                        # Resize for web optimization
+                        img_small = cv2.resize(img_2_process, (640, 360))
+                        
+                        if jpeg:
+                            # Optimize: Use TurboJPEG for faster encoding (SIMD accelerated)
+                            buffer = jpeg.encode(img_small, quality=40)
+                        else:
+                            # Fallback
+                            _, buffer = cv2.imencode('.jpg', img_small, [cv2.IMWRITE_JPEG_QUALITY, 40])
+                            
+                        current_buffer[key] = base64.b64encode(buffer).decode('utf-8')
+                        
+                    except Exception as e:
+                        print(f"Encoding error for {key}: {e}")
                 
                 t2 = time.time()
                 
@@ -167,7 +192,7 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
                     fisheye_time = (t1 - t0) * 1000
                     encoding_time = (t2 - t1) * 1000
                     total_time = (t2 - t0) * 1000
-                    print(f"[Perf] Fisheye: {fisheye_time:.1f}ms | Par-Encode/YOLO: {encoding_time:.1f}ms | Total: {total_time:.1f}ms | FPS: {current_real_fps:.1f}")
+                    print(f"[Perf] Fisheye: {fisheye_time:.1f}ms | Seq-Encode/YOLO: {encoding_time:.1f}ms | Total: {total_time:.1f}ms | FPS: {current_real_fps:.1f}")
 
             except Exception as e:
                 print(f"[Producer] Error: {e}")
