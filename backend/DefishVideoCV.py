@@ -11,7 +11,7 @@ class FisheyeMultiView:
     based on a given configuration.
     """
 
-    def __init__(self, fisheye_frame_shape, view_configs, show_original=True, motion_detection_enabled=False, perimeter_zones={}, output_shape=(720, 1280)):
+    def __init__(self, fisheye_frame_shape, view_configs, show_original=True, motion_detection_enabled=False, perimeter_zones={}):
         """
         Initializes the processor and pre-calculates all necessary transformation maps.
 
@@ -20,7 +20,6 @@ class FisheyeMultiView:
             view_configs (list): A list of dictionaries, where each dict defines a view
                                  with 'angle_z', 'angle_up', and 'zoom'.
             show_original (bool): Flag to determine if the original fisheye view should be returned.
-            output_shape (tuple): Target resolution (height, width) for planar views.
         """
         print("Initializing FisheyeMultiView...")
         if not view_configs:
@@ -35,8 +34,6 @@ class FisheyeMultiView:
         side_length = min(h, w)
         self.crop_offset = (w - side_length) // 2
         self.cropped_frame_shape = (side_length, side_length)
-        
-        self.output_shape = output_shape
         
         # --- Pre-calculate all transformation maps ---
         self._create_all_maps()
@@ -54,7 +51,7 @@ class FisheyeMultiView:
     def _create_all_maps(self):
         """Generates a transformation map for each view configuration."""
         print(f"Creating {len(self.view_configs)} dewarp maps...")
-        # output_shape = (720, 1280)  # Now using self.output_shape
+        output_shape = (720, 1280)  # Increased resolution for better detection (height, width)
 
         for config in self.view_configs:
             if config is None:
@@ -69,7 +66,7 @@ class FisheyeMultiView:
                 # This function is assumed to exist in your FisheyeToPlanar library
                 map_x, map_y = FisheyeToPlanar.create_remap_map(
                     fisheye_shape=self.cropped_frame_shape,
-                    output_shape=self.output_shape,
+                    output_shape=output_shape,
                     i_fov_deg = 180,
                     o_fov_deg=zoom_fov,
                     yaw_deg=0,

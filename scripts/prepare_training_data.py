@@ -73,9 +73,8 @@ def process_video(video_path, output_base_dir):
     
     # Initialize Processor
     # Note: FisheyeMultiView expects (height, width)
-    # Backend DefishVideoCV has been updated to accept output_shape
-    # Using 2K (1440p) resolution to get better crops for small objects
-    processor = FisheyeMultiView((height, width), view_configs, show_original=False, output_shape=(1440, 2560))
+    # Backend DefishVideoCV has been updated to output 1280x720
+    processor = FisheyeMultiView((height, width), view_configs, show_original=False)
 
     frame_idx = 0
     saved_count = 0
@@ -154,7 +153,7 @@ def process_video(video_path, output_base_dir):
                     if hip_y > py1:
                         upper_bbox = (px1, py1, px2, int(hip_y))
                         upper_img, _ = crop_with_padding(target_view, upper_bbox, 0)
-                        if upper_img is not None and upper_img.size > 0:
+                        if upper_img is not None and upper_img.size > 0 and upper_img.shape[0] >= 160:
                             cv2.imwrite(os.path.join(dirs['upper_body'], fname), upper_img)
                     
                     # Lower Body (Thighs/shorts): Hip -> Knee
