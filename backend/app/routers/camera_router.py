@@ -11,20 +11,27 @@ from app.services.video_processor import start_producer_thread
 
 router = APIRouter()
 
-# Directories (Should ideally be in config)
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-UPLOAD_DIR = os.path.join(BASE_DIR, "static", "uploads")
+# Directories
+# We place uploads OUTSIDE the backend directory to prevent uvicorn auto-reload from triggering
+# when a new file is written. This prevents in-memory state (STREAM_CONFIGS) from being wiped.
+BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(BACKEND_ROOT) # Go up one level to CV-UI/
+UPLOAD_DIR = os.path.join(PROJECT_ROOT, "temp_video_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # --- WebSocket Endpoint ---
 @router.websocket("/ws/{camera_id}")
 async def websocket_endpoint(websocket: WebSocket, camera_id: str):
     await websocket.accept()
+    print(f"[WS] Connection accepted for {camera_id}")
     
     config = STREAM_CONFIGS.get(camera_id)
     if not config:
+        print(f"[WS] Error: No config found for {camera_id}. Available keys: {list(STREAM_CONFIGS.keys())}")
         await websocket.close()
         return
+    
+    print(f"[WS] Config found for {camera_id}: {config}")
 
     source_path = config['source_path']
     view_index = config.get('view_index', -1)
