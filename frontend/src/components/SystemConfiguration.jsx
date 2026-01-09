@@ -6,7 +6,7 @@ import { cn } from '../lib/utils';
 import { Checkbox } from './ui/checkbox';
 import { Label } from './ui/label';
 import StreamPlayer from './StreamPlayer';
-import { getApiBaseUrl } from '../apiConfig';
+import { getApiBaseUrl, getWSUrl } from '../apiConfig';
 
 const SystemConfiguration = () => {
     const [cameras, setCameras] = useState([]);
@@ -239,7 +239,7 @@ const SystemConfiguration = () => {
                                     <div className="aspect-video bg-muted relative flex items-center justify-center bg-black">
                                         {cam.type.includes('File') || cam.type.includes('Fisheye') ? (
                                             <StreamPlayer
-                                                wsUrl={cam.ws_url}
+                                                wsUrl={getWSUrl(`/ws/${cam.id}`)}
                                                 className="w-full h-full"
                                                 alt="Live Stream"
                                             />
