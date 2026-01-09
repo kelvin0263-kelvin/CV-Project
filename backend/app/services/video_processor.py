@@ -108,30 +108,39 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
         # Store FPS in the buffer metadata
         current_buffer['__meta__'] = { 'fps': round(current_real_fps, 1) }
         
+        # --- Timing ---
+        t0 = time.time()
+        
         if is_fisheye and processor:
             try:
                 # view_id=None means process ALL views
                 processed_frames, _, _ = processor.process_frame(frame, overlay=True, view_id=None)
+                t1 = time.time()
                 
                 # Encode all to Base64
                 for key, img in processed_frames.items():
                     # Logic: Only apply YOLO on specific views
-                    # key format is crucial. Assuming 'partition_3' is 135deg and 'partition_7' is 315deg
-                    # Based on view_configs order:
-                    # 0: 0deg, 1: 45deg, 2: 90deg, 3: 135deg, 4: 180deg, 5: 225deg, 6: 270deg, 7: 315deg
-                    
                     target_views = ['partition_3'] # Only 135 degree
                     
                     if key in target_views:
                          img_2_process = run_yolo(img)
                     else:
                          img_2_process = img
-
+                    
                     # Resize for web optimization
                     img_small = cv2.resize(img_2_process, (640, 360))
                     _, buffer = cv2.imencode('.jpg', img_small, [cv2.IMWRITE_JPEG_QUALITY, 40])
                     current_buffer[key] = base64.b64encode(buffer).decode('utf-8')
-                    
+                
+                t2 = time.time()
+                
+                # Log performance every 30 frames
+                if fps_frame_count % 30 == 0:
+                    fisheye_time = (t1 - t0) * 1000
+                    encoding_time = (t2 - t1) * 1000
+                    total_time = (t2 - t0) * 1000
+                    print(f"[Perf] Fisheye: {fisheye_time:.1f}ms | Encode/YOLO: {encoding_time:.1f}ms | Total: {total_time:.1f}ms | FPS: {current_real_fps:.1f}")
+
             except Exception as e:
                 print(f"[Producer] Error: {e}")
         else:
