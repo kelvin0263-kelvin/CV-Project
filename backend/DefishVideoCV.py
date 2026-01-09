@@ -180,6 +180,8 @@ class FisheyeMultiView:
             # Overlay the original fisheye frame on the processed views
             output_shape_for_lib = (270*2, 480*2)
             for config in self.view_configs:
+                if config is None:
+                    continue
                 pan_angle = config.get('angle_z', 0)
                 tilt_angle = config.get('angle_up', 0)
                 zoom_fov = config.get('zoom', 90)
