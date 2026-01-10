@@ -51,7 +51,7 @@ class FisheyeMultiView:
     def _create_all_maps(self):
         """Generates a transformation map for each view configuration."""
         print(f"Creating {len(self.view_configs)} dewarp maps...")
-        output_shape = (720, 1280)  # Increased resolution for better detection (height, width)
+        output_shape = (2560, 1920)  # Increased resolution for better detection (height, width)
 
         for config in self.view_configs:
             if config is None:
