@@ -98,6 +98,9 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
         
         # --- Helper: Run Detection (Person Only, Conf > 0.5) ---
         def run_yolo(img):
+            # YOLO Disabled temporarily
+            return img
+
             if model is None:
                 return img
             try:
