@@ -105,19 +105,19 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
         
         # --- Helper: Run Detection (Person Only, Conf > 0.5) ---
         def run_yolo(img):
-            # YOLO Disabled temporarily
-            return img
-
             if model is None:
                 return img
             try:
                 # Run inference: classes=0 (person), conf=0.5
-                # Run inference: classes=0 (person), conf=0.5
-                # Ensure device='0' is used to leverage GPU
-                results = model(img, classes=[0], conf=0.5, verbose=False, device='0')
-                # Plot results
-                annotated_frame = results[0].plot()
-                return annotated_frame
+                # Ensure device='0' is used to leverage GPU when available
+                results = model(
+                    img,
+                    classes=[0],
+                    conf=0.5,
+                    verbose=False,
+                    device='0'
+                )
+                return results[0].plot()
             except Exception as e:
                 return img
 
