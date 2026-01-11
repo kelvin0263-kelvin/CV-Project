@@ -50,6 +50,13 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     delay = 1.0 / fps
 
+    # Detect CUDA availability once
+    cuda_available = hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0
+    if cuda_available:
+        print("[System] CUDA detected: enabling GPU remap/resize")
+    else:
+        print("[System] CUDA not available, using CPU pipeline")
+
     processor = None
     if is_fisheye:
          # Standard 8 views
@@ -71,7 +78,7 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
              else:
                  final_configs.append(None) # Skip this view
                  
-         processor = FisheyeMultiView((height, width), final_configs, show_original=True)
+         processor = FisheyeMultiView((height, width), final_configs, show_original=True, use_cuda=cuda_available)
     
     # Init buffer for this source
     FRAME_BUFFERS[source_path] = {}
@@ -121,6 +128,18 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
         
         # --- Timing ---
         t0 = time.time()
+
+        # --- Helper: GPU-aware resize ---
+        def resize_for_web(img):
+            if cuda_available and hasattr(cv2, "cuda"):
+                try:
+                    gpu_img = cv2.cuda_GpuMat()
+                    gpu_img.upload(img)
+                    gpu_resized = cv2.cuda.resize(gpu_img, (640, 360), interpolation=cv2.INTER_AREA)
+                    return gpu_resized.download()
+                except Exception as e:
+                    print(f"[GPU] Resize fallback due to: {e}")
+            return cv2.resize(img, (640, 360))
         
         # --- Helper: Task for Parallel Encoding ---
         def process_and_encode_view(key, img):
@@ -174,7 +193,7 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
                              img_2_process = run_yolo(img)
                         
                         # Resize for web optimization
-                        img_small = cv2.resize(img_2_process, (640, 360))
+                        img_small = resize_for_web(img_2_process)
                         
                         if jpeg:
                             # Optimize: Use TurboJPEG for faster encoding (SIMD accelerated)
@@ -205,7 +224,7 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
                  # Encode Normal Frame
                  frame_detected = run_yolo(frame)
                  
-                 img_small = cv2.resize(frame_detected, (640, 360))
+                 img_small = resize_for_web(frame_detected)
                  _, buffer = cv2.imencode('.jpg', img_small, [cv2.IMWRITE_JPEG_QUALITY, 40])
                  current_buffer['original'] = base64.b64encode(buffer).decode('utf-8')
              except Exception as e:

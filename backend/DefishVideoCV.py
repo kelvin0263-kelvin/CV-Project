@@ -11,7 +11,7 @@ class FisheyeMultiView:
     based on a given configuration.
     """
 
-    def __init__(self, fisheye_frame_shape, view_configs, show_original=True, motion_detection_enabled=False, perimeter_zones={}):
+    def __init__(self, fisheye_frame_shape, view_configs, show_original=True, motion_detection_enabled=False, perimeter_zones={}, use_cuda=False):
         """
         Initializes the processor and pre-calculates all necessary transformation maps.
 
@@ -28,6 +28,8 @@ class FisheyeMultiView:
         self.view_configs = view_configs
         self.show_original = show_original
         self.dewarp_maps = []
+        self.gpu_dewarp_maps = []  # Holds uploaded maps when CUDA is enabled
+        self.use_cuda = bool(use_cuda and hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0)
 
         # --- Calculate cropping parameters ---
         h, w = fisheye_frame_shape[:2]
@@ -49,13 +51,14 @@ class FisheyeMultiView:
             self.bg_subtractors = []
 
     def _create_all_maps(self):
-        """Generates a transformation map for each view configuration."""
+        """Generates a transformation map for each view configuration and uploads to GPU if available."""
         print(f"Creating {len(self.view_configs)} dewarp maps...")
         output_shape = (1920,2560)  # Increased resolution for better detection (height, width)
 
         for config in self.view_configs:
             if config is None:
                 self.dewarp_maps.append(None)
+                self.gpu_dewarp_maps.append(None)
                 continue
             
             pan_angle = config.get('angle_z', 0)
@@ -74,10 +77,20 @@ class FisheyeMultiView:
                     roll_deg=pan_angle,
                 )
                 self.dewarp_maps.append((map_x, map_y))
+                if self.use_cuda:
+                    # Upload maps to GPU once to avoid per-frame transfers
+                    map_x_gpu = cv2.cuda_GpuMat()
+                    map_y_gpu = cv2.cuda_GpuMat()
+                    map_x_gpu.upload(map_x)
+                    map_y_gpu.upload(map_y)
+                    self.gpu_dewarp_maps.append((map_x_gpu, map_y_gpu))
+                else:
+                    self.gpu_dewarp_maps.append(None)
             except Exception as e:
                 print(f"Failed to create map for config {config}: {e}")
                 # Add a None placeholder to maintain index alignment
                 self.dewarp_maps.append(None)
+                self.gpu_dewarp_maps.append(None)
         
         print("FisheyeMultiView initialization complete.")
 
@@ -141,11 +154,24 @@ class FisheyeMultiView:
 
             if dewarp_map is not None:
                 map_x, map_y = dewarp_map
-                planar_view = cv2.remap(
-                    cropped_frame, map_x, map_y,
-                    interpolation=cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_CONSTANT
-                )
+
+                if self.use_cuda and self.gpu_dewarp_maps[i] is not None:
+                    # GPU remap then download back to host
+                    map_x_gpu, map_y_gpu = self.gpu_dewarp_maps[i]
+                    gpu_src = cv2.cuda_GpuMat()
+                    gpu_src.upload(cropped_frame)
+                    gpu_planar = cv2.cuda.remap(
+                        gpu_src, map_x_gpu, map_y_gpu,
+                        interpolation=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT
+                    )
+                    planar_view = gpu_planar.download()
+                else:
+                    planar_view = cv2.remap(
+                        cropped_frame, map_x, map_y,
+                        interpolation=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT
+                    )
                 
                 # ROTATE 180 degrees (Correct for ceiling mount)
                 planar_view = cv2.rotate(planar_view, cv2.ROTATE_180)
