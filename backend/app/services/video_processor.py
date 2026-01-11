@@ -78,7 +78,13 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
              else:
                  final_configs.append(None) # Skip this view
                  
-         processor = FisheyeMultiView((height, width), final_configs, show_original=True, use_cuda=cuda_available)
+         processor = FisheyeMultiView(
+             (height, width),
+             final_configs,
+             show_original=True,
+             use_cuda=cuda_available,
+             downscale_size=(640, 360) if cuda_available else None
+         )
     
     # Init buffer for this source
     FRAME_BUFFERS[source_path] = {}
@@ -192,8 +198,12 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
                         if key in target_views:
                              img_2_process = run_yolo(img)
                         
-                        # Resize for web optimization
-                        img_small = resize_for_web(img_2_process)
+                        # If CUDA downscaling was applied in FisheyeMultiView, the frame
+                        # is already small; otherwise, resize here.
+                        if cuda_available and processor.use_cuda and processor.downscale_size:
+                            img_small = img_2_process
+                        else:
+                            img_small = resize_for_web(img_2_process)
                         
                         if jpeg:
                             # Optimize: Use TurboJPEG for faster encoding (SIMD accelerated)

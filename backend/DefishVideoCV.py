@@ -11,7 +11,7 @@ class FisheyeMultiView:
     based on a given configuration.
     """
 
-    def __init__(self, fisheye_frame_shape, view_configs, show_original=True, motion_detection_enabled=False, perimeter_zones={}, use_cuda=False):
+    def __init__(self, fisheye_frame_shape, view_configs, show_original=True, motion_detection_enabled=False, perimeter_zones={}, use_cuda=False, downscale_size=(640, 360)):
         """
         Initializes the processor and pre-calculates all necessary transformation maps.
 
@@ -30,6 +30,8 @@ class FisheyeMultiView:
         self.dewarp_maps = []
         self.gpu_dewarp_maps = []  # Holds uploaded maps when CUDA is enabled
         self.use_cuda = bool(use_cuda and hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0)
+        # When using CUDA, downscale on-GPU before downloading to reduce copy cost
+        self.downscale_size = downscale_size if self.use_cuda else None
 
         # --- Calculate cropping parameters ---
         h, w = fisheye_frame_shape[:2]
@@ -53,7 +55,8 @@ class FisheyeMultiView:
     def _create_all_maps(self):
         """Generates a transformation map for each view configuration and uploads to GPU if available."""
         print(f"Creating {len(self.view_configs)} dewarp maps...")
-        output_shape = (1920,2560)  # Increased resolution for better detection (height, width)
+        # High-res remap target; keep as requested (height, width)
+        output_shape = (1920,2560)
 
         for config in self.view_configs:
             if config is None:
@@ -156,7 +159,7 @@ class FisheyeMultiView:
                 map_x, map_y = dewarp_map
 
                 if self.use_cuda and self.gpu_dewarp_maps[i] is not None:
-                    # GPU remap then download back to host
+                    # GPU remap then (optionally) GPU resize before a single download
                     map_x_gpu, map_y_gpu = self.gpu_dewarp_maps[i]
                     gpu_src = cv2.cuda_GpuMat()
                     gpu_src.upload(cropped_frame)
@@ -165,6 +168,10 @@ class FisheyeMultiView:
                         interpolation=cv2.INTER_LINEAR,
                         borderMode=cv2.BORDER_CONSTANT
                     )
+                    if self.downscale_size:
+                        # Note: cv2 uses (width, height)
+                        target_w, target_h = self.downscale_size
+                        gpu_planar = cv2.cuda.resize(gpu_planar, (target_w, target_h), interpolation=cv2.INTER_AREA)
                     planar_view = gpu_planar.download()
                 else:
                     planar_view = cv2.remap(
