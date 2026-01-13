@@ -65,6 +65,13 @@ def process_video(video_path, output_base_dir):
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+    # Detect CUDA availability
+    cuda_available = hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0
+    if cuda_available:
+        print("[System] CUDA detected: enabling GPU processing")
+    else:
+        print("[System] CUDA not available, using CPU pipeline")
+
     # Configure Defisher for 135 degrees
     # Based on previous code: {'angle_z': 135, 'angle_up': 35, 'zoom': 80}
     view_configs = [
@@ -73,8 +80,14 @@ def process_video(video_path, output_base_dir):
     
     # Initialize Processor
     # Note: FisheyeMultiView expects (height, width)
-    # Backend DefishVideoCV has been updated to output 1280x720
-    processor = FisheyeMultiView((height, width), view_configs, show_original=False)
+    # Use CUDA if available, but keep full resolution (no downscale) for training data
+    processor = FisheyeMultiView(
+        (height, width),
+        view_configs,
+        show_original=False,
+        use_cuda=cuda_available,
+        downscale_size=None  # Keep full resolution for training data
+    )
 
     frame_idx = 0
     saved_count = 0
