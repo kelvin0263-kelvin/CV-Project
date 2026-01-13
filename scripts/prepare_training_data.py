@@ -3,9 +3,8 @@ import sys
 import os
 import numpy as np
 from ultralytics import YOLO
-from ultralytics.trackers.byte_tracker import BYTETracker
+import supervision as sv
 import argparse
-from pathlib import Path
 
 # Fix path to import backend modules
 # Assuming script is in d:\CV-UI\scripts and backend is in d:\CV-UI\backend
@@ -61,31 +60,6 @@ def crop_with_padding(image, bbox, padding_percent=0.1):
     ny2 = min(h, int(y2 + pad_h))
     
     return image[ny1:ny2, nx1:nx2], (nx1, ny1, nx2, ny2)
-
-
-class _DetResults:
-    """Minimal adapter to feed numpy detections into Ultralytics BYTETracker."""
-
-    def __init__(self, xyxy: np.ndarray, conf: np.ndarray, cls: np.ndarray):
-        self.xyxy = xyxy.astype(np.float32)
-        self.conf = conf.astype(np.float32)
-        self.cls = cls.astype(np.float32)
-
-    def __getitem__(self, idx):
-        return _DetResults(self.xyxy[idx], self.conf[idx], self.cls[idx])
-
-    def __len__(self):
-        return len(self.xyxy)
-
-    @property
-    def xywh(self):
-        # convert xyxy -> xywh(center-based)
-        xywh = np.zeros_like(self.xyxy)
-        xywh[:, 0] = (self.xyxy[:, 0] + self.xyxy[:, 2]) * 0.5
-        xywh[:, 1] = (self.xyxy[:, 1] + self.xyxy[:, 3]) * 0.5
-        xywh[:, 2] = (self.xyxy[:, 2] - self.xyxy[:, 0])
-        xywh[:, 3] = (self.xyxy[:, 3] - self.xyxy[:, 1])
-        return xywh
 
 def process_video(video_path, output_base_dir):
     # Sampling / tracking controls
@@ -145,27 +119,21 @@ def process_video(video_path, output_base_dir):
         downscale_size=None  # Keep full resolution for training data
     )
 
-    frame_idx = 0
+    frame_idx = 0          # raw frame index from video
+    proc_idx = 0           # processed frame index after stride
     saved_count = 0
     print(f"Starting processing for {total_frames} frames...")
 
-    # ByteTrack tracker
-    class _BTArgs:
-        pass
-    bt_args = _BTArgs()
-    bt_args.track_high_thresh = track_thresh
-    bt_args.track_low_thresh = 0.1
-    bt_args.track_buffer = track_buffer
-    bt_args.match_thresh = match_thresh
-    bt_args.mot20 = False
-    bt_args.fuse_score = False
-    bt_args.new_track_thresh = 0.4
-
-    tracker = BYTETracker(bt_args, frame_rate=int(cap.get(cv2.CAP_PROP_FPS) or 25))
-    last_save_frame = {}
-    track_first_frame = {}
-    last_saved_boxes = []
-    current_saved_boxes = []
+    # ByteTrack tracker via Supervision
+    tracker = sv.ByteTrack(
+        track_thresh=track_thresh,
+        match_thresh=match_thresh,
+        track_buffer=track_buffer,
+        frame_rate=int(cap.get(cv2.CAP_PROP_FPS) or 25),
+    )
+    last_save_step = {}          # track_id -> proc_idx of last save
+    track_first_step = {}        # track_id -> first seen proc_idx
+    last_saved_box_by_id = {}    # track_id -> last saved box coords
 
     while True:
         ret, frame = cap.read()
@@ -176,6 +144,7 @@ def process_video(video_path, output_base_dir):
         # Frame skipping to reduce volume
         if frame_idx % frame_stride != 0:
             continue
+        proc_idx += 1
 
         if frame_idx % 10 == 0:
             print(f"Processing frame {frame_idx}/{total_frames}...", end='\r')
@@ -204,38 +173,35 @@ def process_video(video_path, output_base_dir):
         results = model(target_view, verbose=False, classes=[0], conf=0.5, imgsz=1280, device='0')
 
         for r in results:
-            boxes_xyxy = r.boxes.xyxy.cpu().numpy()
-            scores = r.boxes.conf.cpu().numpy() if r.boxes.conf is not None else np.zeros((len(boxes_xyxy),))
-            classes = r.boxes.cls.cpu().numpy() if r.boxes.cls is not None else np.zeros((len(boxes_xyxy),))
+            detections = sv.Detections.from_ultralytics(r)
+            det_boxes = detections.xyxy if len(detections) > 0 else np.empty((0, 4))
             keypoints = r.keypoints.xy.cpu().numpy() if r.keypoints is not None else []
 
-            det_results = _DetResults(boxes_xyxy, scores, classes)
-
-            tracked = tracker.update(det_results, img=target_view)
+            tracked = tracker.update_with_detections(detections)
             
-            for i, track in enumerate(tracked):
-                # BYTETracker returns ndarray rows: [x1, y1, x2, y2, track_id, score, cls]
-                box_coords = tuple(map(float, track[:4]))
-                track_id = int(track[4]) if len(track) > 4 else i
+            for i in range(len(tracked)):
+                # tracked is a Detections object with tracker_id/boxes
+                box_coords = tuple(map(float, tracked.xyxy[i]))
+                track_id = int(tracked.tracker_id[i]) if tracked.tracker_id is not None else i
 
-                # Track first-seen age gate
-                if track_id not in track_first_frame:
-                    track_first_frame[track_id] = frame_idx
-                if (frame_idx - track_first_frame[track_id]) < min_track_age:
+                # Track first-seen age gate (use processed frame index)
+                if track_id not in track_first_step:
+                    track_first_step[track_id] = proc_idx
+                if (proc_idx - track_first_step[track_id]) < min_track_age:
                     continue
 
-                # Save throttle: only save per track every track_save_gap frames
-                if track_id in last_save_frame and (frame_idx - last_save_frame[track_id]) < track_save_gap:
+                # Save throttle: only save per track every track_save_gap processed frames
+                if track_id in last_save_step and (proc_idx - last_save_step[track_id]) < track_save_gap:
                     continue
 
-                # Dedup vs last saved frame boxes
-                if any(_iou(box_coords, b) > iou_dedup_thresh for b in last_saved_boxes):
+                # Dedup per track id vs its last saved box
+                if track_id in last_saved_box_by_id and _iou(box_coords, last_saved_box_by_id[track_id]) > iou_dedup_thresh:
                     continue
 
                 # Find best matching detection for keypoints
                 best_kp = None
-                if boxes_xyxy.size > 0 and len(keypoints) > 0:
-                    boxes_list = [tuple(map(float, b)) for b in boxes_xyxy]
+                if det_boxes.size > 0 and len(keypoints) > 0:
+                    boxes_list = [tuple(map(float, b)) for b in det_boxes]
                     ious = [_iou(box_coords, b) for b in boxes_list]
                     best_idx = int(np.argmax(ious))
                     if ious[best_idx] > 0.3:
@@ -252,9 +218,11 @@ def process_video(video_path, output_base_dir):
                 # Save Full Body
                 fname = f"frame_{frame_idx}_p{i}_t{track_id}.jpg"
                 if person_img is not None and person_img.size > 0:
-                    cv2.imwrite(os.path.join(dirs['full_body'], fname), person_img)
-                    last_save_frame[track_id] = frame_idx
-                    current_saved_boxes.append(box_coords)
+                    ok = cv2.imwrite(os.path.join(dirs['full_body'], fname), person_img)
+                    if ok:
+                        saved_count += 1
+                        last_save_step[track_id] = proc_idx
+                        last_saved_box_by_id[track_id] = box_coords
                 
                 # Check Keypoints for parts (COCO format: 17 points)
                 # 5,6: Shoulders | 11,12: Hips | 13,14: Knees | 15,16: Ankles
@@ -295,18 +263,13 @@ def process_video(video_path, output_base_dir):
                     
                     # Legs (Knees -> Feet): Knee -> Box Bottom
                     if knee_y < py2:
-                         legs_bbox = (px1, int(knee_y), px2, py2)
-                         # Often allow 'legs' to be wider? No, keep box width.
-                         legs_img, _ = crop_with_padding(target_view, legs_bbox, 0)
-                         if legs_img is not None and legs_img.size > 0:
-                             cv2.imwrite(os.path.join(dirs['legs'], fname), legs_img)
+                        legs_bbox = (px1, int(knee_y), px2, py2)
+                        # Often allow 'legs' to be wider? No, keep box width.
+                        legs_img, _ = crop_with_padding(target_view, legs_bbox, 0)
+                        if legs_img is not None and legs_img.size > 0:
+                            cv2.imwrite(os.path.join(dirs['legs'], fname), legs_img)
 
-                saved_count += 1
-
-        # Update dedup memory
-        if current_saved_boxes:
-            last_saved_boxes = current_saved_boxes
-        current_saved_boxes = []
+                # only count already on successful save above
 
     cap.release()
     print(f"\nDone! Processed {frame_idx} frames. Saved {saved_count} person instances.")
