@@ -56,7 +56,7 @@ class FisheyeMultiView:
         """Generates a transformation map for each view configuration and uploads to GPU if available."""
         print(f"Creating {len(self.view_configs)} dewarp maps...")
         # High-res remap target; keep as requested (height, width)
-        output_shape = (1920,2560)
+        output_shape = (960,1280)
 
         for config in self.view_configs:
             if config is None:

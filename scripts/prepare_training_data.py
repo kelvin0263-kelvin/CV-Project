@@ -3,7 +3,6 @@ import sys
 import os
 import numpy as np
 from ultralytics import YOLO
-import supervision as sv
 import argparse
 
 # Fix path to import backend modules
@@ -61,15 +60,14 @@ def crop_with_padding(image, bbox, padding_percent=0.1):
     
     return image[ny1:ny2, nx1:nx2], (nx1, ny1, nx2, ny2)
 
-def process_video(video_path, output_base_dir):
+def process_video(video_path, output_base_dir, tracker_cfg="bytetrack.yaml"):
     # Sampling / tracking controls
     frame_stride = 3          # process every Nth frame to cut volume (~25fps -> ~8fps)
-    track_thresh = 0.4        # ByteTrack: high-score threshold
-    match_thresh = 0.5        # ByteTrack: association threshold
-    track_buffer = 90         # ByteTrack: buffer for lost tracks (longer persistence)
     track_save_gap = 10       # save once every N processed frames per track
     min_track_age = 2         # require a track to live N processed frames before saving
     iou_dedup_thresh = 0.6    # skip if highly overlapping with last-saved frame
+    track_conf = 0.5          # Ultralytics track/predict conf threshold
+    track_iou = 0.7           # Ultralytics track association IoU (per docs)
 
     # Setup Output Dirs
     dirs = {
@@ -82,8 +80,9 @@ def process_video(video_path, output_base_dir):
         ensure_dir(d)
 
     # Load Model (YOLO-Pose for keypoints)
-    print("Loading YOLOv8m-Pose model...")
-    model = YOLO("yolov8m-pose.pt")
+    print("Loading yolo26n-Pose model...")
+    model = YOLO("yolo26n-pose.pt")  # Load an official Pose model
+
 
     # Open Video
     cap = cv2.VideoCapture(video_path)
@@ -124,13 +123,7 @@ def process_video(video_path, output_base_dir):
     saved_count = 0
     print(f"Starting processing for {total_frames} frames...")
 
-    # ByteTrack tracker via Supervision
-    tracker = sv.ByteTrack(
-        track_thresh=track_thresh,
-        match_thresh=match_thresh,
-        track_buffer=track_buffer,
-        frame_rate=int(cap.get(cv2.CAP_PROP_FPS) or 25),
-    )
+    # Track state (Ultralytics built-in tracker; persist=True keeps IDs across calls)
     last_save_step = {}          # track_id -> proc_idx of last save
     track_first_step = {}        # track_id -> first seen proc_idx
     last_saved_box_by_id = {}    # track_id -> last saved box coords
@@ -167,109 +160,117 @@ def process_video(video_path, output_base_dir):
             print(f"Defish error frame {frame_idx}: {e}")
             continue
 
-        # 2. Run YOLO Pose Detection
-        # Using yolov8m-pose + imgsz=1280
-        # Ensure device='0' is used to leverage GPU
-        results = model(target_view, verbose=False, classes=[0], conf=0.5, imgsz=1280, device='0')
+        # 2. Run Ultralytics tracking (ByteTrack/BOT-SORT via tracker YAML)
+        # Uses track mode so boxes carry stable IDs across frames.
+        results = model.track(
+            source=target_view,
+            tracker=tracker_cfg,
+            persist=True,
+            verbose=False,
+            classes=[0],
+            conf=track_conf,
+            iou=track_iou,
+            imgsz=1280,
+            device='0'  # use GPU if available, else CPU
+        )
 
-        for r in results:
-            detections = sv.Detections.from_ultralytics(r)
-            det_boxes = detections.xyxy if len(detections) > 0 else np.empty((0, 4))
-            keypoints = r.keypoints.xy.cpu().numpy() if r.keypoints is not None else []
+        if not results:
+            continue
 
-            tracked = tracker.update_with_detections(detections)
+        r = results[0]
+        boxes_xyxy = r.boxes.xyxy.cpu().numpy() if r.boxes is not None else np.empty((0, 4))
+        track_ids = r.boxes.id.int().cpu().tolist() if r.boxes is not None and r.boxes.id is not None else []
+        keypoints = r.keypoints.xy.cpu().numpy() if r.keypoints is not None else None
+
+        for i, box_coords in enumerate(boxes_xyxy):
+            track_id = int(track_ids[i]) if i < len(track_ids) and track_ids[i] is not None else None
+            if track_id is None:
+                continue
+
+            # Track first-seen age gate (use processed frame index)
+            if track_id not in track_first_step:
+                track_first_step[track_id] = proc_idx
+            if (proc_idx - track_first_step[track_id]) < min_track_age:
+                continue
+
+            # Save throttle: only save per track every track_save_gap processed frames
+            if track_id in last_save_step and (proc_idx - last_save_step[track_id]) < track_save_gap:
+                continue
+
+            # Dedup per track id vs its last saved box
+            if track_id in last_saved_box_by_id and _iou(tuple(box_coords), last_saved_box_by_id[track_id]) > iou_dedup_thresh:
+                continue
+
+            # Pull keypoints aligned with current detection if available
+            best_kp = None
+            if keypoints is not None and keypoints.shape[0] > i:
+                kp_row = keypoints[i]
+                if kp_row.shape[0] >= 17:
+                    best_kp = kp_row
+
+            # crop full person output
+            px1, py1, px2, py2 = map(float, box_coords)
+            person_img, (px1, py1, px2, py2) = crop_with_padding(
+                target_view,
+                (px1, py1, px2, py2),
+                padding_percent=0.05
+            )
             
-            for i in range(len(tracked)):
-                # tracked is a Detections object with tracker_id/boxes
-                box_coords = tuple(map(float, tracked.xyxy[i]))
-                track_id = int(tracked.tracker_id[i]) if tracked.tracker_id is not None else i
-
-                # Track first-seen age gate (use processed frame index)
-                if track_id not in track_first_step:
-                    track_first_step[track_id] = proc_idx
-                if (proc_idx - track_first_step[track_id]) < min_track_age:
-                    continue
-
-                # Save throttle: only save per track every track_save_gap processed frames
-                if track_id in last_save_step and (proc_idx - last_save_step[track_id]) < track_save_gap:
-                    continue
-
-                # Dedup per track id vs its last saved box
-                if track_id in last_saved_box_by_id and _iou(box_coords, last_saved_box_by_id[track_id]) > iou_dedup_thresh:
-                    continue
-
-                # Find best matching detection for keypoints
-                best_kp = None
-                if det_boxes.size > 0 and len(keypoints) > 0:
-                    boxes_list = [tuple(map(float, b)) for b in det_boxes]
-                    ious = [_iou(box_coords, b) for b in boxes_list]
-                    best_idx = int(np.argmax(ious))
-                    if ious[best_idx] > 0.3:
-                        best_kp = keypoints[best_idx]
-
-                # crop full person output
-                px1, py1, px2, py2 = box_coords
-                person_img, (px1, py1, px2, py2) = crop_with_padding(
-                    target_view,
-                    (px1, py1, px2, py2),
-                    padding_percent=0.05
-                )
+            # Save Full Body
+            fname = f"frame_{frame_idx}_p{i}_t{track_id}.jpg"
+            if person_img is not None and person_img.size > 0:
+                ok = cv2.imwrite(os.path.join(dirs['full_body'], fname), person_img)
+                if ok:
+                    saved_count += 1
+                    last_save_step[track_id] = proc_idx
+                    last_saved_box_by_id[track_id] = tuple(box_coords)
+            
+            # Check Keypoints for parts (COCO format: 17 points)
+            # 5,6: Shoulders | 11,12: Hips | 13,14: Knees | 15,16: Ankles
+            if best_kp is not None:
+                kps = best_kp
                 
-                # Save Full Body
-                fname = f"frame_{frame_idx}_p{i}_t{track_id}.jpg"
-                if person_img is not None and person_img.size > 0:
-                    ok = cv2.imwrite(os.path.join(dirs['full_body'], fname), person_img)
-                    if ok:
-                        saved_count += 1
-                        last_save_step[track_id] = proc_idx
-                        last_saved_box_by_id[track_id] = box_coords
+                # Logic for splitting
+                # We need valid Y coordinates. If check confidence if possible, or just check non-zero.
                 
-                # Check Keypoints for parts (COCO format: 17 points)
-                # 5,6: Shoulders | 11,12: Hips | 13,14: Knees | 15,16: Ankles
-                if best_kp is not None:
-                    kps = best_kp
-                    
-                    # Logic for splitting
-                    # We need valid Y coordinates. If check confidence if possible, or just check non-zero.
-                    
-                    # Avg Y for Shoulders (Upper Limit of Upper Body, though usually Head is top of box)
-                    shoulder_y = np.mean([kps[5][1], kps[6][1]]) if kps[5][1] > 0 and kps[6][1] > 0 else py1
-                    
-                    # Avg Y for Hips (Split Upper/Lower)
-                    hip_y = np.mean([kps[11][1], kps[12][1]]) if kps[11][1] > 0 and kps[12][1] > 0 else None
-                    
-                    # Avg Y for Knees (Split Lower/Legs)
-                    knee_y = np.mean([kps[13][1], kps[14][1]]) if kps[13][1] > 0 and kps[14][1] > 0 else None
-                    
-                    # Fallback logic if pose fails: use relative height of bbox
-                    h_box = py2 - py1
-                    if hip_y is None: hip_y = py1 + h_box * 0.45
-                    if knee_y is None: knee_y = py1 + h_box * 0.75
-                    
-                    # Clamp values to current crop coordinates (global frame coords)
-                    # Upper Body: Box Top -> Hip
-                    if hip_y > py1:
-                        upper_bbox = (px1, py1, px2, int(hip_y))
-                        upper_img, _ = crop_with_padding(target_view, upper_bbox, 0)
-                        if upper_img is not None and upper_img.size > 0 and upper_img.shape[0] >= 160:
-                            cv2.imwrite(os.path.join(dirs['upper_body'], fname), upper_img)
-                    
-                    # Lower Body (Thighs/shorts): Hip -> Knee
-                    if hip_y < py2 and knee_y > hip_y:
-                        lower_bbox = (px1, int(hip_y), px2, int(knee_y))
-                        lower_img, _ = crop_with_padding(target_view, lower_bbox, 0)
-                        if lower_img is not None and lower_img.size > 0:
-                            cv2.imwrite(os.path.join(dirs['lower_body'], fname), lower_img)
-                    
-                    # Legs (Knees -> Feet): Knee -> Box Bottom
-                    if knee_y < py2:
-                        legs_bbox = (px1, int(knee_y), px2, py2)
-                        # Often allow 'legs' to be wider? No, keep box width.
-                        legs_img, _ = crop_with_padding(target_view, legs_bbox, 0)
-                        if legs_img is not None and legs_img.size > 0:
-                            cv2.imwrite(os.path.join(dirs['legs'], fname), legs_img)
+                # Avg Y for Shoulders (Upper Limit of Upper Body, though usually Head is top of box)
+                shoulder_y = np.mean([kps[5][1], kps[6][1]]) if kps[5][1] > 0 and kps[6][1] > 0 else py1   #kps[i] = [x, y] #kps[5][1] = 第 5 号关键点的 y
+                
+                # Avg Y for Hips (Split Upper/Lower)
+                hip_y = np.mean([kps[11][1], kps[12][1]]) if kps[11][1] > 0 and kps[12][1] > 0 else None
+                
+                # Avg Y for Knees (Split Lower/Legs)
+                knee_y = np.mean([kps[13][1], kps[14][1]]) if kps[13][1] > 0 and kps[14][1] > 0 else None
+                
+                # Fallback logic if pose fails: use relative height of bbox
+                h_box = py2 - py1
+                if hip_y is None: hip_y = py1 + h_box * 0.45
+                if knee_y is None: knee_y = py1 + h_box * 0.75
+                
+                # Clamp values to current crop coordinates (global frame coords)
+                # Upper Body: Box Top -> Hip
+                if hip_y > py1:
+                    upper_bbox = (px1, py1, px2, int(hip_y))
+                    upper_img, _ = crop_with_padding(target_view, upper_bbox, 0)
+                    if upper_img is not None and upper_img.size > 0 and upper_img.shape[0] >= 160:
+                        cv2.imwrite(os.path.join(dirs['upper_body'], fname), upper_img)
+                
+                # Lower Body (Thighs/shorts): Hip -> Knee
+                if hip_y < py2 and knee_y > hip_y:
+                    lower_bbox = (px1, int(hip_y), px2, int(knee_y))
+                    lower_img, _ = crop_with_padding(target_view, lower_bbox, 0)
+                    if lower_img is not None and lower_img.size > 0:
+                        cv2.imwrite(os.path.join(dirs['lower_body'], fname), lower_img)
+                
+                # Legs (Knees -> Feet): Knee -> Box Bottom
+                if knee_y < py2:
+                    legs_bbox = (px1, int(knee_y), px2, py2)
+                    # Often allow 'legs' to be wider? No, keep box width.
+                    legs_img, _ = crop_with_padding(target_view, legs_bbox, 0)
+                    if legs_img is not None and legs_img.size > 0:
+                        cv2.imwrite(os.path.join(dirs['legs'], fname), legs_img)
 
-                # only count already on successful save above
+            # only count already on successful save above
 
     cap.release()
     print(f"\nDone! Processed {frame_idx} frames. Saved {saved_count} person instances.")
@@ -279,7 +280,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process Fisheye Video for MobileNet Training Data")
     parser.add_argument("video_path", help="Path to input video")
     parser.add_argument("--output", default="training_data", help="Output directory folder name")
+    parser.add_argument(
+        "--tracker",
+        default="bytetrack.yaml",
+        help="Tracker config YAML (e.g., bytetrack.yaml or botsort.yaml) per Ultralytics docs"
+    )
     
     args = parser.parse_args()
     
-    process_video(args.video_path, args.output)
+    process_video(args.video_path, args.output, args.tracker)
