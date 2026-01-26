@@ -21,3 +21,7 @@ dist/
 # Training Data Output (Do not commit large datasets)
 training_data/
 *_data/
+
+backend/opencv_contrib_python-4.8.0.74-cp36-abi3-linux_x86_64.whl
+
+scripts/yolo26m-pose.pt

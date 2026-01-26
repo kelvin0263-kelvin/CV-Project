@@ -81,7 +81,7 @@ def process_video(video_path, output_base_dir, tracker_cfg="bytetrack.yaml"):
 
     # Load Model (YOLO-Pose for keypoints)
     print("Loading yolo26n-Pose model...")
-    model = YOLO("yolo26n-pose.pt")  # Load an official Pose model
+    model = YOLO("yolo26m-pose.pt")  # Load an official Pose model
 
 
     # Open Video
@@ -255,9 +255,9 @@ def process_video(video_path, output_base_dir, tracker_cfg="bytetrack.yaml"):
                     if upper_img is not None and upper_img.size > 0 and upper_img.shape[0] >= 160:
                         cv2.imwrite(os.path.join(dirs['upper_body'], fname), upper_img)
                 
-                # Lower Body (Thighs/shorts): Hip -> Knee
-                if hip_y < py2 and knee_y > hip_y:
-                    lower_bbox = (px1, int(hip_y), px2, int(knee_y))
+                # Lower Body (Hip down to feet, matching legs bottom boundary)
+                if hip_y < py2:
+                    lower_bbox = (px1, int(hip_y), px2, py2)
                     lower_img, _ = crop_with_padding(target_view, lower_bbox, 0)
                     if lower_img is not None and lower_img.size > 0:
                         cv2.imwrite(os.path.join(dirs['lower_body'], fname), lower_img)
