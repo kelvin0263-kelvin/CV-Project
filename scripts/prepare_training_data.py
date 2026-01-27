@@ -60,7 +60,7 @@ def crop_with_padding(image, bbox, padding_percent=0.1):
     
     return image[ny1:ny2, nx1:nx2], (nx1, ny1, nx2, ny2)
 
-def process_video(video_path, output_base_dir, tracker_cfg="bytetrack.yaml"):
+def process_video(video_path, output_base_dir, tracker_cfg="bytetrack.yaml", defish=True):
     # Sampling / tracking controls
     frame_stride = 3          # process every Nth frame to cut volume (~25fps -> ~8fps)
     track_save_gap = 10       # save once every N processed frames per track
@@ -101,22 +101,24 @@ def process_video(video_path, output_base_dir, tracker_cfg="bytetrack.yaml"):
     else:
         print("[System] CUDA not available, using CPU pipeline")
 
-    # Configure Defisher for 135 degrees
-    # Based on previous code: {'angle_z': 135, 'angle_up': 35, 'zoom': 80}
-    view_configs = [
-        {'angle_z': 135, 'angle_up': 35, 'zoom': 80}
-    ]
-    
-    # Initialize Processor
-    # Note: FisheyeMultiView expects (height, width)
-    # Use CUDA if available, but keep full resolution (no downscale) for training data
-    processor = FisheyeMultiView(
-        (height, width),
-        view_configs,
-        show_original=False,
-        use_cuda=cuda_available,
-        downscale_size=None  # Keep full resolution for training data
-    )
+    processor = None
+    if defish:
+        # Configure Defisher for 135 degrees
+        # Based on previous code: {'angle_z': 135, 'angle_up': 35, 'zoom': 80}
+        view_configs = [
+            {'angle_z': 135, 'angle_up': 35, 'zoom': 80}
+        ]
+        
+        # Initialize Processor
+        # Note: FisheyeMultiView expects (height, width)
+        # Use CUDA if available, but keep full resolution (no downscale) for training data
+        processor = FisheyeMultiView(
+            (height, width),
+            view_configs,
+            show_original=False,
+            use_cuda=cuda_available,
+            downscale_size=None  # Keep full resolution for training data
+        )
 
     frame_idx = 0          # raw frame index from video
     proc_idx = 0           # processed frame index after stride
@@ -142,23 +144,27 @@ def process_video(video_path, output_base_dir, tracker_cfg="bytetrack.yaml"):
         if frame_idx % 10 == 0:
             print(f"Processing frame {frame_idx}/{total_frames}...", end='\r')
 
-        # 1. Defish -> Get 135 degree view
-        # process_frame returns: processed_frames (dict), originals (dict), list_views
-        # The key for the first view will likely be 'partition_0' since we only passed 1 config
-        try:
-            processed_frames, _, _ = processor.process_frame(frame, overlay=False, view_id=None)
-            
-            # Extract the 135-degree view
-            # Since we only passed one config, it should be the first one. 
-            # FisheyeMultiView usually names keys as 'partition_{index}'
-            target_view = processed_frames.get('partition_0')
-            
-            if target_view is None:
-                continue
+        if defish and processor is not None:
+            # 1. Defish -> Get 135 degree view
+            # process_frame returns: processed_frames (dict), originals (dict), list_views
+            # The key for the first view will likely be 'partition_0' since we only passed 1 config
+            try:
+                processed_frames, _, _ = processor.process_frame(frame, overlay=False, view_id=None)
+                
+                # Extract the 135-degree view
+                # Since we only passed one config, it should be the first one. 
+                # FisheyeMultiView usually names keys as 'partition_{index}'
+                target_view = processed_frames.get('partition_0')
+                
+                if target_view is None:
+                    continue
 
-        except Exception as e:
-            print(f"Defish error frame {frame_idx}: {e}")
-            continue
+            except Exception as e:
+                print(f"Defish error frame {frame_idx}: {e}")
+                continue
+        else:
+            # Use raw frame without fisheye remap
+            target_view = frame
 
         # 2. Run Ultralytics tracking (ByteTrack/BOT-SORT via tracker YAML)
         # Uses track mode so boxes carry stable IDs across frames.
@@ -285,7 +291,12 @@ if __name__ == "__main__":
         default="bytetrack.yaml",
         help="Tracker config YAML (e.g., bytetrack.yaml or botsort.yaml) per Ultralytics docs"
     )
+    parser.add_argument(
+        "--no-defish",
+        action="store_true",
+        help="Disable fisheye remapping (use raw frames)"
+    )
     
     args = parser.parse_args()
     
-    process_video(args.video_path, args.output, args.tracker)
+    process_video(args.video_path, args.output, args.tracker, defish=not args.no_defish)

@@ -44,10 +44,10 @@ def format_file_detail(filename: str) -> str:
 
 st.set_page_config(page_title="Dataset Generator", layout="wide")
 
-st.title("🎥 Fisheye Training Data Generator")
+st.title(" Fisheye Training Data Generator")
 st.markdown("""
 This tool allows you to upload a fisheye video causing the script in the backend to:
-1. **Defish** to 135° view.
+1. **Defish** to 135° view (optional).
 2. **Detect People** (YOLOv8).
 3. **Split Body Parts** (YOLO-Pose).
 4. **Package** the results into a ZIP file.
@@ -94,6 +94,12 @@ elif source_choice == "Use workspace/uploads":
 if video_label:
     st.success(f"Ready to process: {video_label}")
 
+    defish_enabled = st.checkbox(
+        "Apply fisheye remap (defish to 135°)",
+        value=True,
+        help="Uncheck to use raw frames without defishing",
+    )
+
     # Process Button
     if st.button("Start Processing", type="primary"):
         progress_bar = st.progress(0)
@@ -123,7 +129,7 @@ if video_label:
                 with st.spinner(
                     'Running AI Models (Defish -> YOLO -> Pose)... This may take a while.'
                 ):
-                    process_video(video_path, output_dir)
+                    process_video(video_path, output_dir, defish=defish_enabled)
 
                 status_text.success("Processing Complete!")
                 progress_bar.progress(100)
@@ -144,7 +150,7 @@ if video_label:
                     zip_data = f.read()
 
                 st.download_button(
-                    label="⬇️ Download Dataset ZIP",
+                    label="⬇ Download Dataset ZIP",
                     data=zip_data,
                     file_name=f"dataset_{int(time.time())}.zip",
                     mime="application/zip"
