@@ -1,12 +1,23 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+from app.core.database import engine
+from app.models.base import Base
 from app.routers import camera_router
 
-# Initialize App
-app = FastAPI(title="CV-UI Backend", version="1.0.0")
 
-# Input/Output Config (Optional: Check folders)
-# BASE_DIR... UPLOAD_DIR... (Handled in router currently, ideally in config)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Create tables if they don't exist (dev convenience). In production use Alembic."""
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+
+
+# Initialize App
+app = FastAPI(title="CV-UI Backend", version="1.0.0", lifespan=lifespan)
 
 # --- CORS ---
 app.add_middleware(
