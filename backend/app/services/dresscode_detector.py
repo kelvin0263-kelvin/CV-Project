@@ -27,15 +27,19 @@ except Exception as e:
     dresscode_class_names = {}
 
 
+MIN_PERSON_HEIGHT = 160  # Minimum person bbox height in pixels (matches training quality)
+
+
 def crop_lower_body(frame: np.ndarray, bbox, keypoints=None) -> tuple:
     """
     Crop the lower-body region from a frame using pose keypoints.
 
-    Mirrors the logic in scripts/prepare_training_data.py (lines 245-269):
+    Matches training script (prepare_training_data.py) quality filters:
+    - Requires valid keypoints with both hips visible (no heuristic fallback)
     - Hip Y = average of keypoints 11,12 (COCO hip keypoints)
-    - Fallback: box_top + 0.45 * box_height
     - Lower body = (x1, hip_y, x2, box_bottom)
     - No padding (padding_percent=0, matching training)
+    - Person bbox must be at least MIN_PERSON_HEIGHT pixels tall
 
     Args:
         frame: Full-resolution frame (numpy array, HxWxC)
@@ -48,17 +52,21 @@ def crop_lower_body(frame: np.ndarray, bbox, keypoints=None) -> tuple:
     h, w = frame.shape[:2]
     px1, py1, px2, py2 = map(float, bbox)
 
-    # Calculate hip_y from keypoints (COCO: 11=left_hip, 12=right_hip)
-    hip_y = None
-    if keypoints is not None and len(keypoints) >= 17:
-        kps = keypoints
-        if kps[11][1] > 0 and kps[12][1] > 0:
-            hip_y = float(np.mean([kps[11][1], kps[12][1]]))
+    # Filter: person bbox must be tall enough (training data was full-res)
+    person_h = py2 - py1
+    if person_h < MIN_PERSON_HEIGHT:
+        return None, None
 
-    # Fallback: use relative height of bbox (matches training script line 253)
-    if hip_y is None:
-        h_box = py2 - py1
-        hip_y = py1 + h_box * 0.45
+    # Require valid keypoints (training script line 236: if best_kp is not None)
+    if keypoints is None or len(keypoints) < 17:
+        return None, None
+
+    # Both hip keypoints must be visible (training script line 246)
+    kps = keypoints
+    if kps[11][1] <= 0 or kps[12][1] <= 0:
+        return None, None
+
+    hip_y = float(np.mean([kps[11][1], kps[12][1]]))
 
     # Lower body: hip -> feet (matching training script line 265-267)
     if hip_y >= py2:
