@@ -20,6 +20,20 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     """Upgrade schema."""
+    # Skip if tables already exist (created by Base.metadata.create_all)
+    conn = op.get_bind()
+    result = conn.execute(
+        sa.text(
+            "SELECT EXISTS ("
+            "  SELECT 1 FROM information_schema.tables "
+            "  WHERE table_name = 'cameras'"
+            ")"
+        )
+    )
+    if result.scalar():
+        print("[Alembic] Tables already exist, skipping initial create.")
+        return
+
     # --- cameras ---
     op.create_table(
         "cameras",
