@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -6,6 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.database import engine
 from app.models.base import Base
 from app.routers import camera_router
+from app.routers import policy_router
+from app.routers import detection_router
 
 
 @asynccontextmanager
@@ -13,7 +16,14 @@ async def lifespan(app: FastAPI):
     """Create tables if they don't exist (dev convenience). In production use Alembic."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # Start background task to persist violation events from the video producer
+    task = asyncio.create_task(detection_router.violation_persistence_loop())
+
     yield
+
+    # Cleanup
+    task.cancel()
 
 
 # Initialize App
@@ -30,6 +40,8 @@ app.add_middleware(
 
 # --- Include Routers ---
 app.include_router(camera_router.router)
+app.include_router(policy_router.router)
+app.include_router(detection_router.router)
 
 if __name__ == "__main__":
     import uvicorn

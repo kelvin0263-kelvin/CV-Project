@@ -12,7 +12,7 @@ const RECENT_DETECTIONS = [
 ];
 
 const CameraFeedCard = ({ camera }) => {
-    const [stats, setStats] = useState({ fps: 0 });
+    const [stats, setStats] = useState({ fps: 0, people_count: 0 });
     const wsUrl = getWSUrl(`/ws/${camera.id}`);
 
     return (
@@ -33,7 +33,7 @@ const CameraFeedCard = ({ camera }) => {
             )}
 
 
-            {/* Simulated Overlays */}
+            {/* Overlays */}
             <div className="absolute inset-0 p-4 pointer-events-none">
                 {/* Top Bar: Camera Info */}
                 <div className="flex justify-between items-start">
@@ -42,8 +42,13 @@ const CameraFeedCard = ({ camera }) => {
                         {camera.name}
                     </div>
                     <div className="flex gap-2">
+                        {stats.people_count > 0 && (
+                            <div className="bg-black/60 text-white text-xs px-2 py-1 rounded backdrop-blur-sm flex items-center gap-1">
+                                <Users className="w-3 h-3" />
+                                {stats.people_count}
+                            </div>
+                        )}
                         <div className="bg-black/60 text-white text-xs px-2 py-1 rounded backdrop-blur-sm flex items-center gap-1">
-                            <Users className="w-3 h-3" />
                             {stats.fps > 0 ? stats.fps : camera.fps} FPS
                         </div>
                     </div>

@@ -55,18 +55,27 @@ async def websocket_endpoint(websocket: WebSocket, camera_id: str):
 
     try:
         while True:
-            # Simply fetch latest frame from global buffer
+            # Fetch latest frame + metadata from global buffer
             if source_path in FRAME_BUFFERS:
                 frames = FRAME_BUFFERS[source_path]
                 if target_key in frames:
                     b64_data = frames[target_key]
 
-                    # Extract FPS from meta
-                    fps = 0
-                    if '__meta__' in frames:
-                        fps = frames['__meta__'].get('fps', 0)
+                    # Extract metadata
+                    meta = frames.get('__meta__', {})
+                    fps = meta.get('fps', 0)
+                    people_count = meta.get('people_count', 0)
 
-                    await websocket.send_json({"image": b64_data, "fps": fps})
+                    # Get detections for this specific view
+                    all_detections = meta.get('detections', {})
+                    view_detections = all_detections.get(target_key, [])
+
+                    await websocket.send_json({
+                        "image": b64_data,
+                        "fps": fps,
+                        "people_count": people_count,
+                        "detections": view_detections,
+                    })
 
             # Consumer limit (~25FPS update to client)
             await asyncio.sleep(0.04)
