@@ -3,7 +3,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete as sa_delete
 from typing import List
 import uuid
-import shutil
 import os
 import asyncio
 
@@ -141,8 +140,15 @@ async def upload_video(
         filename = f"{file_id}_{file.filename}"
         input_path = os.path.join(UPLOAD_DIR, filename)
 
+        # Stream file to disk in 1MB chunks to handle large files
+        CHUNK_SIZE = 1024 * 1024  # 1 MB
         with open(input_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            while True:
+                chunk = await file.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                buffer.write(chunk)
+        print(f"[Upload] Saved {filename} ({os.path.getsize(input_path) / 1024 / 1024:.1f} MB)")
 
         new_cameras: list[CameraRead] = []
 

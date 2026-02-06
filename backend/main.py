@@ -19,23 +19,13 @@ async def lifespan(app: FastAPI):
 
     # Sync dress code policy to runtime on startup
     try:
-        from app.services.video_processor import get_policy as _get_runtime_policy
-
         async with AsyncSessionLocal() as db:
             policy = await policy_router._get_or_create_policy(db)
             await policy_router._sync_policy_to_runtime(db, policy)
             await db.commit()
-
-            runtime = _get_runtime_policy()
-            print(f"[Startup] Dress code policy synced to runtime:")
-            print(f"  restricted_labels  = {runtime.get('restricted_labels')}")
-            print(f"  confidence_thresh  = {runtime.get('confidence_threshold')}")
-            print(f"  detection_views    = {runtime.get('detection_views')}")
-            print(f"  view_to_camera_id  = {runtime.get('view_to_camera_id')}")
-            print(f"  enabled_camera_ids = {runtime.get('enabled_camera_ids')}")
+            print("[Startup] Dress code policy synced to runtime")
     except Exception as e:
         print(f"[Startup] Warning: Could not sync policy: {e}")
-        import traceback; traceback.print_exc()
 
     # Start background task to persist violation events from the video producer
     task = asyncio.create_task(detection_router.violation_persistence_loop())
@@ -65,4 +55,10 @@ app.include_router(detection_router.router)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        timeout_keep_alive=300,  # Keep connections alive longer for large uploads
+    )

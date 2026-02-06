@@ -1,9 +1,8 @@
 """
 Dress Code Policy API
 
-GET  /api/dresscode-policy        -- get the current policy (from DB)
-PUT  /api/dresscode-policy        -- update the policy from the config panel
-GET  /api/debug/policy            -- inspect the in-memory runtime policy
+GET  /api/dresscode-policy  -- get the current policy (from DB)
+PUT  /api/dresscode-policy  -- update the policy from the config panel
 """
 
 from fastapi import APIRouter, Depends
@@ -14,7 +13,7 @@ from app.core.database import get_db
 from app.models.dresscode_policy import DressCodePolicy
 from app.models.stream_config import StreamConfig
 from app.schemas.dresscode_policy import DressCodePolicyRead, DressCodePolicyUpdate
-from app.services.video_processor import update_policy, get_policy as get_runtime_policy
+from app.services.video_processor import update_policy
 
 router = APIRouter()
 
@@ -100,12 +99,3 @@ async def update_policy_endpoint(
     await _sync_policy_to_runtime(db, policy)
 
     return policy
-
-
-@router.get("/api/debug/policy")
-async def debug_runtime_policy():
-    """
-    Return the current in-memory policy dict used by the video processor.
-    Useful for diagnosing why violations are or aren't being flagged.
-    """
-    return get_runtime_policy()

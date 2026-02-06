@@ -122,10 +122,15 @@ const SystemConfiguration = () => {
 
             try {
                 const apiUrl = getApiBaseUrl();
+                // Large files need a generous timeout (10 minutes)
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 10 * 60 * 1000);
                 const res = await fetch(`${apiUrl}/api/upload_and_process`, {
                     method: 'POST',
-                    body: uploadData
+                    body: uploadData,
+                    signal: controller.signal,
                 });
+                clearTimeout(timeoutId);
                 if (!res.ok) throw new Error("Upload failed");
                 const data = await res.json();
                 console.log("Upload success:", data);
