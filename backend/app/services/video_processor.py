@@ -451,15 +451,32 @@ def _get_detection_views() -> list:
     return p.get("detection_views", ["partition_3"])
 
 
+_policy_log_counter = 0  # throttle policy debug logs
+
+
 def _apply_policy_and_save(detections, track_state, frame, source_path, view_key=None):
     """
     Apply the current policy to mark violations and save snapshot evidence.
     Deduplicates by track_id (one snapshot per track).
     """
+    global _policy_log_counter
     policy = get_policy()
     restricted = set(policy.get("restricted_labels", []))
     threshold = policy.get("confidence_threshold", 0.8)
     view_to_camera_id = policy.get("view_to_camera_id", {})
+
+    # --- DEBUG: log policy state every ~30 calls (≈ every 10s at stride=3) ---
+    _policy_log_counter += 1
+    if _policy_log_counter % 30 == 1:
+        print(
+            f"[Policy-Debug] view_key={view_key} | restricted={restricted} | "
+            f"threshold={threshold} | detection_views={policy.get('detection_views')} | "
+            f"view_to_camera_id keys={list(view_to_camera_id.keys())}"
+        )
+
+    if not restricted:
+        if _policy_log_counter % 30 == 1:
+            print("[Policy-Debug] WARNING: restricted_labels is EMPTY — no violations will ever be flagged!")
 
     # Resolve camera_id from the view key
     camera_id = view_to_camera_id.get(view_key) if view_key else None
@@ -468,6 +485,16 @@ def _apply_policy_and_save(detections, track_state, frame, source_path, view_key
         label = det.get("label")
         conf = det.get("confidence")
         track_id = det.get("track_id")
+
+        # --- DEBUG: log each detection's violation check ---
+        label_match = label in restricted if label else False
+        conf_pass = conf >= threshold if conf is not None else False
+        if label:
+            print(
+                f"[Violation-Check] track={track_id} label={label!r} conf={conf} | "
+                f"in_restricted={label_match} conf>={threshold}={conf_pass} | "
+                f"result={'VIOLATION' if (label_match and conf_pass) else 'OK'}"
+            )
 
         if label and conf and label in restricted and conf >= threshold:
             det["violation"] = True
