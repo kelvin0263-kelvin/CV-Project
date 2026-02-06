@@ -20,7 +20,7 @@ const DressCode = () => {
 
     // Available clothing labels (from the model)
     const clothingItems = [
-        { id: 'short_pants', name: 'Short Pants', description: 'Shorts, bermudas, etc.' },
+        { id: 'shorts', name: 'Shorts', description: 'Shorts, bermudas, etc.' },
         { id: 'long_pants', name: 'Long Pants', description: 'Jeans, trousers, slacks, etc.' },
     ];
 
@@ -37,7 +37,7 @@ const DressCode = () => {
                 setPolicy(policyData);
                 setEnabledCameraIds(policyData.enabled_camera_ids || []);
                 setConfidence(Math.round((policyData.confidence_threshold || 0.8) * 100));
-                setRestrictedLabels(policyData.restricted_labels || ['short_pants']);
+                setRestrictedLabels(policyData.restricted_labels || ['shorts']);
                 setPolicyEnabled(policyData.enabled !== false);
             })
             .catch(err => console.error("Failed to load config:", err))

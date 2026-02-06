@@ -425,7 +425,7 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
 # Default policy -- overridden at runtime when policy is loaded from DB
 _current_policy = {
     "enabled_camera_ids": [],
-    "restricted_labels": ["short_pants"],
+    "restricted_labels": ["shorts"],
     "confidence_threshold": 0.8,
     "detection_views": ["partition_3"],  # default view keys for detection
 }

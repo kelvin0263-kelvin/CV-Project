@@ -3,7 +3,7 @@ Dress Code Detector Service
 
 Loads the best.pt YOLO classification model and provides functions to:
 1. Crop lower-body regions from a frame using COCO pose keypoints
-2. Classify the crop (e.g., long_pants vs short_pants)
+2. Classify the crop (e.g., long_pants vs shorts)
 
 The cropping logic mirrors scripts/prepare_training_data.py exactly
 so that inference matches the training data distribution.
@@ -19,7 +19,7 @@ from ultralytics import YOLO
 print("[System] Loading Dress Code Classification Model (best.pt)...")
 try:
     dresscode_model = YOLO("best.pt")
-    dresscode_class_names = dresscode_model.names  # e.g. {0: 'long_pants', 1: 'short_pants'}
+    dresscode_class_names = dresscode_model.names  # e.g. {0: 'long_pants', 1: 'shorts'}
     print(f"[System] Dress code model loaded. Classes: {dresscode_class_names}")
 except Exception as e:
     print(f"[System] Warning: Failed to load dress code model: {e}")
@@ -93,7 +93,7 @@ def classify_lower_body(frame: np.ndarray, bbox, keypoints=None, device='0') -> 
     Returns:
         Dict with classification result, or None if classification failed:
         {
-            "label": "short_pants",
+            "label": "shorts",
             "confidence": 0.91,
             "lower_bbox": [x1, y1, x2, y2]  # lower-body crop coordinates
         }

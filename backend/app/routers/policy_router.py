@@ -26,7 +26,7 @@ async def _get_or_create_policy(db: AsyncSession) -> DressCodePolicy:
     if policy is None:
         policy = DressCodePolicy(
             enabled_camera_ids=[],
-            restricted_labels=["short_pants"],
+            restricted_labels=["shorts"],
             confidence_threshold=0.8,
             enabled=True,
         )
@@ -66,7 +66,7 @@ async def _sync_policy_to_runtime(db: AsyncSession, policy: DressCodePolicy):
 
     update_policy({
         "enabled_camera_ids": policy.enabled_camera_ids or [],
-        "restricted_labels": policy.restricted_labels or ["short_pants"],
+        "restricted_labels": policy.restricted_labels or ["shorts"],
         "confidence_threshold": policy.confidence_threshold or 0.8,
         "detection_views": detection_views,
         "view_to_camera_id": view_to_camera_id,
