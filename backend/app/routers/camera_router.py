@@ -195,8 +195,7 @@ async def upload_video(
             return CameraRead.model_validate(db_camera)
 
         if enable_fisheye:
-            new_cameras.append(await create_cam("Original", -1))
-            # Define angles corresponding to the 8 views
+            # Only create cameras for selected views (no original fisheye view)
             angles = [0, 45, 90, 135, 180, 225, 270, 315]
             for i, angle in enumerate(angles):
                 # Check if this view was selected

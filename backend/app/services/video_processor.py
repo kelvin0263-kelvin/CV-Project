@@ -136,7 +136,7 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
         processor = FisheyeMultiView(
             (height, width),
             final_configs,
-            show_original=True,
+            show_original=False,
             use_cuda=cuda_available,
             downscale_size=None,  # Keep full resolution for accurate classification
         )
@@ -342,7 +342,8 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
                         orig_h, orig_w = img.shape[:2]
 
                         # Run detection on target views only, respecting stride
-                        if run_detection_this_frame and key in _get_detection_views():
+                        active_views = _get_detection_views(source_path)
+                        if run_detection_this_frame and key in active_views:
                             detections, people_count, track_state = run_detection_and_classify(
                                 img, frame_count, track_state
                             )
@@ -354,7 +355,7 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
                             view_detections[key] = scaled
                             cached_detections = scaled
                             cached_people_count = people_count
-                        elif key in _get_detection_views():
+                        elif key in active_views:
                             # Reuse cached detections
                             view_detections[key] = cached_detections
                         else:
@@ -390,7 +391,7 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
             try:
                 orig_h, orig_w = frame.shape[:2]
 
-                if run_detection_this_frame:
+                if run_detection_this_frame and "original" in _get_detection_views(source_path):
                     detections, people_count, track_state = run_detection_and_classify(
                         frame, frame_count, track_state
                     )
@@ -427,7 +428,8 @@ _current_policy = {
     "enabled_camera_ids": [],
     "restricted_labels": ["shorts"],
     "confidence_threshold": 0.8,
-    "detection_views": [],  # empty until cameras are enabled in the config panel
+    "detection_map": {},       # source_path -> set of view_keys
+    "camera_id_map": {},       # "source_path||view_key" -> camera_id
 }
 _policy_lock = threading.Lock()
 
@@ -437,7 +439,8 @@ def update_policy(policy: dict):
     global _current_policy
     with _policy_lock:
         _current_policy = policy
-    print(f"[Policy] Updated: {policy}")
+    print(f"[Policy] Updated: enabled_cameras={policy.get('enabled_camera_ids')}, "
+          f"detection_map keys={list(policy.get('detection_map', {}).keys())}")
 
 
 def get_policy() -> dict:
@@ -445,10 +448,18 @@ def get_policy() -> dict:
         return dict(_current_policy)
 
 
-def _get_detection_views() -> list:
-    """Get list of view keys that should run detection (e.g. ['partition_3'])."""
+def _get_detection_views(source_path: str) -> set:
+    """Get set of view keys that should run detection for a specific source."""
     p = get_policy()
-    return p.get("detection_views", ["partition_3"])
+    detection_map = p.get("detection_map", {})
+    return detection_map.get(source_path, set())
+
+
+def _get_camera_id(source_path: str, view_key: str) -> str | None:
+    """Resolve the camera_id for a specific source + view."""
+    p = get_policy()
+    camera_id_map = p.get("camera_id_map", {})
+    return camera_id_map.get(f"{source_path}||{view_key}")
 
 
 def _apply_policy_and_save(detections, track_state, frame, source_path, view_key=None):
@@ -459,10 +470,9 @@ def _apply_policy_and_save(detections, track_state, frame, source_path, view_key
     policy = get_policy()
     restricted = set(policy.get("restricted_labels", []))
     threshold = policy.get("confidence_threshold", 0.8)
-    view_to_camera_id = policy.get("view_to_camera_id", {})
 
-    # Resolve camera_id from the view key
-    camera_id = view_to_camera_id.get(view_key) if view_key else None
+    # Resolve camera_id from the source_path + view_key
+    camera_id = _get_camera_id(source_path, view_key) if view_key else None
 
     for det in detections:
         label = det.get("label")

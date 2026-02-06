@@ -37,14 +37,18 @@ async def _get_or_create_policy(db: AsyncSession) -> DressCodePolicy:
 
 async def _sync_policy_to_runtime(db: AsyncSession, policy: DressCodePolicy):
     """
-    Resolve enabled_camera_ids -> view partition keys and push
+    Resolve enabled_camera_ids -> per-source detection config and push
     the policy to the video processor runtime.
+
+    Builds a mapping keyed by (source_path, view_key) so that multiple
+    videos can each have independent detection settings.
     """
-    detection_views = []
-    view_to_camera_id = {}  # maps view key -> camera_id for violation tagging
+    # Maps: source_path -> set of view_keys that should run detection
+    detection_map: dict[str, set[str]] = {}
+    # Maps: (source_path, view_key) -> camera_id  for DB event tagging
+    camera_id_map: dict[tuple[str, str], str] = {}
 
     if policy.enabled and policy.enabled_camera_ids:
-        # Look up which view_index each enabled camera maps to
         result = await db.execute(
             select(StreamConfig).where(
                 StreamConfig.camera_id.in_(policy.enabled_camera_ids)
@@ -52,20 +56,20 @@ async def _sync_policy_to_runtime(db: AsyncSession, policy: DressCodePolicy):
         )
         configs = result.scalars().all()
         for sc in configs:
-            if sc.view_index == -1:
-                view_key = "original"
-            else:
-                view_key = f"partition_{sc.view_index}"
-            detection_views.append(view_key)
-            view_to_camera_id[view_key] = sc.camera_id
+            view_key = "original" if sc.view_index == -1 else f"partition_{sc.view_index}"
+            src = sc.source_path
 
-    # If no cameras enabled, detection_views stays empty -- no detection runs
+            if src not in detection_map:
+                detection_map[src] = set()
+            detection_map[src].add(view_key)
+            camera_id_map[(src, view_key)] = sc.camera_id
+
     update_policy({
         "enabled_camera_ids": policy.enabled_camera_ids or [],
         "restricted_labels": policy.restricted_labels or ["shorts"],
         "confidence_threshold": policy.confidence_threshold or 0.8,
-        "detection_views": detection_views,
-        "view_to_camera_id": view_to_camera_id,
+        "detection_map": detection_map,
+        "camera_id_map": {f"{k[0]}||{k[1]}": v for k, v in camera_id_map.items()},
     })
 
 
