@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.core.database import engine
+from app.core.database import engine, AsyncSessionLocal
 from app.models.base import Base
 from app.routers import camera_router
 from app.routers import policy_router
@@ -16,6 +16,16 @@ async def lifespan(app: FastAPI):
     """Create tables if they don't exist (dev convenience). In production use Alembic."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # Sync dress code policy to runtime on startup
+    try:
+        async with AsyncSessionLocal() as db:
+            policy = await policy_router._get_or_create_policy(db)
+            await policy_router._sync_policy_to_runtime(db, policy)
+            await db.commit()
+            print("[Startup] Dress code policy synced to runtime")
+    except Exception as e:
+        print(f"[Startup] Warning: Could not sync policy: {e}")
 
     # Start background task to persist violation events from the video producer
     task = asyncio.create_task(detection_router.violation_persistence_loop())

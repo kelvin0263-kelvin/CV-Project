@@ -41,6 +41,8 @@ async def _sync_policy_to_runtime(db: AsyncSession, policy: DressCodePolicy):
     the policy to the video processor runtime.
     """
     detection_views = []
+    view_to_camera_id = {}  # maps view key -> camera_id for violation tagging
+
     if policy.enabled and policy.enabled_camera_ids:
         # Look up which view_index each enabled camera maps to
         result = await db.execute(
@@ -51,9 +53,11 @@ async def _sync_policy_to_runtime(db: AsyncSession, policy: DressCodePolicy):
         configs = result.scalars().all()
         for sc in configs:
             if sc.view_index == -1:
-                detection_views.append("original")
+                view_key = "original"
             else:
-                detection_views.append(f"partition_{sc.view_index}")
+                view_key = f"partition_{sc.view_index}"
+            detection_views.append(view_key)
+            view_to_camera_id[view_key] = sc.camera_id
 
     # If no views resolved, keep default
     if not detection_views:
@@ -64,6 +68,7 @@ async def _sync_policy_to_runtime(db: AsyncSession, policy: DressCodePolicy):
         "restricted_labels": policy.restricted_labels or ["short_pants"],
         "confidence_threshold": policy.confidence_threshold or 0.8,
         "detection_views": detection_views,
+        "view_to_camera_id": view_to_camera_id,
     })
 
 

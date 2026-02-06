@@ -79,9 +79,14 @@ async def violation_persistence_loop():
         try:
             async with AsyncSessionLocal() as session:
                 for evt in events:
+                    camera_id = evt.get("camera_id")
+                    if not camera_id:
+                        print(f"[DB] Skipping event {evt['id']}: no camera_id resolved")
+                        continue
+
                     db_event = DetectionEvent(
                         id=evt["id"],
-                        camera_id=_resolve_camera_id(evt.get("source_path"), evt.get("track_id")),
+                        camera_id=camera_id,
                         event_type=evt.get("event_type", "Dress Code Violation"),
                         details={
                             "label": evt.get("label"),
@@ -97,15 +102,3 @@ async def violation_persistence_loop():
                 print(f"[DB] Saved {len(events)} violation event(s)")
         except Exception as e:
             print(f"[DB] Error saving violation events: {e}")
-
-
-def _resolve_camera_id(source_path: str, track_id) -> str:
-    """
-    Best-effort resolve a camera_id from the source path.
-    Since violations come from the video producer thread which doesn't
-    know the camera_id directly, we use a placeholder.
-    The frontend can cross-reference via the source_path in details.
-    """
-    # Return a generic identifier; camera_id will be refined when
-    # we have per-camera policy with enabled_camera_ids
-    return source_path or "unknown"

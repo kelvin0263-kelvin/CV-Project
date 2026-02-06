@@ -348,7 +348,7 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
                             )
                             # Check policy for violations & save snapshots
                             detections = _apply_policy_and_save(
-                                detections, track_state, img, source_path
+                                detections, track_state, img, source_path, view_key=key
                             )
                             scaled = scale_detections(detections, orig_h, orig_w)
                             view_detections[key] = scaled
@@ -395,7 +395,7 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
                         frame, frame_count, track_state
                     )
                     detections = _apply_policy_and_save(
-                        detections, track_state, frame, source_path
+                        detections, track_state, frame, source_path, view_key="original"
                     )
                     scaled = scale_detections(detections, orig_h, orig_w)
                     cached_detections = scaled
@@ -451,7 +451,7 @@ def _get_detection_views() -> list:
     return p.get("detection_views", ["partition_3"])
 
 
-def _apply_policy_and_save(detections, track_state, frame, source_path):
+def _apply_policy_and_save(detections, track_state, frame, source_path, view_key=None):
     """
     Apply the current policy to mark violations and save snapshot evidence.
     Deduplicates by track_id (one snapshot per track).
@@ -459,6 +459,10 @@ def _apply_policy_and_save(detections, track_state, frame, source_path):
     policy = get_policy()
     restricted = set(policy.get("restricted_labels", []))
     threshold = policy.get("confidence_threshold", 0.8)
+    view_to_camera_id = policy.get("view_to_camera_id", {})
+
+    # Resolve camera_id from the view key
+    camera_id = view_to_camera_id.get(view_key) if view_key else None
 
     for det in detections:
         label = det.get("label")
@@ -469,7 +473,7 @@ def _apply_policy_and_save(detections, track_state, frame, source_path):
             det["violation"] = True
 
             # Dedup: only save once per track
-            if track_id is not None:
+            if track_id is not None and camera_id is not None:
                 ts = track_state.get(track_id, {})
                 if not ts.get("violation_saved", False):
                     # Save snapshot evidence
@@ -483,6 +487,7 @@ def _apply_policy_and_save(detections, track_state, frame, source_path):
                     # Queue violation event for async DB write
                     queue_violation_event({
                         "id": snapshot_id,
+                        "camera_id": camera_id,
                         "source_path": source_path,
                         "track_id": track_id,
                         "event_type": "Dress Code Violation",
