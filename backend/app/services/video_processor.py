@@ -427,7 +427,7 @@ _current_policy = {
     "enabled_camera_ids": [],
     "restricted_labels": ["shorts"],
     "confidence_threshold": 0.8,
-    "detection_views": ["partition_3"],  # default view keys for detection
+    "detection_views": [],  # empty until cameras are enabled in the config panel
 }
 _policy_lock = threading.Lock()
 

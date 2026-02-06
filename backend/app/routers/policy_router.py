@@ -60,10 +60,7 @@ async def _sync_policy_to_runtime(db: AsyncSession, policy: DressCodePolicy):
             detection_views.append(view_key)
             view_to_camera_id[view_key] = sc.camera_id
 
-    # If no views resolved, keep default
-    if not detection_views:
-        detection_views = ["partition_3"]
-
+    # If no cameras enabled, detection_views stays empty -- no detection runs
     update_policy({
         "enabled_camera_ids": policy.enabled_camera_ids or [],
         "restricted_labels": policy.restricted_labels or ["shorts"],

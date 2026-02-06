@@ -63,27 +63,44 @@ async def get_snapshot(event_id: str):
 # ---------------------------------------------------------------------------
 # Background task: drain violation queue and persist to DB
 # ---------------------------------------------------------------------------
+_retry_buffer: list = []  # Events that failed to save -- retried next cycle
+MAX_RETRY_BUFFER = 200   # Cap to prevent unbounded growth
+
+
 async def violation_persistence_loop():
     """
     Runs as an asyncio background task. Periodically drains the
     violation queue populated by the video processor thread and
     writes events to the database.
+
+    Failed events are kept in a retry buffer and retried on the
+    next cycle. Events are saved one-by-one so a single bad event
+    doesn't block the rest of the batch.
     """
     while True:
         await asyncio.sleep(2)  # Check every 2 seconds
 
         events = drain_violation_queue()
+
+        # Prepend any events that failed last time
+        if _retry_buffer:
+            events = _retry_buffer[:] + events
+            _retry_buffer.clear()
+
         if not events:
             continue
 
-        try:
-            async with AsyncSessionLocal() as session:
-                for evt in events:
-                    camera_id = evt.get("camera_id")
-                    if not camera_id:
-                        print(f"[DB] Skipping event {evt['id']}: no camera_id resolved")
-                        continue
+        saved = 0
+        failed = 0
 
+        for evt in events:
+            camera_id = evt.get("camera_id")
+            if not camera_id:
+                print(f"[DB] Skipping event {evt['id']}: no camera_id resolved")
+                continue
+
+            try:
+                async with AsyncSessionLocal() as session:
                     db_event = DetectionEvent(
                         id=evt["id"],
                         camera_id=camera_id,
@@ -98,7 +115,16 @@ async def violation_persistence_loop():
                         },
                     )
                     session.add(db_event)
-                await session.commit()
-                print(f"[DB] Saved {len(events)} violation event(s)")
-        except Exception as e:
-            print(f"[DB] Error saving violation events: {e}")
+                    await session.commit()
+                    saved += 1
+            except Exception as e:
+                failed += 1
+                # Keep for retry (up to cap)
+                if len(_retry_buffer) < MAX_RETRY_BUFFER:
+                    _retry_buffer.append(evt)
+                print(f"[DB] Failed to save event {evt['id']}: {e}")
+
+        if saved:
+            print(f"[DB] Saved {saved} violation event(s)")
+        if failed:
+            print(f"[DB] {failed} event(s) failed, {len(_retry_buffer)} in retry buffer")
