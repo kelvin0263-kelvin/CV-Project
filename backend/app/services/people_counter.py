@@ -58,6 +58,7 @@ class PeopleCounter:
         h, w = frame_shape
 
         # 1. Compute normalised centroids for this frame
+        #    Priority: ankle midpoint -> hip midpoint -> bbox bottom-center
         current_centroids: dict[int, tuple[float, float]] = {}
         for det in detections:
             track_id = det.get("track_id")
@@ -65,9 +66,41 @@ class PeopleCounter:
             if track_id is None or bbox is None:
                 continue
 
-            # Bottom-center of bounding box, normalised to 0-1
-            cx = ((bbox[0] + bbox[2]) / 2.0) / w
-            cy = bbox[3] / h  # bottom of box
+            kps = det.get("keypoints")
+            cx, cy = None, None
+
+            if kps:
+                # Try ankles first (most accurate ground contact point)
+                la = kps.get("left_ankle")
+                ra = kps.get("right_ankle")
+                if la and ra:
+                    cx = ((la[0] + ra[0]) / 2.0) / w
+                    cy = ((la[1] + ra[1]) / 2.0) / h
+                elif la:
+                    cx = la[0] / w
+                    cy = la[1] / h
+                elif ra:
+                    cx = ra[0] / w
+                    cy = ra[1] / h
+                else:
+                    # Fall back to hips (more stable, less occluded)
+                    lh = kps.get("left_hip")
+                    rh = kps.get("right_hip")
+                    if lh and rh:
+                        cx = ((lh[0] + rh[0]) / 2.0) / w
+                        cy = ((lh[1] + rh[1]) / 2.0) / h
+                    elif lh:
+                        cx = lh[0] / w
+                        cy = lh[1] / h
+                    elif rh:
+                        cx = rh[0] / w
+                        cy = rh[1] / h
+
+            # Ultimate fallback: bbox bottom-center
+            if cx is None or cy is None:
+                cx = ((bbox[0] + bbox[2]) / 2.0) / w
+                cy = bbox[3] / h  # bottom of box
+
             current_centroids[int(track_id)] = (cx, cy)
 
         # 2. Line-crossing detection
