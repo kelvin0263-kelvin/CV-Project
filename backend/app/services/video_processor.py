@@ -254,23 +254,10 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
                                 "last_classified_frame": frame_count,
                             })
 
-                # Extract keypoints for this person (COCO 17-point format)
-                # Indices: 11=left_hip, 12=right_hip, 15=left_ankle, 16=right_ankle
-                person_keypoints = None
-                if keypoints is not None and keypoints.shape[0] > i:
-                    kps = keypoints[i]  # shape: (17, 2)
-                    person_keypoints = {
-                        "left_hip": list(map(float, kps[11])) if kps[11][0] > 0 else None,
-                        "right_hip": list(map(float, kps[12])) if kps[12][0] > 0 else None,
-                        "left_ankle": list(map(float, kps[15])) if kps[15][0] > 0 else None,
-                        "right_ankle": list(map(float, kps[16])) if kps[16][0] > 0 else None,
-                    }
-
                 # Build detection entry
                 det = {
                     "track_id": track_id,
                     "person_bbox": person_bbox,
-                    "keypoints": person_keypoints,  # hip/ankle keypoints for counting
                     "label": cls_result["label"] if cls_result else None,
                     "confidence": cls_result["confidence"] if cls_result else None,
                     "lower_bbox": cls_result["lower_bbox"] if cls_result else None,

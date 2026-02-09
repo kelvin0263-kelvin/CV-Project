@@ -1,11 +1,13 @@
 """
 People Counting Service
 
-Provides line-crossing detection (segment intersection + cross product)
-and ROI zone counting (ray-casting point-in-polygon) logic.
+Supports TWO counting methods (can coexist):
 
-All line/zone coordinates are stored in normalized (0-1) form and
-converted to pixel coordinates at runtime using the frame shape.
+1. **Line-crossing** — segment intersection + cross product direction detection.
+2. **Multi-zone state machine** — tracks transitions between Outside → Door → Inside
+   zones for robust entrance/exit counting, with disappear-inference for fast exits.
+
+All line/zone coordinates are stored in normalized (0-1) form.
 """
 
 import uuid
@@ -13,11 +15,45 @@ import time
 from typing import Optional
 
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+ZONE_OUTSIDE = "outside"
+ZONE_DOOR = "door"
+ZONE_INSIDE = "inside"
+
+# Track states for zone-based counting
+STATE_NONE = "none"
+STATE_OUTSIDE = "outside"
+STATE_DOOR_ENTRY = "door_entry"      # was outside, now in door → heading inside
+STATE_DOOR_EXIT = "door_exit"        # was inside, now in door → heading outside
+STATE_INSIDE = "inside"
+STATE_DOOR_UNKNOWN = "door_unknown"  # first seen in door, direction unknown
+
+
+# ---------------------------------------------------------------------------
+# Per-track zone state
+# ---------------------------------------------------------------------------
+class _TrackZoneState:
+    """Holds the state-machine state for one tracked person in one zone group."""
+    __slots__ = ("state", "last_seen_time")
+
+    def __init__(self):
+        self.state: str = STATE_NONE
+        self.last_seen_time: float = time.time()
+
+
+# ---------------------------------------------------------------------------
+# Main counter
+# ---------------------------------------------------------------------------
 class PeopleCounter:
     """
     Stateful people counter for a single camera/view.
 
-    Maintains per-track centroid history and cumulative In/Out counts.
+    Maintains:
+      - Per-track centroid history (for line crossing)
+      - Per-track zone state machines (for multi-zone counting)
+      - Cumulative In/Out counts
     """
 
     def __init__(self, config: dict):
@@ -26,31 +62,76 @@ class PeopleCounter:
         self.max_capacity = config.get("max_capacity")
         self.enabled = config.get("enabled", True)
 
-        # Tracking state
-        self.prev_centroids: dict[int, tuple[float, float]] = {}  # track_id -> (x, y) normalised
+        # Parse zone groups from zones list
+        self.zone_groups: dict[str, dict[str, dict]] = {}  # group_id -> {type -> zone_cfg}
+        self.standalone_zones: list[dict] = []
+        self._parse_zone_groups()
+
+        # Tracking state (for line crossing)
+        self.prev_centroids: dict[int, tuple[float, float]] = {}
         self.total_in = 0
         self.total_out = 0
         self.capacity_alert_fired = False
+
+        # Zone-group tracking: group_id -> {track_id -> _TrackZoneState}
+        self._zone_track_states: dict[str, dict[int, _TrackZoneState]] = {
+            gid: {} for gid in self.zone_groups
+        }
+        # Per-group cumulative counts
+        self._group_totals: dict[str, dict[str, int]] = {
+            gid: {"in": 0, "out": 0} for gid in self.zone_groups
+        }
+
+        # Disappear inference timeout (seconds)
+        self.disappear_timeout: float = config.get("disappear_timeout", 1.0)
 
         # Snapshot timing
         self._last_snapshot_time = time.time()
 
     # ------------------------------------------------------------------
+    # Zone group parsing
+    # ------------------------------------------------------------------
+    def _parse_zone_groups(self):
+        """Separate zones into groups (by group_id) and standalone zones."""
+        groups_raw: dict[str, dict[str, dict]] = {}
+        for zone in self.zones:
+            gid = zone.get("group_id")
+            ztype = zone.get("zone_type")
+            if gid and ztype in (ZONE_OUTSIDE, ZONE_DOOR, ZONE_INSIDE):
+                if gid not in groups_raw:
+                    groups_raw[gid] = {}
+                groups_raw[gid][ztype] = zone
+            else:
+                self.standalone_zones.append(zone)
+
+        # Validate: each group must have all 3 zone types
+        for gid, group_zones in groups_raw.items():
+            if all(t in group_zones for t in (ZONE_OUTSIDE, ZONE_DOOR, ZONE_INSIDE)):
+                self.zone_groups[gid] = group_zones
+            else:
+                # Incomplete group → treat as standalone
+                for zone in group_zones.values():
+                    self.standalone_zones.append(zone)
+                missing = [t for t in (ZONE_OUTSIDE, ZONE_DOOR, ZONE_INSIDE) if t not in group_zones]
+                print(f"[PeopleCounter] Warning: Group '{gid}' missing {missing}, treating as standalone")
+
+        if self.zone_groups:
+            print(f"[PeopleCounter] Loaded {len(self.zone_groups)} zone group(s): "
+                  f"{list(self.zone_groups.keys())}")
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-
     def update(self, detections: list[dict], frame_shape: tuple[int, int]) -> dict:
         """
         Process one frame of detections and return counting data.
 
         Args:
-            detections: list of dicts with at least {track_id, person_bbox: [x1,y1,x2,y2]}
-                        bboxes are in pixel coordinates for the full-resolution frame
+            detections: list of dicts with {track_id, person_bbox: [x1,y1,x2,y2]}
             frame_shape: (height, width) of the full-resolution frame
 
         Returns:
-            dict with {total_in, total_out, occupancy, zone_counts,
-                        capacity_exceeded, lines, zones}
+            dict with counting results
         """
         if not self.enabled:
             return self._empty_result()
@@ -58,49 +139,15 @@ class PeopleCounter:
         h, w = frame_shape
 
         # 1. Compute normalised centroids for this frame
-        #    Priority: ankle midpoint -> hip midpoint -> bbox bottom-center
         current_centroids: dict[int, tuple[float, float]] = {}
         for det in detections:
             track_id = det.get("track_id")
             bbox = det.get("person_bbox")
             if track_id is None or bbox is None:
                 continue
-
-            kps = det.get("keypoints")
-            cx, cy = None, None
-
-            if kps:
-                # Try ankles first (most accurate ground contact point)
-                la = kps.get("left_ankle")
-                ra = kps.get("right_ankle")
-                if la and ra:
-                    cx = ((la[0] + ra[0]) / 2.0) / w
-                    cy = ((la[1] + ra[1]) / 2.0) / h
-                elif la:
-                    cx = la[0] / w
-                    cy = la[1] / h
-                elif ra:
-                    cx = ra[0] / w
-                    cy = ra[1] / h
-                else:
-                    # Fall back to hips (more stable, less occluded)
-                    lh = kps.get("left_hip")
-                    rh = kps.get("right_hip")
-                    if lh and rh:
-                        cx = ((lh[0] + rh[0]) / 2.0) / w
-                        cy = ((lh[1] + rh[1]) / 2.0) / h
-                    elif lh:
-                        cx = lh[0] / w
-                        cy = lh[1] / h
-                    elif rh:
-                        cx = rh[0] / w
-                        cy = rh[1] / h
-
-            # Ultimate fallback: bbox bottom-center
-            if cx is None or cy is None:
-                cx = ((bbox[0] + bbox[2]) / 2.0) / w
-                cy = bbox[3] / h  # bottom of box
-
+            # Bottom-center of bounding box, normalised to 0-1
+            cx = ((bbox[0] + bbox[2]) / 2.0) / w
+            cy = bbox[3] / h
             current_centroids[int(track_id)] = (cx, cy)
 
         # 2. Line-crossing detection
@@ -122,18 +169,35 @@ class PeopleCounter:
                                 self.total_in += 1
                             else:
                                 self.total_out += 1
-                        else:  # right_to_left
+                        else:
                             if cross < 0:
                                 self.total_in += 1
                             else:
                                 self.total_out += 1
 
-        # 3. Update previous centroids (keep only active tracks)
+        # 3. Zone-group state machine counting
+        zone_group_counts: dict[str, dict] = {}
+        for gid, group_zones in self.zone_groups.items():
+            in_c, out_c = self._process_zone_group(gid, group_zones, current_centroids)
+            self.total_in += in_c
+            self.total_out += out_c
+            self._group_totals[gid]["in"] += in_c
+            self._group_totals[gid]["out"] += out_c
+
+        # 4. Disappear inference (tracks lost while transiting door zone)
+        d_in, d_out, d_group_deltas = self._process_disappears(current_centroids)
+        self.total_in += d_in
+        self.total_out += d_out
+        for gid, (gi, go) in d_group_deltas.items():
+            self._group_totals[gid]["in"] += gi
+            self._group_totals[gid]["out"] += go
+
+        # 5. Update previous centroids
         self.prev_centroids = current_centroids
 
-        # 4. ROI zone counting
+        # 6. Standalone zone counting (occupancy only)
         zone_counts: dict[str, int] = {}
-        for zone_cfg in self.zones:
+        for zone_cfg in self.standalone_zones:
             zone_id = zone_cfg.get("id", "unknown")
             polygon = zone_cfg.get("points", [])
             if len(polygon) < 3:
@@ -144,7 +208,35 @@ class PeopleCounter:
                     count += 1
             zone_counts[zone_id] = count
 
-        # 5. Occupancy and capacity check
+        # Build zone_group_counts for the response
+        for gid, group_zones in self.zone_groups.items():
+            # Count people currently in each zone of this group
+            door_count = 0
+            inside_count = 0
+            outside_count = 0
+            door_poly = group_zones[ZONE_DOOR].get("points", [])
+            inside_poly = group_zones[ZONE_INSIDE].get("points", [])
+            outside_poly = group_zones[ZONE_OUTSIDE].get("points", [])
+            for _, centroid in current_centroids.items():
+                if len(inside_poly) >= 3 and _point_in_polygon(centroid, inside_poly):
+                    inside_count += 1
+                elif len(door_poly) >= 3 and _point_in_polygon(centroid, door_poly):
+                    door_count += 1
+                elif len(outside_poly) >= 3 and _point_in_polygon(centroid, outside_poly):
+                    outside_count += 1
+
+            g_totals = self._group_totals[gid]
+            zone_group_counts[gid] = {
+                "name": group_zones.get(ZONE_DOOR, {}).get("name", gid),
+                "total_in": g_totals["in"],
+                "total_out": g_totals["out"],
+                "occupancy": max(0, g_totals["in"] - g_totals["out"]),
+                "door_count": door_count,
+                "inside_count": inside_count,
+                "outside_count": outside_count,
+            }
+
+        # 7. Occupancy and capacity check
         occupancy = max(0, self.total_in - self.total_out)
         capacity_exceeded = False
         if self.max_capacity is not None and self.max_capacity > 0:
@@ -155,14 +247,156 @@ class PeopleCounter:
             "total_out": self.total_out,
             "occupancy": occupancy,
             "zone_counts": zone_counts,
+            "zone_group_counts": zone_group_counts,
             "capacity_exceeded": capacity_exceeded,
             "lines": self.lines,
             "zones": self.zones,
             "max_capacity": self.max_capacity,
         }
 
+    # ------------------------------------------------------------------
+    # Zone-group state machine
+    # ------------------------------------------------------------------
+    def _process_zone_group(
+        self,
+        gid: str,
+        group_zones: dict[str, dict],
+        current_centroids: dict[int, tuple[float, float]],
+    ) -> tuple[int, int]:
+        """
+        Run the state machine for one zone group against all tracked people.
+        Returns (in_count, out_count) for this frame.
+        """
+        states = self._zone_track_states[gid]
+        in_count = 0
+        out_count = 0
+        now = time.time()
+
+        outside_poly = group_zones[ZONE_OUTSIDE].get("points", [])
+        door_poly = group_zones[ZONE_DOOR].get("points", [])
+        inside_poly = group_zones[ZONE_INSIDE].get("points", [])
+
+        for track_id, centroid in current_centroids.items():
+            # Determine which zone(s) this person is in
+            in_outside = len(outside_poly) >= 3 and _point_in_polygon(centroid, outside_poly)
+            in_door = len(door_poly) >= 3 and _point_in_polygon(centroid, door_poly)
+            in_inside = len(inside_poly) >= 3 and _point_in_polygon(centroid, inside_poly)
+
+            if not (in_outside or in_door or in_inside):
+                continue  # Person not in any zone of this group
+
+            # Ensure track state exists
+            if track_id not in states:
+                states[track_id] = _TrackZoneState()
+            ts = states[track_id]
+            ts.last_seen_time = now
+
+            # If in multiple zones (overlap), prioritise: door > inside > outside
+            if in_door:
+                current_zone = ZONE_DOOR
+            elif in_inside:
+                current_zone = ZONE_INSIDE
+            elif in_outside:
+                current_zone = ZONE_OUTSIDE
+            else:
+                continue
+
+            # State transitions
+            if current_zone == ZONE_OUTSIDE:
+                if ts.state == STATE_DOOR_EXIT:
+                    # inside → door → outside = EXIT
+                    out_count += 1
+                    ts.state = STATE_OUTSIDE
+                elif ts.state == STATE_DOOR_UNKNOWN:
+                    # First seen in door, now outside → was exiting
+                    ts.state = STATE_OUTSIDE
+                elif ts.state == STATE_INSIDE:
+                    # Direct jump inside → outside (skipped door detection)
+                    out_count += 1
+                    ts.state = STATE_OUTSIDE
+                else:
+                    ts.state = STATE_OUTSIDE
+
+            elif current_zone == ZONE_DOOR:
+                if ts.state == STATE_OUTSIDE:
+                    ts.state = STATE_DOOR_ENTRY  # heading inside
+                elif ts.state == STATE_INSIDE:
+                    ts.state = STATE_DOOR_EXIT   # heading outside
+                elif ts.state == STATE_NONE:
+                    ts.state = STATE_DOOR_UNKNOWN
+                # else: stay in current door sub-state
+
+            elif current_zone == ZONE_INSIDE:
+                if ts.state == STATE_DOOR_ENTRY:
+                    # outside → door → inside = ENTRY
+                    in_count += 1
+                    ts.state = STATE_INSIDE
+                elif ts.state == STATE_DOOR_UNKNOWN:
+                    # First seen in door, now inside → was entering
+                    ts.state = STATE_INSIDE
+                elif ts.state == STATE_OUTSIDE:
+                    # Direct jump outside → inside (skipped door detection)
+                    in_count += 1
+                    ts.state = STATE_INSIDE
+                else:
+                    ts.state = STATE_INSIDE
+
+        return (in_count, out_count)
+
+    def _process_disappears(
+        self,
+        current_centroids: dict[int, tuple[float, float]],
+    ) -> tuple[int, int, dict[str, tuple[int, int]]]:
+        """
+        Handle tracks that disappeared while transiting through the door zone.
+
+        Returns:
+            (total_in, total_out, {group_id: (in, out)})
+        """
+        now = time.time()
+        active_ids = set(current_centroids.keys())
+        total_in = 0
+        total_out = 0
+        group_deltas: dict[str, tuple[int, int]] = {}
+
+        for gid, states in self._zone_track_states.items():
+            g_in = 0
+            g_out = 0
+            to_remove: list[int] = []
+
+            for track_id, ts in states.items():
+                if track_id in active_ids:
+                    continue  # Still visible, skip
+
+                elapsed = now - ts.last_seen_time
+
+                if elapsed >= self.disappear_timeout:
+                    if ts.state in (STATE_DOOR_ENTRY, STATE_DOOR_EXIT):
+                        if ts.state == STATE_DOOR_ENTRY:
+                            # Was heading inside, lost at door → infer IN
+                            g_in += 1
+                        else:
+                            # Was heading outside, lost at door → infer OUT
+                            g_out += 1
+                        to_remove.append(track_id)
+                    elif elapsed >= self.disappear_timeout * 3:
+                        # Very stale non-door state, just clean up
+                        to_remove.append(track_id)
+
+            for tid in to_remove:
+                del states[tid]
+
+            total_in += g_in
+            total_out += g_out
+            if g_in or g_out:
+                group_deltas[gid] = (g_in, g_out)
+
+        return (total_in, total_out, group_deltas)
+
+    # ------------------------------------------------------------------
+    # Snapshot & alerts
+    # ------------------------------------------------------------------
     def should_snapshot(self, interval: float = 10.0) -> bool:
-        """Return True if enough time has passed for a periodic snapshot."""
         now = time.time()
         if now - self._last_snapshot_time >= interval:
             self._last_snapshot_time = now
@@ -170,31 +404,22 @@ class PeopleCounter:
         return False
 
     def get_snapshot_data(self, camera_id: str) -> dict:
-        """Build a snapshot dict suitable for DB persistence."""
         occupancy = max(0, self.total_in - self.total_out)
-        zone_counts: dict[str, int] = {}
-        # Zone counts from last frame are not stored here; caller can pass them
         return {
             "id": str(uuid.uuid4()),
             "camera_id": camera_id,
             "total_in": self.total_in,
             "total_out": self.total_out,
             "current_occupancy": occupancy,
-            "zone_counts": zone_counts,
+            "zone_counts": {},
         }
 
     def check_capacity_alert(self) -> Optional[dict]:
-        """
-        Check if a capacity alert should be fired.
-        Returns an event dict if alert should fire, None otherwise.
-        Uses hysteresis: fires once when exceeded, resets when below.
-        """
         if self.max_capacity is None or self.max_capacity <= 0:
             self.capacity_alert_fired = False
             return None
 
         occupancy = max(0, self.total_in - self.total_out)
-
         if occupancy >= self.max_capacity and not self.capacity_alert_fired:
             self.capacity_alert_fired = True
             return {
@@ -204,9 +429,7 @@ class PeopleCounter:
                 "max_capacity": self.max_capacity,
             }
         elif occupancy < self.max_capacity:
-            # Reset so we fire again if it crosses again
             self.capacity_alert_fired = False
-
         return None
 
     def update_config(self, config: dict):
@@ -215,6 +438,22 @@ class PeopleCounter:
         self.zones = config.get("zones", [])
         self.max_capacity = config.get("max_capacity")
         self.enabled = config.get("enabled", True)
+        self.disappear_timeout = config.get("disappear_timeout", 1.0)
+
+        # Re-parse zone groups
+        old_groups = set(self.zone_groups.keys())
+        self.zone_groups = {}
+        self.standalone_zones = []
+        self._parse_zone_groups()
+
+        # Initialise states for new groups, keep existing
+        new_groups = set(self.zone_groups.keys())
+        for gid in new_groups - old_groups:
+            self._zone_track_states[gid] = {}
+            self._group_totals[gid] = {"in": 0, "out": 0}
+        for gid in old_groups - new_groups:
+            self._zone_track_states.pop(gid, None)
+            self._group_totals.pop(gid, None)
 
     def reset(self):
         """Reset all counters (e.g. on video loop)."""
@@ -222,6 +461,10 @@ class PeopleCounter:
         self.total_in = 0
         self.total_out = 0
         self.capacity_alert_fired = False
+        for gid in self._zone_track_states:
+            self._zone_track_states[gid] = {}
+        for gid in self._group_totals:
+            self._group_totals[gid] = {"in": 0, "out": 0}
 
     def _empty_result(self) -> dict:
         return {
@@ -229,6 +472,7 @@ class PeopleCounter:
             "total_out": 0,
             "occupancy": 0,
             "zone_counts": {},
+            "zone_group_counts": {},
             "capacity_exceeded": False,
             "lines": self.lines,
             "zones": self.zones,
@@ -245,11 +489,6 @@ def _cross_product_sign(
     b: tuple[float, float],
     p: tuple[float, float],
 ) -> float:
-    """
-    Compute the sign of the cross product (b-a) x (p-a).
-    Positive = p is to the left of line a->b
-    Negative = p is to the right
-    """
     return (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
 
 
@@ -258,7 +497,6 @@ def _on_segment(
     q: tuple[float, float],
     r: tuple[float, float],
 ) -> bool:
-    """Check if point q lies on segment pr."""
     if (min(p[0], r[0]) <= q[0] <= max(p[0], r[0]) and
             min(p[1], r[1]) <= q[1] <= max(p[1], r[1])):
         return True
@@ -270,10 +508,6 @@ def _orientation(
     q: tuple[float, float],
     r: tuple[float, float],
 ) -> int:
-    """
-    Orientation of ordered triplet (p, q, r).
-    0 -> colinear, 1 -> clockwise, 2 -> counterclockwise
-    """
     val = (q[1] - p[1]) * (r[0] - q[0]) - (q[0] - p[0]) * (r[1] - q[1])
     if abs(val) < 1e-10:
         return 0
@@ -286,20 +520,14 @@ def _segments_intersect(
     p2: tuple[float, float],
     q2: tuple[float, float],
 ) -> bool:
-    """
-    Check if line segment p1-q1 intersects with p2-q2.
-    Uses orientation-based algorithm.
-    """
     o1 = _orientation(p1, q1, p2)
     o2 = _orientation(p1, q1, q2)
     o3 = _orientation(p2, q2, p1)
     o4 = _orientation(p2, q2, q1)
 
-    # General case
     if o1 != o2 and o3 != o4:
         return True
 
-    # Special collinear cases
     if o1 == 0 and _on_segment(p1, p2, q1):
         return True
     if o2 == 0 and _on_segment(p1, q2, q1):
@@ -316,10 +544,6 @@ def _point_in_polygon(
     point: tuple[float, float],
     polygon: list[list[float]],
 ) -> bool:
-    """
-    Ray-casting algorithm for point-in-polygon test.
-    polygon is a list of [x, y] pairs (normalised 0-1 coordinates).
-    """
     x, y = point
     n = len(polygon)
     inside = False
