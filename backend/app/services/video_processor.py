@@ -170,10 +170,11 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
             _, buf = cv2.imencode('.jpg', img_small, [cv2.IMWRITE_JPEG_QUALITY, 40])
         return base64.b64encode(buf).decode('utf-8')
 
-    # --- Detection + classification for a single view ---
-    def run_detection_and_classify(img, frame_count, track_state):
+    # --- Detection + optional classification for a single view ---
+    def run_detection_and_classify(img, frame_count, track_state, skip_classification=False):
         """
-        Run YOLO-Pose tracking + dress code classification on a full-res image.
+        Run YOLO-Pose tracking on a full-res image.
+        If skip_classification is False, also runs dress code classification.
 
         Returns:
             (detections_list, people_count, updated_track_state)
@@ -218,37 +219,40 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
 
                 person_bbox = list(map(float, box_coords))
 
-                # --- Per-track classification throttling ---
                 cls_result = None
-                if track_id is not None and track_id in track_state:
-                    cached = track_state[track_id]
-                    frames_since = frame_count - cached.get("last_classified_frame", 0)
-                    if frames_since < 30:
-                        # Reuse cached label
-                        cls_result = {
-                            "label": cached["label"],
-                            "confidence": cached["confidence"],
-                            "lower_bbox": cached.get("lower_bbox"),
-                        }
 
-                # Classify if no cached result
-                if cls_result is None:
-                    kp_row = None
-                    if keypoints is not None and keypoints.shape[0] > i:
-                        kp_row = keypoints[i]
+                # Only run dress code classification when needed
+                if not skip_classification:
+                    # --- Per-track classification throttling ---
+                    if track_id is not None and track_id in track_state:
+                        cached = track_state[track_id]
+                        frames_since = frame_count - cached.get("last_classified_frame", 0)
+                        if frames_since < 30:
+                            # Reuse cached label
+                            cls_result = {
+                                "label": cached["label"],
+                                "confidence": cached["confidence"],
+                                "lower_bbox": cached.get("lower_bbox"),
+                            }
 
-                    cls_result = classify_lower_body(img, box_coords, kp_row, device='0')
+                    # Classify if no cached result
+                    if cls_result is None:
+                        kp_row = None
+                        if keypoints is not None and keypoints.shape[0] > i:
+                            kp_row = keypoints[i]
 
-                    # Update track state
-                    if track_id is not None and cls_result is not None:
-                        if track_id not in track_state:
-                            track_state[track_id] = {"violation_saved": False}
-                        track_state[track_id].update({
-                            "label": cls_result["label"],
-                            "confidence": cls_result["confidence"],
-                            "lower_bbox": cls_result.get("lower_bbox"),
-                            "last_classified_frame": frame_count,
-                        })
+                        cls_result = classify_lower_body(img, box_coords, kp_row, device='0')
+
+                        # Update track state
+                        if track_id is not None and cls_result is not None:
+                            if track_id not in track_state:
+                                track_state[track_id] = {"violation_saved": False}
+                            track_state[track_id].update({
+                                "label": cls_result["label"],
+                                "confidence": cls_result["confidence"],
+                                "lower_bbox": cls_result.get("lower_bbox"),
+                                "last_classified_frame": frame_count,
+                            })
 
                 # Build detection entry
                 det = {
@@ -326,6 +330,8 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
         # Get or create PeopleCounter for this view
         if view_key not in people_counters:
             people_counters[view_key] = PeopleCounter(config)
+            print(f"[Counting] Created counter for {view_key} (camera={camera_id}), "
+                  f"lines={len(config.get('lines', []))}, zones={len(config.get('zones', []))}")
         else:
             # Hot-reload config changes
             people_counters[view_key].update_config(config)
@@ -387,6 +393,7 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
             'fps': round(current_real_fps, 1),
             'people_count': cached_people_count,
             'detections': [],
+            'counting_data': {},
         }
 
         if is_fisheye and processor:
@@ -406,9 +413,13 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
 
                         # Run detection on target views only, respecting stride
                         all_views = _get_all_detection_views()
+                        dresscode_views = _get_detection_views(source_path)
                         if run_detection_this_frame and key in all_views:
+                            # Skip dress code classification if only counting needs this view
+                            only_counting = key not in dresscode_views
                             detections, people_count, track_state = run_detection_and_classify(
-                                img, frame_count, track_state
+                                img, frame_count, track_state,
+                                skip_classification=only_counting,
                             )
                             # Check policy for violations & save snapshots
                             detections = _apply_policy_and_save(
@@ -464,10 +475,14 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
             try:
                 orig_h, orig_w = frame.shape[:2]
                 all_views = _get_all_detection_views()
+                dresscode_views = _get_detection_views(source_path)
 
                 if run_detection_this_frame and "original" in all_views:
+                    # Skip dress code classification if only counting needs this view
+                    only_counting = "original" not in dresscode_views
                     detections, people_count, track_state = run_detection_and_classify(
-                        frame, frame_count, track_state
+                        frame, frame_count, track_state,
+                        skip_classification=only_counting,
                     )
                     detections = _apply_policy_and_save(
                         detections, track_state, frame, source_path, view_key="original"

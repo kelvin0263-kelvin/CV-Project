@@ -7,6 +7,34 @@ const StreamPlayer = ({ wsUrl, className, alt, onStats, onDetections, onCounting
     const detectionsRef = useRef([]);
     const [status, setStatus] = useState('connecting');
 
+    // --- Compute actual image display area within object-contain ---
+    const getImageDisplayArea = useCallback(() => {
+        const img = imgRef.current;
+        if (!img) return null;
+        const rect = img.getBoundingClientRect();
+        const containerW = rect.width;
+        const containerH = rect.height;
+        // Backend always sends 640x360 (16:9)
+        const imgAspect = 640 / 360;
+        const containerAspect = containerW / containerH;
+
+        let displayW, displayH, offsetX, offsetY;
+        if (containerAspect > imgAspect) {
+            // Container is wider - pillarboxing (black bars on sides)
+            displayH = containerH;
+            displayW = containerH * imgAspect;
+            offsetX = (containerW - displayW) / 2;
+            offsetY = 0;
+        } else {
+            // Container is taller - letterboxing (black bars top/bottom)
+            displayW = containerW;
+            displayH = containerW / imgAspect;
+            offsetX = 0;
+            offsetY = (containerH - displayH) / 2;
+        }
+        return { displayW, displayH, offsetX, offsetY };
+    }, []);
+
     // --- Draw detections on canvas overlay ---
     const drawDetections = useCallback((detections) => {
         const canvas = canvasRef.current;
@@ -15,7 +43,7 @@ const StreamPlayer = ({ wsUrl, className, alt, onStats, onDetections, onCounting
 
         const ctx = canvas.getContext('2d');
 
-        // Match canvas size to displayed image size
+        // Match canvas size to displayed image element size
         const rect = img.getBoundingClientRect();
         canvas.width = rect.width;
         canvas.height = rect.height;
@@ -24,17 +52,22 @@ const StreamPlayer = ({ wsUrl, className, alt, onStats, onDetections, onCounting
 
         if (!detections || detections.length === 0) return;
 
+        // Compute actual visible image area (accounting for object-contain letterboxing)
+        const area = getImageDisplayArea();
+        if (!area) return;
+        const { displayW, displayH, offsetX, offsetY } = area;
+
         // The detections have coords scaled to 640x360 by the backend.
-        // Scale to the actual display size.
-        const scaleX = rect.width / 640;
-        const scaleY = rect.height / 360;
+        // Scale to the actual displayed image size, with offset for letterboxing.
+        const scaleX = displayW / 640;
+        const scaleY = displayH / 360;
 
         detections.forEach((det) => {
             if (!det.person_bbox) return;
 
             const [x1, y1, x2, y2] = det.person_bbox;
-            const sx1 = x1 * scaleX;
-            const sy1 = y1 * scaleY;
+            const sx1 = x1 * scaleX + offsetX;
+            const sy1 = y1 * scaleY + offsetY;
             const sw = (x2 - x1) * scaleX;
             const sh = (y2 - y1) * scaleY;
 
