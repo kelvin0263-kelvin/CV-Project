@@ -4,6 +4,9 @@ import React, { useRef, useEffect, useState, useCallback } from 'react';
  * CountingCanvas - Interactive SVG overlay for drawing counting lines/zones
  * and displaying live counting data.
  *
+ * All coordinates are normalised to the ACTUAL VIDEO AREA (0-1),
+ * compensating for object-contain letterboxing/pillarboxing.
+ *
  * Props:
  *   lines         - array of line configs [{id, name, points, direction}]
  *   zones         - array of zone configs [{id, name, points}]
@@ -25,44 +28,71 @@ const CountingCanvas = ({
     const svgRef = useRef(null);
     const [svgSize, setSvgSize] = useState({ width: 640, height: 360 });
 
+    // The actual video display area within the container (accounting for object-contain)
+    const [videoArea, setVideoArea] = useState({ displayW: 640, displayH: 360, offsetX: 0, offsetY: 0 });
+
     // Drawing state
-    const [lineStart, setLineStart] = useState(null); // normalised {x, y}
+    const [lineStart, setLineStart] = useState(null); // normalised {x, y} relative to video area
     const [lineEnd, setLineEnd] = useState(null);
     const [polygonPoints, setPolygonPoints] = useState([]); // array of normalised {x, y}
     const [mousePos, setMousePos] = useState(null); // normalised
 
-    // Sync SVG size with container
+    // Sync SVG size and video area with container
     useEffect(() => {
         const updateSize = () => {
             if (containerRef?.current) {
                 const rect = containerRef.current.getBoundingClientRect();
-                setSvgSize({ width: rect.width, height: rect.height });
+                const containerW = rect.width;
+                const containerH = rect.height;
+                setSvgSize({ width: containerW, height: containerH });
+
+                // Compute actual video display area (backend sends 640x360 = 16:9)
+                const imgAspect = 640 / 360;
+                const containerAspect = containerW / containerH;
+
+                let displayW, displayH, offsetX, offsetY;
+                if (containerAspect > imgAspect) {
+                    // Container wider than video -> pillarboxing (black bars on sides)
+                    displayH = containerH;
+                    displayW = containerH * imgAspect;
+                    offsetX = (containerW - displayW) / 2;
+                    offsetY = 0;
+                } else {
+                    // Container taller than video -> letterboxing (black bars top/bottom)
+                    displayW = containerW;
+                    displayH = containerW / imgAspect;
+                    offsetX = 0;
+                    offsetY = (containerH - displayH) / 2;
+                }
+                setVideoArea({ displayW, displayH, offsetX, offsetY });
             }
         };
         updateSize();
         window.addEventListener('resize', updateSize);
-        const interval = setInterval(updateSize, 500); // catch dynamic resizes
+        const interval = setInterval(updateSize, 500);
         return () => {
             window.removeEventListener('resize', updateSize);
             clearInterval(interval);
         };
     }, [containerRef]);
 
-    // Convert pixel coords to normalised (0-1)
+    // Convert pixel coords (relative to SVG/container) to normalised (0-1) relative to VIDEO AREA
     const toNorm = useCallback((px, py) => {
+        const { displayW, displayH, offsetX, offsetY } = videoArea;
         return {
-            x: px / svgSize.width,
-            y: py / svgSize.height,
+            x: Math.max(0, Math.min(1, (px - offsetX) / displayW)),
+            y: Math.max(0, Math.min(1, (py - offsetY) / displayH)),
         };
-    }, [svgSize]);
+    }, [videoArea]);
 
-    // Convert normalised to pixel
+    // Convert normalised (0-1) relative to VIDEO AREA to pixel coords in SVG
     const toPx = useCallback((nx, ny) => {
+        const { displayW, displayH, offsetX, offsetY } = videoArea;
         return {
-            x: nx * svgSize.width,
-            y: ny * svgSize.height,
+            x: nx * displayW + offsetX,
+            y: ny * displayH + offsetY,
         };
-    }, [svgSize]);
+    }, [videoArea]);
 
     // Get mouse position relative to SVG
     const getMousePos = useCallback((e) => {
@@ -74,6 +104,13 @@ const CountingCanvas = ({
             py: e.clientY - rect.top,
         };
     }, []);
+
+    // Check if pixel position is within the video area
+    const isInVideoArea = useCallback((px, py) => {
+        const { displayW, displayH, offsetX, offsetY } = videoArea;
+        return px >= offsetX && px <= offsetX + displayW &&
+               py >= offsetY && py <= offsetY + displayH;
+    }, [videoArea]);
 
     // Handle mouse move
     const handleMouseMove = useCallback((e) => {
@@ -92,14 +129,14 @@ const CountingCanvas = ({
     const handleMouseDown = useCallback((e) => {
         if (!drawingMode) return;
         const pos = getMousePos(e);
-        if (!pos) return;
+        if (!pos || !isInVideoArea(pos.px, pos.py)) return;
         const norm = toNorm(pos.px, pos.py);
 
         if (drawingMode === 'line') {
             setLineStart(norm);
             setLineEnd(norm);
         }
-    }, [drawingMode, getMousePos, toNorm]);
+    }, [drawingMode, getMousePos, toNorm, isInVideoArea]);
 
     // Handle mouse up
     const handleMouseUp = useCallback((e) => {
@@ -123,11 +160,11 @@ const CountingCanvas = ({
     const handleClick = useCallback((e) => {
         if (drawingMode !== 'roi') return;
         const pos = getMousePos(e);
-        if (!pos) return;
+        if (!pos || !isInVideoArea(pos.px, pos.py)) return;
         const norm = toNorm(pos.px, pos.py);
 
         setPolygonPoints(prev => [...prev, norm]);
-    }, [drawingMode, getMousePos, toNorm]);
+    }, [drawingMode, getMousePos, toNorm, isInVideoArea]);
 
     // Handle double-click to close polygon
     const handleDoubleClick = useCallback((e) => {
@@ -164,6 +201,7 @@ const CountingCanvas = ({
         const dx = p2.x - p1.x;
         const dy = p2.y - p1.y;
         const len = Math.hypot(dx, dy);
+        if (len === 0) return null;
         // Perpendicular direction for arrow (indicates "in" direction)
         const perpX = -dy / len * 12;
         const perpY = dx / len * 12;
@@ -289,8 +327,9 @@ const CountingCanvas = ({
 
             // Hint text
             if (polygonPoints.length >= 3) {
+                const hintY = videoArea.offsetY + 20;
                 elements.push(
-                    <text key="poly-hint" x={svgSize.width / 2} y={20}
+                    <text key="poly-hint" x={svgSize.width / 2} y={hintY}
                         textAnchor="middle" fill="#3b82f6" fontSize="12" fontWeight="bold"
                         style={{ textShadow: '1px 1px 2px rgba(0,0,0,0.8)' }}>
                         Double-click to close polygon ({polygonPoints.length} points)
@@ -302,13 +341,16 @@ const CountingCanvas = ({
         return elements;
     };
 
+    // Whether counting is active (counter exists on backend)
+    const isCountingActive = countingData && countingData.total_in !== undefined;
+
     return (
         <svg
             ref={svgRef}
             className="absolute inset-0 w-full h-full"
             style={{
                 pointerEvents: drawingMode ? 'auto' : 'none',
-                cursor: drawingMode === 'line' ? 'crosshair' : drawingMode === 'roi' ? 'crosshair' : 'default',
+                cursor: drawingMode ? 'crosshair' : 'default',
                 zIndex: 20,
             }}
             viewBox={`0 0 ${svgSize.width} ${svgSize.height}`}
@@ -319,6 +361,15 @@ const CountingCanvas = ({
             onClick={handleClick}
             onDoubleClick={handleDoubleClick}
         >
+            {/* Video area boundary hint (subtle border) */}
+            {drawingMode && (
+                <rect
+                    x={videoArea.offsetX} y={videoArea.offsetY}
+                    width={videoArea.displayW} height={videoArea.displayH}
+                    fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="1" strokeDasharray="4,4"
+                />
+            )}
+
             {/* Saved zones */}
             {zones.map((zone, i) => renderZone(zone, i))}
 
@@ -328,18 +379,26 @@ const CountingCanvas = ({
             {/* Active drawing */}
             {renderDrawing()}
 
-            {/* Live counting summary badge */}
-            {countingData && (countingData.total_in > 0 || countingData.total_out > 0) && (
+            {/* Live counting summary badge - show whenever counter is active */}
+            {isCountingActive && (
                 <g>
-                    <rect x={svgSize.width - 140} y={svgSize.height - 50} width="130" height="42" rx="8"
-                        fill="rgba(0,0,0,0.7)" />
-                    <text x={svgSize.width - 125} y={svgSize.height - 30} fill="#22c55e" fontSize="12" fontWeight="bold">
+                    <rect x={videoArea.offsetX + videoArea.displayW - 140}
+                          y={videoArea.offsetY + videoArea.displayH - 50}
+                          width="130" height="42" rx="8"
+                          fill="rgba(0,0,0,0.7)" />
+                    <text x={videoArea.offsetX + videoArea.displayW - 125}
+                          y={videoArea.offsetY + videoArea.displayH - 30}
+                          fill="#22c55e" fontSize="12" fontWeight="bold">
                         IN: {countingData.total_in}
                     </text>
-                    <text x={svgSize.width - 60} y={svgSize.height - 30} fill="#ef4444" fontSize="12" fontWeight="bold">
+                    <text x={videoArea.offsetX + videoArea.displayW - 60}
+                          y={videoArea.offsetY + videoArea.displayH - 30}
+                          fill="#ef4444" fontSize="12" fontWeight="bold">
                         OUT: {countingData.total_out}
                     </text>
-                    <text x={svgSize.width - 125} y={svgSize.height - 14} fill="#fff" fontSize="11">
+                    <text x={videoArea.offsetX + videoArea.displayW - 125}
+                          y={videoArea.offsetY + videoArea.displayH - 14}
+                          fill="#fff" fontSize="11">
                         Occupancy: {countingData.occupancy ?? 0}
                     </text>
                 </g>
