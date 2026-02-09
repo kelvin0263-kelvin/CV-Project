@@ -69,11 +69,16 @@ async def websocket_endpoint(websocket: WebSocket, camera_id: str):
                     all_detections = meta.get('detections', {})
                     view_detections = all_detections.get(target_key, [])
 
+                    # Get counting data for this specific view
+                    all_counting = meta.get('counting_data', {})
+                    view_counting = all_counting.get(target_key, {})
+
                     await websocket.send_json({
                         "image": b64_data,
                         "fps": fps,
                         "people_count": people_count,
                         "detections": view_detections,
+                        "counting_data": view_counting,
                     })
 
             # Consumer limit (~25FPS update to client)

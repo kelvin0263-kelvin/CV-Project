@@ -101,18 +101,28 @@ async def violation_persistence_loop():
 
             try:
                 async with AsyncSessionLocal() as session:
-                    db_event = DetectionEvent(
-                        id=evt["id"],
-                        camera_id=camera_id,
-                        event_type=evt.get("event_type", "Dress Code Violation"),
-                        details={
+                    # Build details dict based on event type
+                    event_type = evt.get("event_type", "Dress Code Violation")
+                    if event_type == "Capacity Exceeded":
+                        details = {
+                            "occupancy": evt.get("occupancy"),
+                            "max_capacity": evt.get("max_capacity"),
+                        }
+                    else:
+                        details = {
                             "label": evt.get("label"),
                             "confidence": evt.get("confidence"),
                             "person_bbox": evt.get("person_bbox"),
                             "track_id": evt.get("track_id"),
                             "snapshot_path": evt.get("snapshot_path"),
                             "source_path": evt.get("source_path"),
-                        },
+                        }
+
+                    db_event = DetectionEvent(
+                        id=evt["id"],
+                        camera_id=camera_id,
+                        event_type=event_type,
+                        details=details,
                     )
                     session.add(db_event)
                     await session.commit()

@@ -23,6 +23,14 @@ from app.core.globals import FRAME_BUFFERS, ACTIVE_PRODUCERS
 from ultralytics import YOLO
 from turbojpeg import TurboJPEG
 from app.services.dresscode_detector import classify_lower_body, crop_full_person
+from app.services.people_counter import PeopleCounter
+from app.routers.counting_router import (
+    get_counting_views,
+    get_counting_camera_id,
+    get_counting_config,
+    update_live_counts,
+    queue_counting_snapshot,
+)
 
 # ---------------------------------------------------------------------------
 # Snapshot output directory
@@ -292,6 +300,56 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
     cached_detections = [] # Reused between detection frames
     cached_people_count = 0
 
+    # People counting state: view_key -> PeopleCounter instance
+    people_counters: dict[str, PeopleCounter] = {}
+    cached_counting_data: dict[str, dict] = {}  # view_key -> last counting result
+
+    # -----------------------------------------------------------------------
+    # Helper: get all views needing detection (dress code OR counting)
+    # -----------------------------------------------------------------------
+    def _get_all_detection_views():
+        """Union of dress-code views and people-counting views."""
+        dresscode_views = _get_detection_views(source_path)
+        counting_views = get_counting_views(source_path)
+        return dresscode_views | counting_views
+
+    def _run_counting_for_view(view_key, detections_unscaled, frame_shape):
+        """Run people counting on unscaled detections for a specific view."""
+        camera_id = get_counting_camera_id(source_path, view_key)
+        if camera_id is None:
+            return None
+
+        config = get_counting_config(camera_id)
+        if config is None or not config.get("enabled", True):
+            return None
+
+        # Get or create PeopleCounter for this view
+        if view_key not in people_counters:
+            people_counters[view_key] = PeopleCounter(config)
+        else:
+            # Hot-reload config changes
+            people_counters[view_key].update_config(config)
+
+        counter = people_counters[view_key]
+        counting_data = counter.update(detections_unscaled, frame_shape)
+
+        # Publish live counts
+        update_live_counts(camera_id, counting_data)
+
+        # Check capacity alert
+        alert = counter.check_capacity_alert()
+        if alert:
+            alert["camera_id"] = camera_id
+            queue_violation_event(alert)
+
+        # Periodic snapshot
+        if counter.should_snapshot(interval=10.0):
+            snap = counter.get_snapshot_data(camera_id)
+            snap["zone_counts"] = counting_data.get("zone_counts", {})
+            queue_counting_snapshot(snap)
+
+        return counting_data
+
     # -----------------------------------------------------------------------
     # Main loop
     # -----------------------------------------------------------------------
@@ -305,6 +363,9 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
             track_state = {}
             cached_detections = []
             cached_people_count = 0
+            # Reset people counters on video loop
+            for counter in people_counters.values():
+                counter.reset()
             continue
 
         frame_count += 1
@@ -337,13 +398,15 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
                 # 2. Process each view
                 view_detections = {}  # key -> scaled detections list
 
+                view_counting_data = {}  # key -> counting_data dict
+
                 for key, img in processed_frames.items():
                     try:
                         orig_h, orig_w = img.shape[:2]
 
                         # Run detection on target views only, respecting stride
-                        active_views = _get_detection_views(source_path)
-                        if run_detection_this_frame and key in active_views:
+                        all_views = _get_all_detection_views()
+                        if run_detection_this_frame and key in all_views:
                             detections, people_count, track_state = run_detection_and_classify(
                                 img, frame_count, track_state
                             )
@@ -351,13 +414,22 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
                             detections = _apply_policy_and_save(
                                 detections, track_state, img, source_path, view_key=key
                             )
+
+                            # Run people counting on unscaled detections
+                            cd = _run_counting_for_view(key, detections, (orig_h, orig_w))
+                            if cd is not None:
+                                view_counting_data[key] = cd
+                                cached_counting_data[key] = cd
+
                             scaled = scale_detections(detections, orig_h, orig_w)
                             view_detections[key] = scaled
                             cached_detections = scaled
                             cached_people_count = people_count
-                        elif key in active_views:
+                        elif key in all_views:
                             # Reuse cached detections
                             view_detections[key] = cached_detections
+                            if key in cached_counting_data:
+                                view_counting_data[key] = cached_counting_data[key]
                         else:
                             view_detections[key] = []
 
@@ -370,6 +442,7 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
                 # Store detections per-view in metadata
                 current_buffer['__meta__']['detections'] = view_detections
                 current_buffer['__meta__']['people_count'] = cached_people_count
+                current_buffer['__meta__']['counting_data'] = view_counting_data
 
                 t2 = time.time()
 
@@ -390,14 +463,21 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
             # --- Normal (non-fisheye) video processing ---
             try:
                 orig_h, orig_w = frame.shape[:2]
+                all_views = _get_all_detection_views()
 
-                if run_detection_this_frame and "original" in _get_detection_views(source_path):
+                if run_detection_this_frame and "original" in all_views:
                     detections, people_count, track_state = run_detection_and_classify(
                         frame, frame_count, track_state
                     )
                     detections = _apply_policy_and_save(
                         detections, track_state, frame, source_path, view_key="original"
                     )
+
+                    # Run people counting on unscaled detections
+                    cd = _run_counting_for_view("original", detections, (orig_h, orig_w))
+                    if cd is not None:
+                        cached_counting_data["original"] = cd
+
                     scaled = scale_detections(detections, orig_h, orig_w)
                     cached_detections = scaled
                     cached_people_count = people_count
@@ -406,6 +486,9 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
                 current_buffer['original'] = encode_frame(frame)
                 current_buffer['__meta__']['detections'] = {'original': cached_detections}
                 current_buffer['__meta__']['people_count'] = cached_people_count
+                current_buffer['__meta__']['counting_data'] = {
+                    'original': cached_counting_data.get('original', {}),
+                }
 
             except Exception as e:
                 print(f"[Producer] Normal video error: {e}")

@@ -1,8 +1,11 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
 import { Button } from './ui/button';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer } from 'recharts';
-import { Download, Calendar, Filter, Eye, FileText, XCircle, AlertTriangle, User, RefreshCw } from 'lucide-react';
+import {
+    BarChart, Bar, LineChart, Line,
+    XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer
+} from 'recharts';
+import { Download, Calendar, Filter, Eye, FileText, XCircle, AlertTriangle, User, RefreshCw, Users } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { getApiBaseUrl } from '../apiConfig';
 
@@ -81,6 +84,18 @@ const DetailModal = ({ record, onClose, apiUrl }) => {
                                 <p className="font-mono">{record.details.track_id}</p>
                             </div>
                         )}
+                        {record.details?.occupancy !== undefined && (
+                            <div>
+                                <p className="text-muted-foreground font-medium">Occupancy</p>
+                                <p>{record.details.occupancy}</p>
+                            </div>
+                        )}
+                        {record.details?.max_capacity !== undefined && (
+                            <div>
+                                <p className="text-muted-foreground font-medium">Max Capacity</p>
+                                <p>{record.details.max_capacity}</p>
+                            </div>
+                        )}
                     </div>
                 </CardContent>
             </Card>
@@ -115,6 +130,97 @@ const ExportDialog = ({ isOpen, onClose, onExport }) => {
     );
 };
 
+const OccupancyChart = ({ apiUrl }) => {
+    const [cameras, setCameras] = useState([]);
+    const [selectedCamera, setSelectedCamera] = useState('');
+    const [historyData, setHistoryData] = useState([]);
+    const [loading, setLoading] = useState(false);
+
+    useEffect(() => {
+        const fetchCameras = async () => {
+            try {
+                const res = await fetch(`${apiUrl}/api/cameras`);
+                const data = await res.json();
+                setCameras(data.filter(c => c.enabled));
+            } catch (err) {
+                console.error('Failed to fetch cameras:', err);
+            }
+        };
+        fetchCameras();
+    }, [apiUrl]);
+
+    useEffect(() => {
+        if (!selectedCamera) return;
+        const fetchHistory = async () => {
+            setLoading(true);
+            try {
+                const res = await fetch(`${apiUrl}/api/people-counting-history?camera_id=${selectedCamera}&limit=100`);
+                if (res.ok) {
+                    const data = await res.json();
+                    // Reverse so oldest first for chart
+                    const chartData = data.reverse().map(s => ({
+                        time: new Date(s.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+                        in: s.total_in,
+                        out: s.total_out,
+                        occupancy: s.current_occupancy,
+                    }));
+                    setHistoryData(chartData);
+                }
+            } catch (err) {
+                console.error('Failed to fetch counting history:', err);
+            }
+            setLoading(false);
+        };
+        fetchHistory();
+        const interval = setInterval(fetchHistory, 15000);
+        return () => clearInterval(interval);
+    }, [apiUrl, selectedCamera]);
+
+    return (
+        <Card className="flex flex-col h-[400px] md:h-auto">
+            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                <CardTitle className="flex items-center gap-2">
+                    <Users className="w-4 h-4" />
+                    Occupancy Over Time
+                </CardTitle>
+                <select
+                    className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                    value={selectedCamera}
+                    onChange={(e) => setSelectedCamera(e.target.value)}
+                >
+                    <option value="">Select camera...</option>
+                    {cameras.map(cam => (
+                        <option key={cam.id} value={cam.id}>{cam.name}</option>
+                    ))}
+                </select>
+            </CardHeader>
+            <CardContent className="flex-1 min-h-0">
+                {historyData.length > 0 ? (
+                    <ResponsiveContainer width="100%" height="100%">
+                        <LineChart data={historyData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                            <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
+                            <XAxis dataKey="time" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
+                            <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} allowDecimals={false} />
+                            <RechartsTooltip
+                                cursor={{ strokeDasharray: '3 3' }}
+                                contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
+                            />
+                            <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
+                            <Line type="monotone" dataKey="in" name="Total In" stroke="#22c55e" strokeWidth={2} dot={false} />
+                            <Line type="monotone" dataKey="out" name="Total Out" stroke="#ef4444" strokeWidth={2} dot={false} />
+                            <Line type="monotone" dataKey="occupancy" name="Occupancy" stroke="#3b82f6" strokeWidth={2} dot={false} />
+                        </LineChart>
+                    </ResponsiveContainer>
+                ) : (
+                    <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
+                        {loading ? 'Loading...' : selectedCamera ? 'No occupancy data available' : 'Select a camera to view occupancy history'}
+                    </div>
+                )}
+            </CardContent>
+        </Card>
+    );
+};
+
 const Reporting = () => {
     const apiUrl = getApiBaseUrl();
 
@@ -134,6 +240,8 @@ const Reporting = () => {
             let url = `${apiUrl}/api/detection-events?limit=200`;
             if (selectedCategory === 'Dress Code') {
                 url += '&event_type=Dress Code Violation';
+            } else if (selectedCategory === 'People Counting') {
+                url += '&event_type=Capacity Exceeded';
             }
             const res = await fetch(url);
             const data = await res.json();
@@ -221,7 +329,7 @@ const Reporting = () => {
                     <div className="space-y-2">
                         <label className="text-sm font-medium">Report Category</label>
                         <div className="flex bg-muted rounded-md p-1 h-10 items-center">
-                            {['All', 'Dress Code'].map(cat => (
+                            {['All', 'Dress Code', 'People Counting'].map(cat => (
                                 <button
                                     key={cat}
                                     onClick={() => handleCategoryChange(cat)}
@@ -269,10 +377,10 @@ const Reporting = () => {
 
             {/* Content Area */}
             <div className="flex-1 overflow-y-auto grid md:grid-cols-2 gap-6 min-h-0">
-                {/* Chart */}
+                {/* Violations by Day Chart */}
                 <Card className="flex flex-col h-[400px] md:h-auto">
                     <CardHeader>
-                        <CardTitle>Violations by Day</CardTitle>
+                        <CardTitle>Events by Day</CardTitle>
                     </CardHeader>
                     <CardContent className="flex-1 min-h-0">
                         {chartData.length > 0 ? (
@@ -286,19 +394,22 @@ const Reporting = () => {
                                         contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
                                     />
                                     <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
-                                    <Bar dataKey="violations" name="Violations" fill="hsl(var(--destructive))" radius={[4, 4, 0, 0]} maxBarSize={40} />
+                                    <Bar dataKey="violations" name="Events" fill="hsl(var(--destructive))" radius={[4, 4, 0, 0]} maxBarSize={40} />
                                 </BarChart>
                             </ResponsiveContainer>
                         ) : (
                             <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
-                                No violation data to display
+                                No event data to display
                             </div>
                         )}
                     </CardContent>
                 </Card>
 
+                {/* Occupancy Over Time Chart */}
+                <OccupancyChart apiUrl={apiUrl} />
+
                 {/* Event Log Table */}
-                <Card className="flex flex-col h-[400px] md:h-auto overflow-hidden">
+                <Card className="flex flex-col h-[400px] md:col-span-2 overflow-hidden">
                     <CardHeader>
                         <CardTitle>Detection Event Logs</CardTitle>
                     </CardHeader>
@@ -308,41 +419,46 @@ const Reporting = () => {
                                 <tr>
                                     <th className="px-4 py-3 font-medium">Timestamp</th>
                                     <th className="px-4 py-3 font-medium">Event Type</th>
-                                    <th className="px-4 py-3 font-medium">Label</th>
-                                    <th className="px-4 py-3 font-medium">Confidence</th>
+                                    <th className="px-4 py-3 font-medium">Details</th>
                                     <th className="px-4 py-3 font-medium text-right">Action</th>
                                 </tr>
                             </thead>
                             <tbody className="divide-y">
-                                {filteredEvents.length > 0 ? filteredEvents.map(evt => (
-                                    <tr key={evt.id} className="hover:bg-muted/30 transition-colors group cursor-pointer" onClick={() => setSelectedRecord(evt)}>
-                                        <td className="px-4 py-3">{new Date(evt.timestamp).toLocaleString()}</td>
-                                        <td className="px-4 py-3">
-                                            <div className="flex items-center gap-2">
-                                                <div className="w-2 h-2 rounded-full bg-red-500" />
-                                                {evt.event_type}
-                                            </div>
-                                        </td>
-                                        <td className="px-4 py-3 text-muted-foreground">
-                                            {evt.details?.label?.replace(/_/g, ' ') || '-'}
-                                        </td>
-                                        <td className="px-4 py-3">
-                                            {evt.details?.confidence
-                                                ? <span className="px-2 py-0.5 rounded text-xs font-medium bg-red-500/10 text-red-500">
-                                                    {Math.round(evt.details.confidence * 100)}%
-                                                </span>
-                                                : '-'
-                                            }
-                                        </td>
-                                        <td className="px-4 py-3 text-right">
-                                            <Button variant="ghost" size="icon" className="h-8 w-8 opacity-0 group-hover:opacity-100 transition-opacity">
-                                                <Eye className="w-4 h-4" />
-                                            </Button>
-                                        </td>
-                                    </tr>
-                                )) : (
+                                {filteredEvents.length > 0 ? filteredEvents.map(evt => {
+                                    const isCapacity = evt.event_type === 'Capacity Exceeded';
+                                    const dotColor = isCapacity ? 'bg-orange-500' : 'bg-red-500';
+
+                                    return (
+                                        <tr key={evt.id} className="hover:bg-muted/30 transition-colors group cursor-pointer" onClick={() => setSelectedRecord(evt)}>
+                                            <td className="px-4 py-3">{new Date(evt.timestamp).toLocaleString()}</td>
+                                            <td className="px-4 py-3">
+                                                <div className="flex items-center gap-2">
+                                                    <div className={cn("w-2 h-2 rounded-full", dotColor)} />
+                                                    {evt.event_type}
+                                                </div>
+                                            </td>
+                                            <td className="px-4 py-3 text-muted-foreground">
+                                                {isCapacity ? (
+                                                    <span>
+                                                        Occupancy: {evt.details?.occupancy ?? '-'} / {evt.details?.max_capacity ?? '-'}
+                                                    </span>
+                                                ) : (
+                                                    <span>
+                                                        {evt.details?.label?.replace(/_/g, ' ') || '-'}
+                                                        {evt.details?.confidence ? ` (${Math.round(evt.details.confidence * 100)}%)` : ''}
+                                                    </span>
+                                                )}
+                                            </td>
+                                            <td className="px-4 py-3 text-right">
+                                                <Button variant="ghost" size="icon" className="h-8 w-8 opacity-0 group-hover:opacity-100 transition-opacity">
+                                                    <Eye className="w-4 h-4" />
+                                                </Button>
+                                            </td>
+                                        </tr>
+                                    );
+                                }) : (
                                     <tr>
-                                        <td colSpan={5} className="px-4 py-8 text-center text-muted-foreground">
+                                        <td colSpan={4} className="px-4 py-8 text-center text-muted-foreground">
                                             {loading ? "Loading..." : "No detection events found."}
                                         </td>
                                     </tr>

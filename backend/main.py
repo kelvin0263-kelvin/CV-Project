@@ -9,6 +9,7 @@ from app.models.base import Base
 from app.routers import camera_router
 from app.routers import policy_router
 from app.routers import detection_router
+from app.routers import counting_router
 
 
 @asynccontextmanager
@@ -27,13 +28,23 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[Startup] Warning: Could not sync policy: {e}")
 
+    # Load people counting configs from DB into in-memory cache
+    try:
+        await counting_router.load_counting_configs_from_db()
+    except Exception as e:
+        print(f"[Startup] Warning: Could not load counting configs: {e}")
+
     # Start background task to persist violation events from the video producer
     task = asyncio.create_task(detection_router.violation_persistence_loop())
+
+    # Start background task to persist counting snapshots
+    snapshot_task = asyncio.create_task(counting_router.counting_snapshot_persistence_loop())
 
     yield
 
     # Cleanup
     task.cancel()
+    snapshot_task.cancel()
 
 
 # Initialize App
@@ -52,6 +63,7 @@ app.add_middleware(
 app.include_router(camera_router.router)
 app.include_router(policy_router.router)
 app.include_router(detection_router.router)
+app.include_router(counting_router.router)
 
 if __name__ == "__main__":
     import uvicorn

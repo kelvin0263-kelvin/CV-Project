@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 
-const StreamPlayer = ({ wsUrl, className, alt, onStats, onDetections }) => {
+const StreamPlayer = ({ wsUrl, className, alt, onStats, onDetections, onCountingData }) => {
     const imgRef = useRef(null);
     const canvasRef = useRef(null);
     const wsRef = useRef(null);
@@ -118,6 +118,11 @@ const StreamPlayer = ({ wsUrl, className, alt, onStats, onDetections }) => {
                 // Forward detections to parent if callback provided
                 if (onDetections && detections.length > 0) {
                     onDetections(detections);
+                }
+
+                // Forward counting data to parent if callback provided
+                if (onCountingData && data.counting_data) {
+                    onCountingData(data.counting_data);
                 }
             } catch (e) {
                 console.error("Error parsing WS message", e);

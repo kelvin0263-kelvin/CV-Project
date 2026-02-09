@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Card, CardContent } from './ui/card';
 import { Button } from './ui/button';
-import { HardDrive, Circle, ChevronRight, LayoutGrid, Users, Shirt, AlertTriangle, ShieldCheck, Maximize2, Minimize2 } from 'lucide-react';
+import { HardDrive, Circle, ChevronRight, LayoutGrid, Users, Shirt, AlertTriangle, ShieldCheck, Maximize2, Minimize2, ArrowDownToLine, ArrowUpFromLine } from 'lucide-react';
 import StreamPlayer from './StreamPlayer';
 import { getApiBaseUrl, getWSUrl } from '../apiConfig';
 
@@ -13,7 +13,11 @@ const RECENT_DETECTIONS = [
 
 const CameraFeedCard = ({ camera }) => {
     const [stats, setStats] = useState({ fps: 0, people_count: 0 });
+    const [countingData, setCountingData] = useState({});
     const wsUrl = getWSUrl(`/ws/${camera.id}`);
+
+    const hasCountingData = countingData && (countingData.total_in > 0 || countingData.total_out > 0);
+    const capacityExceeded = countingData?.capacity_exceeded ?? false;
 
     return (
         <div className="relative group overflow-hidden bg-black rounded-sm border border-border/50 h-full w-full flex items-center justify-center">
@@ -24,6 +28,7 @@ const CameraFeedCard = ({ camera }) => {
                     className="w-full h-full"
                     alt={camera.name}
                     onStats={setStats}
+                    onCountingData={setCountingData}
                 />
             ) : (
                 <div className="absolute inset-0 bg-muted/20 flex items-center justify-center text-muted-foreground">
@@ -41,11 +46,17 @@ const CameraFeedCard = ({ camera }) => {
                         <Circle className="w-2 h-2 fill-green-500 text-green-500 animate-pulse" />
                         {camera.name}
                     </div>
-                    <div className="flex gap-2">
+                    <div className="flex gap-2 flex-wrap justify-end">
                         {stats.people_count > 0 && (
                             <div className="bg-black/60 text-white text-xs px-2 py-1 rounded backdrop-blur-sm flex items-center gap-1">
                                 <Users className="w-3 h-3" />
                                 {stats.people_count}
+                            </div>
+                        )}
+                        {hasCountingData && (
+                            <div className="bg-black/60 text-white text-xs px-2 py-1 rounded backdrop-blur-sm flex items-center gap-1.5">
+                                <span className="text-green-400">IN:{countingData.total_in}</span>
+                                <span className="text-red-400">OUT:{countingData.total_out}</span>
                             </div>
                         )}
                         <div className="bg-black/60 text-white text-xs px-2 py-1 rounded backdrop-blur-sm flex items-center gap-1">
@@ -53,6 +64,16 @@ const CameraFeedCard = ({ camera }) => {
                         </div>
                     </div>
                 </div>
+
+                {/* Capacity exceeded warning */}
+                {capacityExceeded && (
+                    <div className="absolute bottom-4 left-4 right-4 flex justify-center">
+                        <div className="bg-red-500/80 text-white text-xs px-3 py-1.5 rounded-full backdrop-blur-sm flex items-center gap-1.5 animate-pulse">
+                            <AlertTriangle className="w-3 h-3" />
+                            Capacity Exceeded ({countingData.occupancy}/{countingData.max_capacity})
+                        </div>
+                    </div>
+                )}
             </div>
         </div>
     );
