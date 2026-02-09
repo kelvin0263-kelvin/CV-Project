@@ -1,11 +1,13 @@
 """
 People Counting Service
 
-Supports TWO counting methods (can coexist):
+Supports THREE counting methods (can coexist):
 
 1. **Line-crossing** — segment intersection + cross product direction detection.
-2. **Multi-zone state machine** — tracks transitions between Outside → Door → Inside
-   zones for robust entrance/exit counting, with disappear-inference for fast exits.
+2. **3-zone state machine** — Outside → Door → Inside transitions.
+3. **2-zone door counting** — Outside + Door only (no Inside zone).
+   IN = person walks Outside → Door → disappears (went inside, camera can't see).
+   OUT = new track appears in Door → moves to Outside (came from inside).
 
 All line/zone coordinates are stored in normalized (0-1) form.
 """
@@ -30,17 +32,27 @@ STATE_DOOR_EXIT = "door_exit"        # was inside, now in door → heading outsi
 STATE_INSIDE = "inside"
 STATE_DOOR_UNKNOWN = "door_unknown"  # first seen in door, direction unknown
 
+# Group modes
+MODE_3ZONE = "3zone"  # Outside + Door + Inside
+MODE_2ZONE = "2zone"  # Outside + Door only (no Inside visible)
+
+# Anti-noise defaults
+DEFAULT_MIN_FRAMES = 3        # Minimum frames a track must be seen before counting
+DEFAULT_DISAPPEAR_TIMEOUT = 1.0  # Seconds before inferring from disappearance
+
 
 # ---------------------------------------------------------------------------
 # Per-track zone state
 # ---------------------------------------------------------------------------
 class _TrackZoneState:
     """Holds the state-machine state for one tracked person in one zone group."""
-    __slots__ = ("state", "last_seen_time")
+    __slots__ = ("state", "last_seen_time", "frame_count", "birth_zone")
 
-    def __init__(self):
+    def __init__(self, birth_zone: str = ""):
         self.state: str = STATE_NONE
         self.last_seen_time: float = time.time()
+        self.frame_count: int = 0        # How many frames this track has been seen in any zone
+        self.birth_zone: str = birth_zone  # Which zone the track was first detected in
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +75,8 @@ class PeopleCounter:
         self.enabled = config.get("enabled", True)
 
         # Parse zone groups from zones list
-        self.zone_groups: dict[str, dict[str, dict]] = {}  # group_id -> {type -> zone_cfg}
+        self.zone_groups: dict[str, dict[str, dict]] = {}   # group_id -> {type -> zone_cfg}
+        self.zone_group_modes: dict[str, str] = {}          # group_id -> MODE_2ZONE | MODE_3ZONE
         self.standalone_zones: list[dict] = []
         self._parse_zone_groups()
 
@@ -82,8 +95,9 @@ class PeopleCounter:
             gid: {"in": 0, "out": 0} for gid in self.zone_groups
         }
 
-        # Disappear inference timeout (seconds)
-        self.disappear_timeout: float = config.get("disappear_timeout", 1.0)
+        # Anti-noise settings
+        self.min_frames_for_count: int = config.get("min_frames", DEFAULT_MIN_FRAMES)
+        self.disappear_timeout: float = config.get("disappear_timeout", DEFAULT_DISAPPEAR_TIMEOUT)
 
         # Snapshot timing
         self._last_snapshot_time = time.time()
@@ -104,48 +118,49 @@ class PeopleCounter:
             else:
                 self.standalone_zones.append(zone)
 
-        # Validate: each group must have all 3 zone types
         for gid, group_zones in groups_raw.items():
-            if all(t in group_zones for t in (ZONE_OUTSIDE, ZONE_DOOR, ZONE_INSIDE)):
+            has_outside = ZONE_OUTSIDE in group_zones
+            has_door = ZONE_DOOR in group_zones
+            has_inside = ZONE_INSIDE in group_zones
+
+            if has_outside and has_door and has_inside:
+                # Full 3-zone group
                 self.zone_groups[gid] = group_zones
+                self.zone_group_modes[gid] = MODE_3ZONE
+            elif has_outside and has_door:
+                # 2-zone group (no inside visible)
+                self.zone_groups[gid] = group_zones
+                self.zone_group_modes[gid] = MODE_2ZONE
             else:
-                # Incomplete group → treat as standalone
+                # Incomplete → standalone
                 for zone in group_zones.values():
                     self.standalone_zones.append(zone)
-                missing = [t for t in (ZONE_OUTSIDE, ZONE_DOOR, ZONE_INSIDE) if t not in group_zones]
-                print(f"[PeopleCounter] Warning: Group '{gid}' missing {missing}, treating as standalone")
+                present = [t for t in (ZONE_OUTSIDE, ZONE_DOOR, ZONE_INSIDE) if t in group_zones]
+                print(f"[PeopleCounter] Warning: Group '{gid}' has only {present}, "
+                      f"need at least Outside+Door. Treating as standalone.")
 
         if self.zone_groups:
-            print(f"[PeopleCounter] Loaded {len(self.zone_groups)} zone group(s): "
-                  f"{list(self.zone_groups.keys())}")
+            summaries = []
+            for gid in self.zone_groups:
+                summaries.append(f"{gid}({self.zone_group_modes[gid]})")
+            print(f"[PeopleCounter] Loaded {len(self.zone_groups)} zone group(s): {summaries}")
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
     def update(self, detections: list[dict], frame_shape: tuple[int, int]) -> dict:
-        """
-        Process one frame of detections and return counting data.
-
-        Args:
-            detections: list of dicts with {track_id, person_bbox: [x1,y1,x2,y2]}
-            frame_shape: (height, width) of the full-resolution frame
-
-        Returns:
-            dict with counting results
-        """
         if not self.enabled:
             return self._empty_result()
 
         h, w = frame_shape
 
-        # 1. Compute normalised centroids for this frame
+        # 1. Compute normalised centroids
         current_centroids: dict[int, tuple[float, float]] = {}
         for det in detections:
             track_id = det.get("track_id")
             bbox = det.get("person_bbox")
             if track_id is None or bbox is None:
                 continue
-            # Bottom-center of bounding box, normalised to 0-1
             cx = ((bbox[0] + bbox[2]) / 2.0) / w
             cy = bbox[3] / h
             current_centroids[int(track_id)] = (cx, cy)
@@ -176,15 +191,15 @@ class PeopleCounter:
                                 self.total_out += 1
 
         # 3. Zone-group state machine counting
-        zone_group_counts: dict[str, dict] = {}
         for gid, group_zones in self.zone_groups.items():
-            in_c, out_c = self._process_zone_group(gid, group_zones, current_centroids)
+            mode = self.zone_group_modes[gid]
+            in_c, out_c = self._process_zone_group(gid, group_zones, current_centroids, mode)
             self.total_in += in_c
             self.total_out += out_c
             self._group_totals[gid]["in"] += in_c
             self._group_totals[gid]["out"] += out_c
 
-        # 4. Disappear inference (tracks lost while transiting door zone)
+        # 4. Disappear inference
         d_in, d_out, d_group_deltas = self._process_disappears(current_centroids)
         self.total_in += d_in
         self.total_out += d_out
@@ -208,15 +223,17 @@ class PeopleCounter:
                     count += 1
             zone_counts[zone_id] = count
 
-        # Build zone_group_counts for the response
+        # 7. Build zone_group_counts for the response
+        zone_group_counts: dict[str, dict] = {}
         for gid, group_zones in self.zone_groups.items():
-            # Count people currently in each zone of this group
+            mode = self.zone_group_modes[gid]
             door_count = 0
             inside_count = 0
             outside_count = 0
-            door_poly = group_zones[ZONE_DOOR].get("points", [])
-            inside_poly = group_zones[ZONE_INSIDE].get("points", [])
-            outside_poly = group_zones[ZONE_OUTSIDE].get("points", [])
+            door_poly = group_zones.get(ZONE_DOOR, {}).get("points", [])
+            inside_poly = group_zones.get(ZONE_INSIDE, {}).get("points", []) if mode == MODE_3ZONE else []
+            outside_poly = group_zones.get(ZONE_OUTSIDE, {}).get("points", [])
+
             for _, centroid in current_centroids.items():
                 if len(inside_poly) >= 3 and _point_in_polygon(centroid, inside_poly):
                     inside_count += 1
@@ -228,6 +245,7 @@ class PeopleCounter:
             g_totals = self._group_totals[gid]
             zone_group_counts[gid] = {
                 "name": group_zones.get(ZONE_DOOR, {}).get("name", gid),
+                "mode": mode,
                 "total_in": g_totals["in"],
                 "total_out": g_totals["out"],
                 "occupancy": max(0, g_totals["in"] - g_totals["out"]),
@@ -236,7 +254,7 @@ class PeopleCounter:
                 "outside_count": outside_count,
             }
 
-        # 7. Occupancy and capacity check
+        # 8. Occupancy and capacity check
         occupancy = max(0, self.total_in - self.total_out)
         capacity_exceeded = False
         if self.max_capacity is not None and self.max_capacity > 0:
@@ -255,13 +273,14 @@ class PeopleCounter:
         }
 
     # ------------------------------------------------------------------
-    # Zone-group state machine
+    # Zone-group state machine (handles both 2-zone and 3-zone)
     # ------------------------------------------------------------------
     def _process_zone_group(
         self,
         gid: str,
         group_zones: dict[str, dict],
         current_centroids: dict[int, tuple[float, float]],
+        mode: str,
     ) -> tuple[int, int]:
         """
         Run the state machine for one zone group against all tracked people.
@@ -272,26 +291,21 @@ class PeopleCounter:
         out_count = 0
         now = time.time()
 
-        outside_poly = group_zones[ZONE_OUTSIDE].get("points", [])
-        door_poly = group_zones[ZONE_DOOR].get("points", [])
-        inside_poly = group_zones[ZONE_INSIDE].get("points", [])
+        outside_poly = group_zones.get(ZONE_OUTSIDE, {}).get("points", [])
+        door_poly = group_zones.get(ZONE_DOOR, {}).get("points", [])
+        inside_poly = group_zones.get(ZONE_INSIDE, {}).get("points", []) if mode == MODE_3ZONE else []
+        has_inside = mode == MODE_3ZONE and len(inside_poly) >= 3
 
         for track_id, centroid in current_centroids.items():
             # Determine which zone(s) this person is in
             in_outside = len(outside_poly) >= 3 and _point_in_polygon(centroid, outside_poly)
             in_door = len(door_poly) >= 3 and _point_in_polygon(centroid, door_poly)
-            in_inside = len(inside_poly) >= 3 and _point_in_polygon(centroid, inside_poly)
+            in_inside = has_inside and _point_in_polygon(centroid, inside_poly)
 
             if not (in_outside or in_door or in_inside):
                 continue  # Person not in any zone of this group
 
-            # Ensure track state exists
-            if track_id not in states:
-                states[track_id] = _TrackZoneState()
-            ts = states[track_id]
-            ts.last_seen_time = now
-
-            # If in multiple zones (overlap), prioritise: door > inside > outside
+            # Resolve zone priority: door > inside > outside
             if in_door:
                 current_zone = ZONE_DOOR
             elif in_inside:
@@ -301,19 +315,37 @@ class PeopleCounter:
             else:
                 continue
 
-            # State transitions
+            # Ensure track state exists
+            if track_id not in states:
+                states[track_id] = _TrackZoneState(birth_zone=current_zone)
+            ts = states[track_id]
+            ts.last_seen_time = now
+            ts.frame_count += 1
+
+            # ---- State transitions ----
+
             if current_zone == ZONE_OUTSIDE:
                 if ts.state == STATE_DOOR_EXIT:
-                    # inside → door → outside = EXIT
-                    out_count += 1
+                    # (3-zone) inside → door → outside = EXIT
+                    if ts.frame_count >= self.min_frames_for_count:
+                        out_count += 1
                     ts.state = STATE_OUTSIDE
+
                 elif ts.state == STATE_DOOR_UNKNOWN:
-                    # First seen in door, now outside → was exiting
+                    # Track first appeared in door, now moved to outside.
+                    # In 2-zone mode: this means they came from inside = OUT
+                    # In 3-zone mode: ambiguous, don't count (could be passing through)
+                    if mode == MODE_2ZONE and ts.birth_zone == ZONE_DOOR:
+                        if ts.frame_count >= self.min_frames_for_count:
+                            out_count += 1
                     ts.state = STATE_OUTSIDE
+
                 elif ts.state == STATE_INSIDE:
-                    # Direct jump inside → outside (skipped door detection)
-                    out_count += 1
+                    # Direct jump inside → outside (skipped door)
+                    if ts.frame_count >= self.min_frames_for_count:
+                        out_count += 1
                     ts.state = STATE_OUTSIDE
+
                 else:
                     ts.state = STATE_OUTSIDE
 
@@ -327,28 +359,34 @@ class PeopleCounter:
                 # else: stay in current door sub-state
 
             elif current_zone == ZONE_INSIDE:
+                # Only reachable in 3-zone mode
                 if ts.state == STATE_DOOR_ENTRY:
                     # outside → door → inside = ENTRY
-                    in_count += 1
+                    if ts.frame_count >= self.min_frames_for_count:
+                        in_count += 1
                     ts.state = STATE_INSIDE
                 elif ts.state == STATE_DOOR_UNKNOWN:
-                    # First seen in door, now inside → was entering
                     ts.state = STATE_INSIDE
                 elif ts.state == STATE_OUTSIDE:
-                    # Direct jump outside → inside (skipped door detection)
-                    in_count += 1
+                    # Direct jump outside → inside
+                    if ts.frame_count >= self.min_frames_for_count:
+                        in_count += 1
                     ts.state = STATE_INSIDE
                 else:
                     ts.state = STATE_INSIDE
 
         return (in_count, out_count)
 
+    # ------------------------------------------------------------------
+    # Disappear inference
+    # ------------------------------------------------------------------
     def _process_disappears(
         self,
         current_centroids: dict[int, tuple[float, float]],
     ) -> tuple[int, int, dict[str, tuple[int, int]]]:
         """
         Handle tracks that disappeared while transiting through the door zone.
+        Applies anti-noise: only infer if frame_count >= min_frames_for_count.
 
         Returns:
             (total_in, total_out, {group_id: (in, out)})
@@ -360,25 +398,35 @@ class PeopleCounter:
         group_deltas: dict[str, tuple[int, int]] = {}
 
         for gid, states in self._zone_track_states.items():
+            mode = self.zone_group_modes.get(gid, MODE_3ZONE)
             g_in = 0
             g_out = 0
             to_remove: list[int] = []
 
             for track_id, ts in states.items():
                 if track_id in active_ids:
-                    continue  # Still visible, skip
+                    continue  # Still visible
 
                 elapsed = now - ts.last_seen_time
 
                 if elapsed >= self.disappear_timeout:
                     if ts.state in (STATE_DOOR_ENTRY, STATE_DOOR_EXIT):
-                        if ts.state == STATE_DOOR_ENTRY:
-                            # Was heading inside, lost at door → infer IN
-                            g_in += 1
-                        else:
-                            # Was heading outside, lost at door → infer OUT
-                            g_out += 1
+                        # Only count if track was visible for enough frames (anti-noise)
+                        if ts.frame_count >= self.min_frames_for_count:
+                            if ts.state == STATE_DOOR_ENTRY:
+                                # Was heading inside, lost at door → infer IN
+                                g_in += 1
+                            else:
+                                # Was heading outside, lost at door → infer OUT
+                                g_out += 1
                         to_remove.append(track_id)
+
+                    elif ts.state == STATE_DOOR_UNKNOWN and mode == MODE_2ZONE:
+                        # In 2-zone mode, a track born in the door that disappears
+                        # without moving to outside → they went back inside, no count.
+                        # Just clean up.
+                        to_remove.append(track_id)
+
                     elif elapsed >= self.disappear_timeout * 3:
                         # Very stale non-door state, just clean up
                         to_remove.append(track_id)
@@ -418,7 +466,6 @@ class PeopleCounter:
         if self.max_capacity is None or self.max_capacity <= 0:
             self.capacity_alert_fired = False
             return None
-
         occupancy = max(0, self.total_in - self.total_out)
         if occupancy >= self.max_capacity and not self.capacity_alert_fired:
             self.capacity_alert_fired = True
@@ -438,15 +485,16 @@ class PeopleCounter:
         self.zones = config.get("zones", [])
         self.max_capacity = config.get("max_capacity")
         self.enabled = config.get("enabled", True)
-        self.disappear_timeout = config.get("disappear_timeout", 1.0)
+        self.disappear_timeout = config.get("disappear_timeout", DEFAULT_DISAPPEAR_TIMEOUT)
+        self.min_frames_for_count = config.get("min_frames", DEFAULT_MIN_FRAMES)
 
         # Re-parse zone groups
         old_groups = set(self.zone_groups.keys())
         self.zone_groups = {}
+        self.zone_group_modes = {}
         self.standalone_zones = []
         self._parse_zone_groups()
 
-        # Initialise states for new groups, keep existing
         new_groups = set(self.zone_groups.keys())
         for gid in new_groups - old_groups:
             self._zone_track_states[gid] = {}
@@ -484,42 +532,25 @@ class PeopleCounter:
 # Geometry helpers
 # ---------------------------------------------------------------------------
 
-def _cross_product_sign(
-    a: tuple[float, float],
-    b: tuple[float, float],
-    p: tuple[float, float],
-) -> float:
+def _cross_product_sign(a, b, p):
     return (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
 
 
-def _on_segment(
-    p: tuple[float, float],
-    q: tuple[float, float],
-    r: tuple[float, float],
-) -> bool:
+def _on_segment(p, q, r):
     if (min(p[0], r[0]) <= q[0] <= max(p[0], r[0]) and
             min(p[1], r[1]) <= q[1] <= max(p[1], r[1])):
         return True
     return False
 
 
-def _orientation(
-    p: tuple[float, float],
-    q: tuple[float, float],
-    r: tuple[float, float],
-) -> int:
+def _orientation(p, q, r):
     val = (q[1] - p[1]) * (r[0] - q[0]) - (q[0] - p[0]) * (r[1] - q[1])
     if abs(val) < 1e-10:
         return 0
     return 1 if val > 0 else 2
 
 
-def _segments_intersect(
-    p1: tuple[float, float],
-    q1: tuple[float, float],
-    p2: tuple[float, float],
-    q2: tuple[float, float],
-) -> bool:
+def _segments_intersect(p1, q1, p2, q2):
     o1 = _orientation(p1, q1, p2)
     o2 = _orientation(p1, q1, q2)
     o3 = _orientation(p2, q2, p1)
@@ -540,10 +571,7 @@ def _segments_intersect(
     return False
 
 
-def _point_in_polygon(
-    point: tuple[float, float],
-    polygon: list[list[float]],
-) -> bool:
+def _point_in_polygon(point, polygon):
     x, y = point
     n = len(polygon)
     inside = False

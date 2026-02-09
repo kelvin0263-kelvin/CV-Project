@@ -177,10 +177,9 @@ const PeopleCounting = () => {
         const gid = `entrance_${Date.now()}`;
         // Just expand - zones will be added as user draws
         setExpandedGroups(prev => ({ ...prev, [gid]: true }));
-        // Create a placeholder so the group shows up in the UI immediately
-        // We add a "marker" zone with no points that gets filtered out on save
-        // Actually, let's just use state tracking. The group exists if it has an expanded entry.
-        // But we need the group to appear in entranceGroups. Let's add a sentinel zone:
+        // Add placeholder zones so the group appears in the UI immediately.
+        // Inside zone is optional (2-zone mode). Placeholders with empty points
+        // are filtered out on save.
         setZones(prev => [
             ...prev,
             { id: `${gid}_outside_placeholder`, name: 'Outside', points: [], zone_type: 'outside', group_id: gid },
@@ -282,13 +281,20 @@ const PeopleCounting = () => {
                                 </Button>
                             </div>
                             <p className="text-xs text-muted-foreground">
-                                Draw Outside → Door → Inside zones for each entrance. Counting uses zone transitions.
+                                Draw Outside + Door zones (Inside is optional). 2-zone mode uses disappear-inference for entrances near frame edges.
                             </p>
 
                             {Object.entries(entranceGroups).map(([gid, group]) => {
                                 const isExpanded = expandedGroups[gid] ?? false;
                                 const gCounts = zoneGroupCounts[gid];
                                 const groupName = `Entrance ${Object.keys(entranceGroups).indexOf(gid) + 1}`;
+
+                                // Determine mode: has Inside zone drawn?
+                                const hasOutside = group.zones.outside?.points?.length >= 3;
+                                const hasDoor = group.zones.door?.points?.length >= 3;
+                                const hasInside = group.zones.inside?.points?.length >= 3;
+                                const groupMode = hasOutside && hasDoor && hasInside ? '3-zone'
+                                    : hasOutside && hasDoor ? '2-zone' : 'incomplete';
 
                                 return (
                                     <div key={gid} className="border rounded-lg overflow-hidden">
@@ -298,6 +304,13 @@ const PeopleCounting = () => {
                                             {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
                                             <DoorOpen className="w-4 h-4 text-primary" />
                                             <span className="text-sm font-medium flex-1">{groupName}</span>
+                                            {hasOutside && hasDoor && (
+                                                <span className={cn("text-[9px] px-1.5 py-0.5 rounded-full font-medium",
+                                                    groupMode === '2-zone' ? "bg-yellow-500/15 text-yellow-600" : "bg-green-500/15 text-green-600"
+                                                )}>
+                                                    {groupMode}
+                                                </span>
+                                            )}
                                             {gCounts && (
                                                 <span className="text-[10px] text-muted-foreground">
                                                     IN:{gCounts.total_in} OUT:{gCounts.total_out}
@@ -316,6 +329,7 @@ const PeopleCounting = () => {
                                                     const meta = ZONE_TYPE_META[ztype];
                                                     const zoneExists = group.zones[ztype] && group.zones[ztype].points?.length >= 3;
                                                     const isDrawing = drawingMode === 'roi' && pendingGroupId === gid && drawingZoneType === ztype;
+                                                    const isOptional = ztype === 'inside';
 
                                                     return (
                                                         <div key={ztype} className={cn(
@@ -323,7 +337,10 @@ const PeopleCounting = () => {
                                                             isDrawing ? "border-primary bg-primary/5" : "bg-muted/20"
                                                         )}>
                                                             <div className={cn("w-2.5 h-2.5 rounded-full shrink-0", meta.color)} />
-                                                            <span className="font-medium flex-1">{meta.label} Zone</span>
+                                                            <span className="font-medium flex-1">
+                                                                {meta.label} Zone
+                                                                {isOptional && <span className="text-muted-foreground font-normal ml-1">(optional)</span>}
+                                                            </span>
                                                             {zoneExists ? (
                                                                 <>
                                                                     <span className="text-muted-foreground">✓</span>
