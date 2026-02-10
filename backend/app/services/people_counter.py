@@ -16,6 +16,9 @@ import uuid
 import time
 from typing import Optional
 
+# Set to True to enable detailed per-track debug logging
+DEBUG_COUNTING = True
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -156,14 +159,18 @@ class PeopleCounter:
 
         # 1. Compute normalised centroids
         current_centroids: dict[int, tuple[float, float]] = {}
+        skipped_no_track = 0
         for det in detections:
             track_id = det.get("track_id")
             bbox = det.get("person_bbox")
             if track_id is None or bbox is None:
+                skipped_no_track += 1
                 continue
             cx = ((bbox[0] + bbox[2]) / 2.0) / w
             cy = bbox[3] / h
             current_centroids[int(track_id)] = (cx, cy)
+        if DEBUG_COUNTING and skipped_no_track > 0:
+            print(f"  [WARN] {skipped_no_track} detection(s) skipped: no track_id (green box, no ID)")
 
         # 2. Line-crossing detection
         for track_id, curr_pos in current_centroids.items():
@@ -191,8 +198,13 @@ class PeopleCounter:
                                 self.total_out += 1
 
         # 3. Zone-group state machine counting
+        if DEBUG_COUNTING and current_centroids and self.zone_groups:
+            print(f"\n[PeopleCounter] === Frame Update === tracks={list(current_centroids.keys())}, total_in={self.total_in}, total_out={self.total_out}")
+
         for gid, group_zones in self.zone_groups.items():
             mode = self.zone_group_modes[gid]
+            if DEBUG_COUNTING and current_centroids:
+                print(f"  [GROUP] {gid} (mode={mode})")
             in_c, out_c = self._process_zone_group(gid, group_zones, current_centroids, mode)
             self.total_in += in_c
             self.total_out += out_c
@@ -206,6 +218,18 @@ class PeopleCounter:
         for gid, (gi, go) in d_group_deltas.items():
             self._group_totals[gid]["in"] += gi
             self._group_totals[gid]["out"] += go
+
+        # Debug: print full track state summary periodically
+        if DEBUG_COUNTING and self.zone_groups:
+            self._debug_frame_counter = getattr(self, '_debug_frame_counter', 0) + 1
+            if self._debug_frame_counter % 30 == 0:  # Print every 30 frames
+                print(f"\n  [SUMMARY] Frame #{self._debug_frame_counter} | total_in={self.total_in} total_out={self.total_out}")
+                for gid, states in self._zone_track_states.items():
+                    if states:
+                        print(f"    Group '{gid}': {len(states)} tracked")
+                        for tid, ts in states.items():
+                            active = "ACTIVE" if tid in current_centroids else f"MISSING {time.time()-ts.last_seen_time:.1f}s"
+                            print(f"      Track {tid}: state={ts.state}, frames={ts.frame_count}, birth={ts.birth_zone}, {active}")
 
         # 5. Update previous centroids
         self.prev_centroids = current_centroids
@@ -303,6 +327,8 @@ class PeopleCounter:
             in_inside = has_inside and _point_in_polygon(centroid, inside_poly)
 
             if not (in_outside or in_door or in_inside):
+                if DEBUG_COUNTING:
+                    print(f"    Track {track_id}: centroid=({centroid[0]:.3f},{centroid[1]:.3f}) NOT in any zone of group '{gid}'")
                 continue  # Person not in any zone of this group
 
             # Resolve zone priority: door > inside > outside
@@ -323,27 +349,39 @@ class PeopleCounter:
             ts.frame_count += 1
 
             # ---- State transitions ----
+            old_state = ts.state
 
             if current_zone == ZONE_OUTSIDE:
                 if ts.state == STATE_DOOR_EXIT:
-                    # (3-zone) inside → door → outside = EXIT
                     if ts.frame_count >= self.min_frames_for_count:
                         out_count += 1
+                        if DEBUG_COUNTING:
+                            print(f"  [COUNT] Track {track_id}: OUT +1 (inside→door→outside, frames={ts.frame_count})")
+                    elif DEBUG_COUNTING:
+                        print(f"  [REJECT] Track {track_id}: door_exit→outside but frames={ts.frame_count} < {self.min_frames_for_count}, NOT counted")
                     ts.state = STATE_OUTSIDE
 
                 elif ts.state == STATE_DOOR_UNKNOWN:
-                    # Track first appeared in door, now moved to outside.
-                    # In 2-zone mode: this means they came from inside = OUT
-                    # In 3-zone mode: ambiguous, don't count (could be passing through)
                     if mode == MODE_2ZONE and ts.birth_zone == ZONE_DOOR:
                         if ts.frame_count >= self.min_frames_for_count:
                             out_count += 1
+                            if DEBUG_COUNTING:
+                                print(f"  [COUNT] Track {track_id}: OUT +1 (2-zone: born_door→outside, frames={ts.frame_count})")
+                        elif DEBUG_COUNTING:
+                            print(f"  [REJECT] Track {track_id}: door_unknown→outside but frames={ts.frame_count} < {self.min_frames_for_count}, NOT counted")
+                    elif DEBUG_COUNTING and mode == MODE_2ZONE:
+                        print(f"  [REJECT] Track {track_id}: door_unknown→outside but birth_zone={ts.birth_zone} != door, NOT counted")
+                    elif DEBUG_COUNTING and mode == MODE_3ZONE:
+                        print(f"  [SKIP] Track {track_id}: door_unknown→outside in 3-zone mode, ambiguous, no count")
                     ts.state = STATE_OUTSIDE
 
                 elif ts.state == STATE_INSIDE:
-                    # Direct jump inside → outside (skipped door)
                     if ts.frame_count >= self.min_frames_for_count:
                         out_count += 1
+                        if DEBUG_COUNTING:
+                            print(f"  [COUNT] Track {track_id}: OUT +1 (direct inside→outside, frames={ts.frame_count})")
+                    elif DEBUG_COUNTING:
+                        print(f"  [REJECT] Track {track_id}: inside→outside but frames={ts.frame_count} < {self.min_frames_for_count}, NOT counted")
                     ts.state = STATE_OUTSIDE
 
                 else:
@@ -351,29 +389,37 @@ class PeopleCounter:
 
             elif current_zone == ZONE_DOOR:
                 if ts.state == STATE_OUTSIDE:
-                    ts.state = STATE_DOOR_ENTRY  # heading inside
+                    ts.state = STATE_DOOR_ENTRY
                 elif ts.state == STATE_INSIDE:
-                    ts.state = STATE_DOOR_EXIT   # heading outside
+                    ts.state = STATE_DOOR_EXIT
                 elif ts.state == STATE_NONE:
                     ts.state = STATE_DOOR_UNKNOWN
-                # else: stay in current door sub-state
 
             elif current_zone == ZONE_INSIDE:
-                # Only reachable in 3-zone mode
                 if ts.state == STATE_DOOR_ENTRY:
-                    # outside → door → inside = ENTRY
                     if ts.frame_count >= self.min_frames_for_count:
                         in_count += 1
+                        if DEBUG_COUNTING:
+                            print(f"  [COUNT] Track {track_id}: IN +1 (outside→door→inside, frames={ts.frame_count})")
+                    elif DEBUG_COUNTING:
+                        print(f"  [REJECT] Track {track_id}: door_entry→inside but frames={ts.frame_count} < {self.min_frames_for_count}, NOT counted")
                     ts.state = STATE_INSIDE
                 elif ts.state == STATE_DOOR_UNKNOWN:
                     ts.state = STATE_INSIDE
                 elif ts.state == STATE_OUTSIDE:
-                    # Direct jump outside → inside
                     if ts.frame_count >= self.min_frames_for_count:
                         in_count += 1
+                        if DEBUG_COUNTING:
+                            print(f"  [COUNT] Track {track_id}: IN +1 (direct outside→inside, frames={ts.frame_count})")
+                    elif DEBUG_COUNTING:
+                        print(f"  [REJECT] Track {track_id}: outside→inside but frames={ts.frame_count} < {self.min_frames_for_count}, NOT counted")
                     ts.state = STATE_INSIDE
                 else:
                     ts.state = STATE_INSIDE
+
+            # Log state transitions
+            if DEBUG_COUNTING and ts.state != old_state:
+                print(f"  [STATE] Track {track_id}: {old_state} → {ts.state} (zone={current_zone}, frames={ts.frame_count}, birth={ts.birth_zone})")
 
         return (in_count, out_count)
 
@@ -411,24 +457,27 @@ class PeopleCounter:
 
                 if elapsed >= self.disappear_timeout:
                     if ts.state in (STATE_DOOR_ENTRY, STATE_DOOR_EXIT):
-                        # Only count if track was visible for enough frames (anti-noise)
                         if ts.frame_count >= self.min_frames_for_count:
                             if ts.state == STATE_DOOR_ENTRY:
-                                # Was heading inside, lost at door → infer IN
                                 g_in += 1
+                                if DEBUG_COUNTING:
+                                    print(f"  [INFER] Track {track_id}: IN +1 (disappeared in door_entry after {elapsed:.1f}s, frames={ts.frame_count})")
                             else:
-                                # Was heading outside, lost at door → infer OUT
                                 g_out += 1
+                                if DEBUG_COUNTING:
+                                    print(f"  [INFER] Track {track_id}: OUT +1 (disappeared in door_exit after {elapsed:.1f}s, frames={ts.frame_count})")
+                        elif DEBUG_COUNTING:
+                            print(f"  [REJECT] Track {track_id}: disappeared in {ts.state} after {elapsed:.1f}s but frames={ts.frame_count} < {self.min_frames_for_count}, NOT counted")
                         to_remove.append(track_id)
 
                     elif ts.state == STATE_DOOR_UNKNOWN and mode == MODE_2ZONE:
-                        # In 2-zone mode, a track born in the door that disappears
-                        # without moving to outside → they went back inside, no count.
-                        # Just clean up.
+                        if DEBUG_COUNTING:
+                            print(f"  [CLEANUP] Track {track_id}: door_unknown disappeared after {elapsed:.1f}s, went back inside, no count (frames={ts.frame_count})")
                         to_remove.append(track_id)
 
                     elif elapsed >= self.disappear_timeout * 3:
-                        # Very stale non-door state, just clean up
+                        if DEBUG_COUNTING:
+                            print(f"  [CLEANUP] Track {track_id}: stale state={ts.state} after {elapsed:.1f}s, frames={ts.frame_count}, removing")
                         to_remove.append(track_id)
 
             for tid in to_remove:
