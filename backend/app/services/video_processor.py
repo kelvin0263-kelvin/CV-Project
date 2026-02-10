@@ -19,7 +19,13 @@ import numpy as np
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from DefishVideoCV import FisheyeMultiView
-from app.core.globals import FRAME_BUFFERS, ACTIVE_PRODUCERS
+from app.core.globals import (
+    FRAME_BUFFERS,
+    PRODUCER_THREADS,
+    PRODUCER_STOP_EVENTS,
+    PRODUCER_META,
+    PRODUCER_LOCK,
+)
 from ultralytics import YOLO
 from turbojpeg import TurboJPEG
 from app.services.dresscode_detector import classify_lower_body, crop_full_person
@@ -37,6 +43,7 @@ from app.routers.counting_router import (
 # ---------------------------------------------------------------------------
 BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PROJECT_ROOT = os.path.dirname(BACKEND_ROOT)
+UPLOAD_ROOT = os.path.abspath(os.path.join(PROJECT_ROOT, "temp_video_uploads"))
 SNAPSHOT_DIR = os.path.join(PROJECT_ROOT, "temp_video_uploads", "snapshots")
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
@@ -84,28 +91,90 @@ def drain_violation_queue() -> list:
 # Producer thread management
 # ---------------------------------------------------------------------------
 def start_producer_thread(source_path: str, is_fisheye: bool, active_views: list = None):
-    if source_path in ACTIVE_PRODUCERS:
-        return  # Already running
+    with PRODUCER_LOCK:
+        existing = PRODUCER_THREADS.get(source_path)
+        if existing is not None and existing.is_alive():
+            return  # Already running for this source
 
-    ACTIVE_PRODUCERS[source_path] = True
-    threading.Thread(
-        target=video_producer,
-        args=(source_path, is_fisheye, active_views),
-        daemon=True,
-    ).start()
+        stop_event = threading.Event()
+        source_abs = os.path.abspath(source_path)
+        source_meta = {
+            "is_file_source": os.path.isfile(source_abs),
+            "is_uploaded_source": os.path.commonpath([source_abs, UPLOAD_ROOT]) == UPLOAD_ROOT,
+        }
+
+        thread = threading.Thread(
+            target=video_producer,
+            args=(source_path, is_fisheye, active_views, stop_event, source_meta),
+            daemon=True,
+        )
+        PRODUCER_THREADS[source_path] = thread
+        PRODUCER_STOP_EVENTS[source_path] = stop_event
+        PRODUCER_META[source_path] = source_meta
+        thread.start()
+
+
+def stop_producer_thread(source_path: str, join_timeout: float = 2.0) -> bool:
+    """Request producer shutdown for a source. Returns True if fully stopped."""
+    with PRODUCER_LOCK:
+        thread = PRODUCER_THREADS.get(source_path)
+        stop_event = PRODUCER_STOP_EVENTS.get(source_path)
+
+    if thread is None or stop_event is None:
+        return True  # Already stopped / unknown source
+
+    stop_event.set()
+    if thread.is_alive():
+        thread.join(timeout=join_timeout)
+
+    if thread.is_alive():
+        print(f"[Producer] Stop requested but still alive for {source_path}")
+        return False
+
+    _cleanup_producer_state(source_path, clear_frame_buffer=True)
+    return True
+
+
+def is_producer_running(source_path: str) -> bool:
+    with PRODUCER_LOCK:
+        thread = PRODUCER_THREADS.get(source_path)
+        return thread.is_alive() if thread is not None else False
+
+
+def _cleanup_producer_state(source_path: str, clear_frame_buffer: bool):
+    with PRODUCER_LOCK:
+        PRODUCER_THREADS.pop(source_path, None)
+        PRODUCER_STOP_EVENTS.pop(source_path, None)
+        PRODUCER_META.pop(source_path, None)
+    if clear_frame_buffer:
+        FRAME_BUFFERS.pop(source_path, None)
 
 
 # ---------------------------------------------------------------------------
 # Main producer loop
 # ---------------------------------------------------------------------------
-def video_producer(source_path: str, is_fisheye: bool, active_views: list = None):
+def video_producer(
+    source_path: str,
+    is_fisheye: bool,
+    active_views: list = None,
+    stop_event: threading.Event | None = None,
+    source_meta: dict | None = None,
+):
     print(f"[Producer] Starting loop for {source_path}")
+
+    if stop_event is None:
+        stop_event = threading.Event()
+    if source_meta is None:
+        source_abs = os.path.abspath(source_path)
+        source_meta = {
+            "is_file_source": os.path.isfile(source_abs),
+            "is_uploaded_source": os.path.commonpath([source_abs, UPLOAD_ROOT]) == UPLOAD_ROOT,
+        }
 
     cap = cv2.VideoCapture(source_path)
     if not cap.isOpened():
         print(f"[Producer] Failed to open {source_path}")
-        if source_path in ACTIVE_PRODUCERS:
-            del ACTIVE_PRODUCERS[source_path]
+        _cleanup_producer_state(source_path, clear_frame_buffer=True)
         return
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -362,18 +431,21 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
     # Main loop
     # -----------------------------------------------------------------------
     while True:
+        if stop_event.is_set():
+            print(f"[Producer] Stop requested for {source_path}")
+            break
+
         loop_start = time.time()
         ret, frame = cap.read()
 
         if not ret:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            # Reset tracking state on video loop
-            track_state = {}
-            cached_detections = []
-            cached_people_count = 0
-            # Reset people counters on video loop
-            for counter in people_counters.values():
-                counter.reset()
+            # Uploaded file source reached EOF: stop producer automatically.
+            if source_meta.get("is_uploaded_source") and source_meta.get("is_file_source"):
+                print(f"[Producer] EOF reached, stopping uploaded source: {source_path}")
+                break
+
+            # Non-upload/live source: transient read failure, keep retrying.
+            time.sleep(0.1)
             continue
 
         frame_count += 1
@@ -518,6 +590,10 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
         wait = delay - elapsed
         if wait > 0:
             time.sleep(wait)
+
+    cap.release()
+    _cleanup_producer_state(source_path, clear_frame_buffer=True)
+    print(f"[Producer] Stopped loop for {source_path}")
 
 
 # ---------------------------------------------------------------------------

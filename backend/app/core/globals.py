@@ -1,4 +1,5 @@
 from typing import Dict
+import threading
 
 # --------------------------------------------------------------------------
 # Runtime-only in-memory state (NOT persisted in the database).
@@ -9,5 +10,8 @@ from typing import Dict
 # Format: { source_path: { 'original': b64_str, 'partition_X': b64_str, '__meta__': {...} } }
 FRAME_BUFFERS: Dict[str, Dict[str, str]] = {}
 
-# Active Producer Threads Tracker
-ACTIVE_PRODUCERS: Dict[str, bool] = {}
+# Producer thread runtime registries (keyed by source_path)
+PRODUCER_THREADS: Dict[str, threading.Thread] = {}
+PRODUCER_STOP_EVENTS: Dict[str, threading.Event] = {}
+PRODUCER_META: Dict[str, dict] = {}
+PRODUCER_LOCK = threading.Lock()

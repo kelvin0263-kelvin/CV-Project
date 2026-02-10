@@ -11,7 +11,7 @@ from app.models.stream_config import StreamConfig
 from app.schemas.camera import CameraCreate, CameraRead
 from app.core.database import get_db, AsyncSessionLocal
 from app.core.globals import FRAME_BUFFERS
-from app.services.video_processor import start_producer_thread
+from app.services.video_processor import start_producer_thread, stop_producer_thread
 
 router = APIRouter()
 
@@ -120,6 +120,13 @@ async def add_camera(camera: CameraCreate, db: AsyncSession = Depends(get_db)):
 
 @router.delete("/api/cameras/{camera_id}")
 async def delete_camera(camera_id: str, db: AsyncSession = Depends(get_db)):
+    # Capture source_path(s) first so we can stop producer if this was the last camera for a source.
+    stream_result = await db.execute(
+        select(StreamConfig).where(StreamConfig.camera_id == camera_id)
+    )
+    stream_rows = stream_result.scalars().all()
+    source_paths = {row.source_path for row in stream_rows if row.source_path}
+
     # Delete stream config first (cascade should handle it, but be explicit)
     await db.execute(
         sa_delete(StreamConfig).where(StreamConfig.camera_id == camera_id)
@@ -129,6 +136,15 @@ async def delete_camera(camera_id: str, db: AsyncSession = Depends(get_db)):
     )
     if result.rowcount == 0:
         raise HTTPException(status_code=404, detail="Camera not found")
+
+    # Stop producer for any source that no longer has cameras bound to it.
+    for source_path in source_paths:
+        remaining = await db.execute(
+            select(StreamConfig.id).where(StreamConfig.source_path == source_path).limit(1)
+        )
+        if remaining.scalar_one_or_none() is None:
+            stop_producer_thread(source_path)
+
     return {"status": "deleted"}
 
 
