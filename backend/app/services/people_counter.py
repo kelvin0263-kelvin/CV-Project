@@ -181,21 +181,28 @@ class PeopleCounter:
                       f"need at least Outside+Door. Treating as standalone.")
 
         if self.zone_groups:
-            summaries = []
-            for gid in self.zone_groups:
-                summaries.append(f"{gid}({self.zone_group_modes[gid]})")
-            print(f"[PeopleCounter] Loaded {len(self.zone_groups)} zone group(s): {summaries}")
-            # Print zone boundaries for debugging coordinate issues
-            if DEBUG_COUNTING:
-                for gid, group_zones in self.zone_groups.items():
-                    for ztype, zone_cfg in group_zones.items():
-                        pts = zone_cfg.get("points", [])
-                        if pts:
-                            xs = [p[0] for p in pts]
-                            ys = [p[1] for p in pts]
-                            print(f"  [ZONE] {gid}/{ztype}: X=[{min(xs):.3f}..{max(xs):.3f}], "
-                                  f"Y=[{min(ys):.3f}..{max(ys):.3f}], {len(pts)} points")
-                            print(f"         points={[(round(p[0],4), round(p[1],4)) for p in pts]}")
+            # Build a signature to detect actual changes
+            new_sig = str(sorted(
+                (gid, self.zone_group_modes[gid],
+                 tuple(tuple(tuple(p) for p in z.get("points", []))
+                       for z in gzones.values()))
+                for gid, gzones in self.zone_groups.items()
+            ))
+            old_sig = getattr(self, '_zone_signature', None)
+            if new_sig != old_sig:
+                self._zone_signature = new_sig
+                summaries = [f"{gid}({self.zone_group_modes[gid]})" for gid in self.zone_groups]
+                print(f"[PeopleCounter] Loaded {len(self.zone_groups)} zone group(s): {summaries}")
+                if DEBUG_COUNTING:
+                    for gid, group_zones in self.zone_groups.items():
+                        for ztype, zone_cfg in group_zones.items():
+                            pts = zone_cfg.get("points", [])
+                            if pts:
+                                xs = [p[0] for p in pts]
+                                ys = [p[1] for p in pts]
+                                print(f"  [ZONE] {gid}/{ztype}: X=[{min(xs):.3f}..{max(xs):.3f}], "
+                                      f"Y=[{min(ys):.3f}..{max(ys):.3f}], {len(pts)} points")
+                                print(f"         points={[(round(p[0],4), round(p[1],4)) for p in pts]}")
 
     # ------------------------------------------------------------------
     # Public API
@@ -377,7 +384,15 @@ class PeopleCounter:
 
             if not (in_outside or in_door or in_inside):
                 if DEBUG_COUNTING:
-                    print(f"    Track {track_id}: centroid=({centroid[0]:.3f},{centroid[1]:.3f}) NOT in any zone of group '{gid}'")
+                    # Only print once per track to reduce spam
+                    warned_key = f"_warned_nozone_{gid}"
+                    warned_set = getattr(self, warned_key, None)
+                    if warned_set is None:
+                        warned_set = set()
+                        setattr(self, warned_key, warned_set)
+                    if track_id not in warned_set:
+                        warned_set.add(track_id)
+                        print(f"    Track {track_id}: centroid=({centroid[0]:.3f},{centroid[1]:.3f}) NOT in any zone of group '{gid}' (first occurrence, won't repeat)")
                 continue  # Person not in any zone of this group
 
             # Resolve zone priority: door > inside > outside
@@ -393,9 +408,9 @@ class PeopleCounter:
             # Ensure track state exists
             if track_id not in states:
                 # --- Door Buffer: check if this new track matches a recent disappearance ---
-                matched_buffer = None
-                if current_zone == ZONE_DOOR:
-                    matched_buffer = self._match_door_buffer(gid, centroid, now)
+                # Check buffer for ANY zone (not just door), so occlusion in
+                # the outside→door transition can be recovered.
+                matched_buffer = self._match_door_buffer(gid, centroid, now)
 
                 if matched_buffer is not None:
                     # Inherit state from the disappeared track
@@ -404,10 +419,18 @@ class PeopleCounter:
                     ts.frame_count = matched_buffer.frame_count
                     ts.last_position = centroid
                     states[track_id] = ts
+                    # Remove the old track's state so it won't be double-counted
+                    old_tid = matched_buffer.track_id
+                    if old_tid in states:
+                        del states[old_tid]
+                    # Also remove from all door buffers for this group
+                    buf = self._door_buffer.get(gid, [])
+                    buf[:] = [e for e in buf if e.track_id != old_tid]
                     if DEBUG_COUNTING:
-                        print(f"  [BUFFER] Track {track_id}: MERGED with old Track {matched_buffer.track_id} "
+                        print(f"  [BUFFER] Track {track_id}: MERGED with old Track {old_tid} "
                               f"(state={matched_buffer.state}, frames={matched_buffer.frame_count}, "
-                              f"dist={math.dist(centroid, matched_buffer.last_position):.4f})")
+                              f"dist={math.dist(centroid, matched_buffer.last_position):.4f}) "
+                              f"→ old Track {old_tid} removed from states")
                 else:
                     states[track_id] = _TrackZoneState(birth_zone=current_zone)
 
@@ -561,12 +584,14 @@ class PeopleCounter:
 
                 elapsed = now - ts.last_seen_time
 
-                # Phase 1: Recently disappeared door-state track → add to buffer
-                if ts.state in (STATE_DOOR_ENTRY, STATE_DOOR_EXIT, STATE_DOOR_UNKNOWN):
-                    # Check if already in buffer
+                # Bufferable states: door states + outside/inside (for occlusion recovery)
+                is_door_state = ts.state in (STATE_DOOR_ENTRY, STATE_DOOR_EXIT, STATE_DOOR_UNKNOWN)
+                is_zone_state = ts.state in (STATE_OUTSIDE, STATE_INSIDE)
+
+                # Phase 1: Recently disappeared track → add to buffer
+                if is_door_state or (is_zone_state and ts.frame_count >= self.min_frames_for_count):
                     already_buffered = any(e.track_id == track_id for e in buf)
                     if not already_buffered and elapsed < self.door_buffer_timeout:
-                        # Add to buffer — give it a chance to reappear with new ID
                         buf.append(_DoorBufferEntry(
                             track_id=track_id,
                             state=ts.state,
@@ -576,14 +601,13 @@ class PeopleCounter:
                             disappear_time=ts.last_seen_time,
                         ))
                         if DEBUG_COUNTING:
-                            print(f"  [BUFFER+] Track {track_id}: added to door buffer "
+                            print(f"  [BUFFER+] Track {track_id}: added to buffer "
                                   f"(state={ts.state}, pos=({ts.last_position[0]:.3f},{ts.last_position[1]:.3f}), "
                                   f"frames={ts.frame_count})")
                         continue  # Don't process yet, wait for buffer timeout
 
-                    # Phase 2: Buffer timeout expired → proceed to inference
+                    # Phase 2: Buffer timeout expired → proceed to inference / cleanup
                     if elapsed >= self.door_buffer_timeout:
-                        # Remove from buffer if present (wasn't matched)
                         buf[:] = [e for e in buf if e.track_id != track_id]
 
                         if ts.state in (STATE_DOOR_ENTRY, STATE_DOOR_EXIT):
@@ -603,6 +627,12 @@ class PeopleCounter:
                         elif ts.state == STATE_DOOR_UNKNOWN and mode == MODE_2ZONE:
                             if DEBUG_COUNTING:
                                 print(f"  [CLEANUP] Track {track_id}: door_unknown disappeared after {elapsed:.1f}s, went back inside, no count (frames={ts.frame_count})")
+                            to_remove.append(track_id)
+
+                        elif ts.state in (STATE_OUTSIDE, STATE_INSIDE):
+                            # Outside/inside track wasn't matched → just clean up, no count
+                            if DEBUG_COUNTING:
+                                print(f"  [CLEANUP] Track {track_id}: {ts.state} buffer expired after {elapsed:.1f}s, no match, removing (frames={ts.frame_count})")
                             to_remove.append(track_id)
 
                         else:
