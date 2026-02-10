@@ -41,20 +41,28 @@ const VideoUpload = () => {
         try {
             const apiUrl = getApiBaseUrl();
             console.log("VideoUpload fetching from:", apiUrl);
-            const response = await fetch(`${apiUrl}/api/upload`, {
+            const response = await fetch(`${apiUrl}/api/upload_and_process`, {
                 method: 'POST',
                 body: formData,
             });
 
             if (!response.ok) {
-                throw new Error('Upload failed');
+                let detail = 'Upload failed';
+                try {
+                    const err = await response.json();
+                    if (err?.detail) detail = err.detail;
+                } catch (_) {
+                    // Keep generic detail fallback
+                }
+                throw new Error(detail);
             }
 
             const data = await response.json();
 
-            setVideoUrl(data.video_url);
+            setVideoUrl('');
             setUploadStatus('success');
-            setMessage(data.message);
+            const created = Array.isArray(data.created_cameras) ? data.created_cameras.length : 0;
+            setMessage(created > 0 ? `Upload successful. Created ${created} camera(s).` : 'Upload successful.');
 
         } catch (error) {
             console.error('Error:', error);

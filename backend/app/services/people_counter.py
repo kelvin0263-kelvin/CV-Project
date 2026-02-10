@@ -48,6 +48,7 @@ MODE_2ZONE = "2zone"  # Outside + Door only (no Inside visible)
 # Anti-noise defaults
 DEFAULT_MIN_FRAMES = 3        # Minimum frames a track must be seen before counting
 DEFAULT_DISAPPEAR_TIMEOUT = 1.0  # Seconds before inferring from disappearance
+DEFAULT_COUNT_COOLDOWN = 4.0  # Seconds to suppress repeated IN counts for same track_id
 
 # Door buffer defaults
 DEFAULT_DOOR_BUFFER_TIMEOUT = 0.8   # Seconds to keep a disappeared door-zone track in buffer
@@ -132,6 +133,8 @@ class PeopleCounter:
         # Anti-noise settings
         self.min_frames_for_count: int = config.get("min_frames", DEFAULT_MIN_FRAMES)
         self.disappear_timeout: float = config.get("disappear_timeout", DEFAULT_DISAPPEAR_TIMEOUT)
+        self.count_cooldown: float = config.get("count_cooldown", DEFAULT_COUNT_COOLDOWN)
+        self._last_in_count_time: dict[int, float] = {}  # track_id -> last IN count timestamp
 
         # Door buffer: per-group list of recently-disappeared door-zone tracks
         self._door_buffer: dict[str, list[_DoorBufferEntry]] = {
@@ -214,6 +217,8 @@ class PeopleCounter:
         h, w = frame_shape
 
         # 1. Compute normalised centroids
+        now = time.time()
+        self._cleanup_in_cooldown(now)
         current_centroids: dict[int, tuple[float, float]] = {}
         skipped_no_track = 0
         for det in detections:
@@ -244,12 +249,16 @@ class PeopleCounter:
                         cross = _cross_product_sign(lp1, lp2, curr_pos)
                         if direction == "left_to_right":
                             if cross > 0:
-                                self.total_in += 1
+                                if self._can_count_in(track_id, now):
+                                    self.total_in += 1
+                                    self._mark_counted_in(track_id, now)
                             else:
                                 self.total_out += 1
                         else:
                             if cross < 0:
-                                self.total_in += 1
+                                if self._can_count_in(track_id, now):
+                                    self.total_in += 1
+                                    self._mark_counted_in(track_id, now)
                             else:
                                 self.total_out += 1
 
@@ -489,9 +498,13 @@ class PeopleCounter:
             elif current_zone == ZONE_INSIDE:
                 if ts.state == STATE_DOOR_ENTRY:
                     if ts.frame_count >= self.min_frames_for_count:
-                        in_count += 1
-                        if DEBUG_COUNTING:
-                            print(f"  [COUNT] Track {track_id}: IN +1 (outside→door→inside, frames={ts.frame_count})")
+                        if self._can_count_in(track_id, now):
+                            in_count += 1
+                            self._mark_counted_in(track_id, now)
+                            if DEBUG_COUNTING:
+                                print(f"  [COUNT] Track {track_id}: IN +1 (outside→door→inside, frames={ts.frame_count})")
+                        elif DEBUG_COUNTING:
+                            print(f"  [COOLDOWN] Track {track_id}: IN suppressed (outside→door→inside)")
                     elif DEBUG_COUNTING:
                         print(f"  [REJECT] Track {track_id}: door_entry→inside but frames={ts.frame_count} < {self.min_frames_for_count}, NOT counted")
                     ts.state = STATE_INSIDE
@@ -499,9 +512,13 @@ class PeopleCounter:
                     ts.state = STATE_INSIDE
                 elif ts.state == STATE_OUTSIDE:
                     if ts.frame_count >= self.min_frames_for_count:
-                        in_count += 1
-                        if DEBUG_COUNTING:
-                            print(f"  [COUNT] Track {track_id}: IN +1 (direct outside→inside, frames={ts.frame_count})")
+                        if self._can_count_in(track_id, now):
+                            in_count += 1
+                            self._mark_counted_in(track_id, now)
+                            if DEBUG_COUNTING:
+                                print(f"  [COUNT] Track {track_id}: IN +1 (direct outside→inside, frames={ts.frame_count})")
+                        elif DEBUG_COUNTING:
+                            print(f"  [COOLDOWN] Track {track_id}: IN suppressed (direct outside→inside)")
                     elif DEBUG_COUNTING:
                         print(f"  [REJECT] Track {track_id}: outside→inside but frames={ts.frame_count} < {self.min_frames_for_count}, NOT counted")
                     ts.state = STATE_INSIDE
@@ -613,9 +630,13 @@ class PeopleCounter:
                         if ts.state in (STATE_DOOR_ENTRY, STATE_DOOR_EXIT):
                             if ts.frame_count >= self.min_frames_for_count:
                                 if ts.state == STATE_DOOR_ENTRY:
-                                    g_in += 1
-                                    if DEBUG_COUNTING:
-                                        print(f"  [INFER] Track {track_id}: IN +1 (disappeared in door_entry after {elapsed:.1f}s, frames={ts.frame_count})")
+                                    if self._can_count_in(track_id, now):
+                                        g_in += 1
+                                        self._mark_counted_in(track_id, now)
+                                        if DEBUG_COUNTING:
+                                            print(f"  [INFER] Track {track_id}: IN +1 (disappeared in door_entry after {elapsed:.1f}s, frames={ts.frame_count})")
+                                    elif DEBUG_COUNTING:
+                                        print(f"  [COOLDOWN] Track {track_id}: IN inference suppressed (door_entry disappear)")
                                 else:
                                     g_out += 1
                                     if DEBUG_COUNTING:
@@ -702,6 +723,7 @@ class PeopleCounter:
         self.enabled = config.get("enabled", True)
         self.disappear_timeout = config.get("disappear_timeout", DEFAULT_DISAPPEAR_TIMEOUT)
         self.min_frames_for_count = config.get("min_frames", DEFAULT_MIN_FRAMES)
+        self.count_cooldown = config.get("count_cooldown", DEFAULT_COUNT_COOLDOWN)
         self.door_buffer_timeout = config.get("door_buffer_timeout", DEFAULT_DOOR_BUFFER_TIMEOUT)
         self.door_buffer_distance = config.get("door_buffer_distance", DEFAULT_DOOR_BUFFER_DISTANCE)
 
@@ -728,12 +750,34 @@ class PeopleCounter:
         self.total_in = 0
         self.total_out = 0
         self.capacity_alert_fired = False
+        self._last_in_count_time = {}
         for gid in self._zone_track_states:
             self._zone_track_states[gid] = {}
         for gid in self._group_totals:
             self._group_totals[gid] = {"in": 0, "out": 0}
         for gid in self._door_buffer:
             self._door_buffer[gid] = []
+
+    def _can_count_in(self, track_id: int, now: float) -> bool:
+        """True if this track_id is outside the IN cooldown window."""
+        if self.count_cooldown <= 0:
+            return True
+        last_ts = self._last_in_count_time.get(track_id)
+        if last_ts is None:
+            return True
+        return (now - last_ts) >= self.count_cooldown
+
+    def _mark_counted_in(self, track_id: int, now: float):
+        self._last_in_count_time[track_id] = now
+
+    def _cleanup_in_cooldown(self, now: float):
+        if not self._last_in_count_time:
+            return
+        # Keep a grace window to handle long-ish occlusions without unbounded dict growth.
+        keep_for = max(self.count_cooldown, 1.0) * 10.0
+        self._last_in_count_time = {
+            tid: ts for tid, ts in self._last_in_count_time.items() if (now - ts) < keep_for
+        }
 
     def _empty_result(self) -> dict:
         return {

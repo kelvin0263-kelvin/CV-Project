@@ -54,7 +54,7 @@ except Exception as e:
 # ---------------------------------------------------------------------------
 print("[System] Loading YOLOv11-Pose Model...")
 try:
-    model = YOLO("yolo11m-pose.pt")
+    model = YOLO("yolo26m-pose.pt")
 except Exception as e:
     print(f"[System] Warning: Failed to load YOLO model: {e}")
     model = None
@@ -195,7 +195,7 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
                 persist=True,
                 verbose=False,
                 classes=[0],        # person only
-                conf=0.35,          # lower threshold: keep detections during partial occlusion
+                conf=0.30,          # lower threshold: keep detections during partial occlusion
                 iou=0.5,            # more lenient matching: easier to re-associate after occlusion
                 imgsz=1280,         # matches training: imgsz=1280
                 device='0',
