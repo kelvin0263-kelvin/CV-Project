@@ -57,16 +57,6 @@ except Exception as e:
     jpeg = None
 
 # ---------------------------------------------------------------------------
-# Initialize YOLO-Pose Model
-# ---------------------------------------------------------------------------
-print("[System] Loading YOLOv11-Pose Model...")
-try:
-    model = YOLO("yolo26m-pose.pt")
-except Exception as e:
-    print(f"[System] Warning: Failed to load YOLO model: {e}")
-    model = None
-
-# ---------------------------------------------------------------------------
 # In-memory violation event queue (consumed by detection_router)
 # ---------------------------------------------------------------------------
 VIOLATION_QUEUE: list = []  # Thread-safe enough for append; consumed elsewhere
@@ -177,6 +167,16 @@ def video_producer(
         _cleanup_producer_state(source_path, clear_frame_buffer=True)
         return
 
+    # Per-stream model instance: isolates tracker state across concurrent sources.
+    print(f"[Producer] Loading YOLO model for {source_path}")
+    try:
+        local_model = YOLO("yolo26m-pose.pt")
+    except Exception as e:
+        print(f"[Producer] Failed to load YOLO model for {source_path}: {e}")
+        cap.release()
+        _cleanup_producer_state(source_path, clear_frame_buffer=True)
+        return
+
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
@@ -251,14 +251,14 @@ def video_producer(
         Each detection dict:
             {track_id, person_bbox, label, confidence, lower_bbox, violation}
         """
-        if model is None:
+        if local_model is None:
             return [], 0, track_state
 
         try:
             # YOLO-Pose tracking with BoT-SORT for better occlusion handling.
             # BoT-SORT adds ReID appearance features + improved Kalman filter,
             # so tracks survive brief occlusions (e.g. door frame) much better.
-            results = model.track(
+            results = local_model.track(
                 source=img,
                 tracker="/workspace/CV-Project/backend/bytetrack_custom.yaml",
                 persist=True,
