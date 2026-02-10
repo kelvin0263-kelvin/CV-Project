@@ -9,9 +9,15 @@ Supports THREE counting methods (can coexist):
    IN = person walks Outside → Door → disappears (went inside, camera can't see).
    OUT = new track appears in Door → moves to Outside (came from inside).
 
+**Door Buffer** — event-level merging for tracks that disappear and reappear
+in the door zone due to occlusion.  When a new track appears in the door zone
+and a recently-disappeared track was nearby, the new track inherits the old
+track's state instead of being treated as a fresh arrival.
+
 All line/zone coordinates are stored in normalized (0-1) form.
 """
 
+import math
 import uuid
 import time
 from typing import Optional
@@ -43,19 +49,44 @@ MODE_2ZONE = "2zone"  # Outside + Door only (no Inside visible)
 DEFAULT_MIN_FRAMES = 3        # Minimum frames a track must be seen before counting
 DEFAULT_DISAPPEAR_TIMEOUT = 1.0  # Seconds before inferring from disappearance
 
+# Door buffer defaults
+DEFAULT_DOOR_BUFFER_TIMEOUT = 0.8   # Seconds to keep a disappeared door-zone track in buffer
+DEFAULT_DOOR_BUFFER_DISTANCE = 0.06  # Max normalised distance to match a new track to a buffer entry
+
+
+# ---------------------------------------------------------------------------
+# Door buffer entry — remembers a disappeared track from the door zone
+# ---------------------------------------------------------------------------
+class _DoorBufferEntry:
+    """Short-term memory for a track that disappeared in the door zone."""
+    __slots__ = ("track_id", "state", "frame_count", "birth_zone",
+                 "last_position", "disappear_time")
+
+    def __init__(self, track_id: int, state: str, frame_count: int,
+                 birth_zone: str, last_position: tuple[float, float],
+                 disappear_time: float):
+        self.track_id = track_id
+        self.state = state
+        self.frame_count = frame_count
+        self.birth_zone = birth_zone
+        self.last_position = last_position
+        self.disappear_time = disappear_time
+
 
 # ---------------------------------------------------------------------------
 # Per-track zone state
 # ---------------------------------------------------------------------------
 class _TrackZoneState:
     """Holds the state-machine state for one tracked person in one zone group."""
-    __slots__ = ("state", "last_seen_time", "frame_count", "birth_zone")
+    __slots__ = ("state", "last_seen_time", "frame_count", "birth_zone",
+                 "last_position")
 
     def __init__(self, birth_zone: str = ""):
         self.state: str = STATE_NONE
         self.last_seen_time: float = time.time()
         self.frame_count: int = 0        # How many frames this track has been seen in any zone
         self.birth_zone: str = birth_zone  # Which zone the track was first detected in
+        self.last_position: tuple[float, float] = (0.0, 0.0)  # Last known centroid
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +132,13 @@ class PeopleCounter:
         # Anti-noise settings
         self.min_frames_for_count: int = config.get("min_frames", DEFAULT_MIN_FRAMES)
         self.disappear_timeout: float = config.get("disappear_timeout", DEFAULT_DISAPPEAR_TIMEOUT)
+
+        # Door buffer: per-group list of recently-disappeared door-zone tracks
+        self._door_buffer: dict[str, list[_DoorBufferEntry]] = {
+            gid: [] for gid in self.zone_groups
+        }
+        self.door_buffer_timeout: float = config.get("door_buffer_timeout", DEFAULT_DOOR_BUFFER_TIMEOUT)
+        self.door_buffer_distance: float = config.get("door_buffer_distance", DEFAULT_DOOR_BUFFER_DISTANCE)
 
         # Snapshot timing
         self._last_snapshot_time = time.time()
@@ -343,10 +381,29 @@ class PeopleCounter:
 
             # Ensure track state exists
             if track_id not in states:
-                states[track_id] = _TrackZoneState(birth_zone=current_zone)
+                # --- Door Buffer: check if this new track matches a recent disappearance ---
+                matched_buffer = None
+                if current_zone == ZONE_DOOR:
+                    matched_buffer = self._match_door_buffer(gid, centroid, now)
+
+                if matched_buffer is not None:
+                    # Inherit state from the disappeared track
+                    ts = _TrackZoneState(birth_zone=matched_buffer.birth_zone)
+                    ts.state = matched_buffer.state
+                    ts.frame_count = matched_buffer.frame_count
+                    ts.last_position = centroid
+                    states[track_id] = ts
+                    if DEBUG_COUNTING:
+                        print(f"  [BUFFER] Track {track_id}: MERGED with old Track {matched_buffer.track_id} "
+                              f"(state={matched_buffer.state}, frames={matched_buffer.frame_count}, "
+                              f"dist={math.dist(centroid, matched_buffer.last_position):.4f})")
+                else:
+                    states[track_id] = _TrackZoneState(birth_zone=current_zone)
+
             ts = states[track_id]
             ts.last_seen_time = now
             ts.frame_count += 1
+            ts.last_position = centroid
 
             # ---- State transitions ----
             old_state = ts.state
@@ -424,7 +481,38 @@ class PeopleCounter:
         return (in_count, out_count)
 
     # ------------------------------------------------------------------
-    # Disappear inference
+    # Door buffer: match new track to recently-disappeared track
+    # ------------------------------------------------------------------
+    def _match_door_buffer(
+        self, gid: str, centroid: tuple[float, float], now: float
+    ) -> Optional[_DoorBufferEntry]:
+        """
+        Check if a new track in the door zone matches a recently-disappeared
+        track (by position proximity + time window).
+        Returns the matched buffer entry (and removes it) or None.
+        """
+        buf = self._door_buffer.get(gid, [])
+        best_entry: Optional[_DoorBufferEntry] = None
+        best_dist = float("inf")
+        best_idx = -1
+
+        for i, entry in enumerate(buf):
+            elapsed = now - entry.disappear_time
+            if elapsed > self.door_buffer_timeout:
+                continue  # Too old, skip (will be cleaned up later)
+            dist = math.dist(centroid, entry.last_position)
+            if dist < self.door_buffer_distance and dist < best_dist:
+                best_dist = dist
+                best_entry = entry
+                best_idx = i
+
+        if best_entry is not None and best_idx >= 0:
+            buf.pop(best_idx)
+
+        return best_entry
+
+    # ------------------------------------------------------------------
+    # Disappear inference (with door buffer integration)
     # ------------------------------------------------------------------
     def _process_disappears(
         self,
@@ -432,7 +520,13 @@ class PeopleCounter:
     ) -> tuple[int, int, dict[str, tuple[int, int]]]:
         """
         Handle tracks that disappeared while transiting through the door zone.
-        Applies anti-noise: only infer if frame_count >= min_frames_for_count.
+
+        Two-phase approach:
+        1. When a door-state track first disappears, add it to the door buffer
+           (short-term memory). This gives the tracker a chance to re-detect the
+           person with a new ID.
+        2. After door_buffer_timeout, if no new track matched, proceed to
+           normal disappear inference (IN/OUT counting).
 
         Returns:
             (total_in, total_out, {group_id: (in, out)})
@@ -448,6 +542,7 @@ class PeopleCounter:
             g_in = 0
             g_out = 0
             to_remove: list[int] = []
+            buf = self._door_buffer.setdefault(gid, [])
 
             for track_id, ts in states.items():
                 if track_id in active_ids:
@@ -455,30 +550,60 @@ class PeopleCounter:
 
                 elapsed = now - ts.last_seen_time
 
-                if elapsed >= self.disappear_timeout:
-                    if ts.state in (STATE_DOOR_ENTRY, STATE_DOOR_EXIT):
-                        if ts.frame_count >= self.min_frames_for_count:
-                            if ts.state == STATE_DOOR_ENTRY:
-                                g_in += 1
-                                if DEBUG_COUNTING:
-                                    print(f"  [INFER] Track {track_id}: IN +1 (disappeared in door_entry after {elapsed:.1f}s, frames={ts.frame_count})")
-                            else:
-                                g_out += 1
-                                if DEBUG_COUNTING:
-                                    print(f"  [INFER] Track {track_id}: OUT +1 (disappeared in door_exit after {elapsed:.1f}s, frames={ts.frame_count})")
-                        elif DEBUG_COUNTING:
-                            print(f"  [REJECT] Track {track_id}: disappeared in {ts.state} after {elapsed:.1f}s but frames={ts.frame_count} < {self.min_frames_for_count}, NOT counted")
-                        to_remove.append(track_id)
-
-                    elif ts.state == STATE_DOOR_UNKNOWN and mode == MODE_2ZONE:
+                # Phase 1: Recently disappeared door-state track → add to buffer
+                if ts.state in (STATE_DOOR_ENTRY, STATE_DOOR_EXIT, STATE_DOOR_UNKNOWN):
+                    # Check if already in buffer
+                    already_buffered = any(e.track_id == track_id for e in buf)
+                    if not already_buffered and elapsed < self.door_buffer_timeout:
+                        # Add to buffer — give it a chance to reappear with new ID
+                        buf.append(_DoorBufferEntry(
+                            track_id=track_id,
+                            state=ts.state,
+                            frame_count=ts.frame_count,
+                            birth_zone=ts.birth_zone,
+                            last_position=ts.last_position,
+                            disappear_time=ts.last_seen_time,
+                        ))
                         if DEBUG_COUNTING:
-                            print(f"  [CLEANUP] Track {track_id}: door_unknown disappeared after {elapsed:.1f}s, went back inside, no count (frames={ts.frame_count})")
-                        to_remove.append(track_id)
+                            print(f"  [BUFFER+] Track {track_id}: added to door buffer "
+                                  f"(state={ts.state}, pos=({ts.last_position[0]:.3f},{ts.last_position[1]:.3f}), "
+                                  f"frames={ts.frame_count})")
+                        continue  # Don't process yet, wait for buffer timeout
 
-                    elif elapsed >= self.disappear_timeout * 3:
-                        if DEBUG_COUNTING:
-                            print(f"  [CLEANUP] Track {track_id}: stale state={ts.state} after {elapsed:.1f}s, frames={ts.frame_count}, removing")
-                        to_remove.append(track_id)
+                    # Phase 2: Buffer timeout expired → proceed to inference
+                    if elapsed >= self.door_buffer_timeout:
+                        # Remove from buffer if present (wasn't matched)
+                        buf[:] = [e for e in buf if e.track_id != track_id]
+
+                        if ts.state in (STATE_DOOR_ENTRY, STATE_DOOR_EXIT):
+                            if ts.frame_count >= self.min_frames_for_count:
+                                if ts.state == STATE_DOOR_ENTRY:
+                                    g_in += 1
+                                    if DEBUG_COUNTING:
+                                        print(f"  [INFER] Track {track_id}: IN +1 (disappeared in door_entry after {elapsed:.1f}s, frames={ts.frame_count})")
+                                else:
+                                    g_out += 1
+                                    if DEBUG_COUNTING:
+                                        print(f"  [INFER] Track {track_id}: OUT +1 (disappeared in door_exit after {elapsed:.1f}s, frames={ts.frame_count})")
+                            elif DEBUG_COUNTING:
+                                print(f"  [REJECT] Track {track_id}: disappeared in {ts.state} after {elapsed:.1f}s but frames={ts.frame_count} < {self.min_frames_for_count}, NOT counted")
+                            to_remove.append(track_id)
+
+                        elif ts.state == STATE_DOOR_UNKNOWN and mode == MODE_2ZONE:
+                            if DEBUG_COUNTING:
+                                print(f"  [CLEANUP] Track {track_id}: door_unknown disappeared after {elapsed:.1f}s, went back inside, no count (frames={ts.frame_count})")
+                            to_remove.append(track_id)
+
+                        else:
+                            to_remove.append(track_id)
+
+                elif elapsed >= self.disappear_timeout * 3:
+                    if DEBUG_COUNTING:
+                        print(f"  [CLEANUP] Track {track_id}: stale state={ts.state} after {elapsed:.1f}s, frames={ts.frame_count}, removing")
+                    to_remove.append(track_id)
+
+            # Clean expired buffer entries
+            buf[:] = [e for e in buf if (now - e.disappear_time) < self.door_buffer_timeout * 2]
 
             for tid in to_remove:
                 del states[tid]
@@ -536,6 +661,8 @@ class PeopleCounter:
         self.enabled = config.get("enabled", True)
         self.disappear_timeout = config.get("disappear_timeout", DEFAULT_DISAPPEAR_TIMEOUT)
         self.min_frames_for_count = config.get("min_frames", DEFAULT_MIN_FRAMES)
+        self.door_buffer_timeout = config.get("door_buffer_timeout", DEFAULT_DOOR_BUFFER_TIMEOUT)
+        self.door_buffer_distance = config.get("door_buffer_distance", DEFAULT_DOOR_BUFFER_DISTANCE)
 
         # Re-parse zone groups
         old_groups = set(self.zone_groups.keys())
@@ -548,9 +675,11 @@ class PeopleCounter:
         for gid in new_groups - old_groups:
             self._zone_track_states[gid] = {}
             self._group_totals[gid] = {"in": 0, "out": 0}
+            self._door_buffer[gid] = []
         for gid in old_groups - new_groups:
             self._zone_track_states.pop(gid, None)
             self._group_totals.pop(gid, None)
+            self._door_buffer.pop(gid, None)
 
     def reset(self):
         """Reset all counters (e.g. on video loop)."""
@@ -562,6 +691,8 @@ class PeopleCounter:
             self._zone_track_states[gid] = {}
         for gid in self._group_totals:
             self._group_totals[gid] = {"in": 0, "out": 0}
+        for gid in self._door_buffer:
+            self._door_buffer[gid] = []
 
     def _empty_result(self) -> dict:
         return {

@@ -186,15 +186,17 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
             return [], 0, track_state
 
         try:
-            # YOLO-Pose tracking (matches training script parameters)
+            # YOLO-Pose tracking with BoT-SORT for better occlusion handling.
+            # BoT-SORT adds ReID appearance features + improved Kalman filter,
+            # so tracks survive brief occlusions (e.g. door frame) much better.
             results = model.track(
                 source=img,
-                tracker="bytetrack.yaml",
+                tracker="botsort.yaml",
                 persist=True,
                 verbose=False,
                 classes=[0],        # person only
-                conf=0.5,           # matches training: track_conf = 0.5
-                iou=0.7,            # matches training: track_iou = 0.7
+                conf=0.35,          # lower threshold: keep detections during partial occlusion
+                iou=0.5,            # more lenient matching: easier to re-associate after occlusion
                 imgsz=1280,         # matches training: imgsz=1280
                 device='0',
             )
