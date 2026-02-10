@@ -191,7 +191,7 @@ def video_producer(source_path: str, is_fisheye: bool, active_views: list = None
             # so tracks survive brief occlusions (e.g. door frame) much better.
             results = model.track(
                 source=img,
-                tracker="botsort.yaml",
+                tracker="/workspace/CV-Project/backend/bytetrack_custom.yaml",
                 persist=True,
                 verbose=False,
                 classes=[0],        # person only

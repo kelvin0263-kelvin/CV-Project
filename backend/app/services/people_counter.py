@@ -185,6 +185,17 @@ class PeopleCounter:
             for gid in self.zone_groups:
                 summaries.append(f"{gid}({self.zone_group_modes[gid]})")
             print(f"[PeopleCounter] Loaded {len(self.zone_groups)} zone group(s): {summaries}")
+            # Print zone boundaries for debugging coordinate issues
+            if DEBUG_COUNTING:
+                for gid, group_zones in self.zone_groups.items():
+                    for ztype, zone_cfg in group_zones.items():
+                        pts = zone_cfg.get("points", [])
+                        if pts:
+                            xs = [p[0] for p in pts]
+                            ys = [p[1] for p in pts]
+                            print(f"  [ZONE] {gid}/{ztype}: X=[{min(xs):.3f}..{max(xs):.3f}], "
+                                  f"Y=[{min(ys):.3f}..{max(ys):.3f}], {len(pts)} points")
+                            print(f"         points={[(round(p[0],4), round(p[1],4)) for p in pts]}")
 
     # ------------------------------------------------------------------
     # Public API
