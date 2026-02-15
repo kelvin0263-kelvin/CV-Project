@@ -149,6 +149,16 @@ class FisheyeMultiView:
 
         # print(f"Processing fisheye frame of shape {frame.shape} into {len(self.dewarp_maps)} views...")
 
+        # Upload once per frame and reuse for all partitions.
+        # This avoids repeated host->device copies inside the per-view loop.
+        gpu_cropped_frame = None
+        if self.use_cuda:
+            try:
+                gpu_cropped_frame = cv2.cuda_GpuMat()
+                gpu_cropped_frame.upload(cropped_frame)
+            except Exception:
+                gpu_cropped_frame = None
+
         # --- Generate each dewarped partition ---
         for i, dewarp_map in enumerate(self.dewarp_maps):
             current_key = f"partition_{i}"
@@ -158,13 +168,11 @@ class FisheyeMultiView:
             if dewarp_map is not None:
                 map_x, map_y = dewarp_map
 
-                if self.use_cuda and self.gpu_dewarp_maps[i] is not None:
+                if self.use_cuda and gpu_cropped_frame is not None and self.gpu_dewarp_maps[i] is not None:
                     # GPU remap then (optionally) GPU resize before a single download
                     map_x_gpu, map_y_gpu = self.gpu_dewarp_maps[i]
-                    gpu_src = cv2.cuda_GpuMat()
-                    gpu_src.upload(cropped_frame)
                     gpu_planar = cv2.cuda.remap(
-                        gpu_src, map_x_gpu, map_y_gpu,
+                        gpu_cropped_frame, map_x_gpu, map_y_gpu,
                         interpolation=cv2.INTER_LINEAR,
                         borderMode=cv2.BORDER_CONSTANT
                     )
@@ -172,16 +180,22 @@ class FisheyeMultiView:
                         # Note: cv2 uses (width, height)
                         target_w, target_h = self.downscale_size
                         gpu_planar = cv2.cuda.resize(gpu_planar, (target_w, target_h), interpolation=cv2.INTER_AREA)
-                    planar_view = gpu_planar.download()
+
+                    # 180-degree rotate on GPU (equivalent to both-axis flip).
+                    # Fallback to CPU rotate if the CUDA op is unavailable.
+                    try:
+                        gpu_planar = cv2.cuda.flip(gpu_planar, -1)
+                        planar_view = gpu_planar.download()
+                    except Exception:
+                        planar_view = cv2.rotate(gpu_planar.download(), cv2.ROTATE_180)
                 else:
                     planar_view = cv2.remap(
                         cropped_frame, map_x, map_y,
                         interpolation=cv2.INTER_LINEAR,
                         borderMode=cv2.BORDER_CONSTANT
                     )
-                
-                # ROTATE 180 degrees (Correct for ceiling mount)
-                planar_view = cv2.rotate(planar_view, cv2.ROTATE_180)
+                    # ROTATE 180 degrees (Correct for ceiling mount)
+                    planar_view = cv2.rotate(planar_view, cv2.ROTATE_180)
 
                 motion_mask = None
                 # --- Handle motion detection if enabled ---

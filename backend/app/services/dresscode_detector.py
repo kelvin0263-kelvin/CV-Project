@@ -11,13 +11,19 @@ so that inference matches the training data distribution.
 
 import numpy as np
 import cv2
-from ultralytics import YOLO
+try:
+    from ultralytics import YOLO
+except Exception as _yolo_import_error:
+    YOLO = None
+    print(f"[System] Warning: ultralytics import failed: {_yolo_import_error}")
 
 # ---------------------------------------------------------------------------
 # Load classification model once at module level
 # ---------------------------------------------------------------------------
 print("[System] Loading Dress Code Classification Model (best.pt)...")
 try:
+    if YOLO is None:
+        raise RuntimeError("ultralytics is unavailable")
     dresscode_model = YOLO("best.pt")
     dresscode_class_names = dresscode_model.names  # e.g. {0: 'long_pants', 1: 'shorts'}
     print(f"[System] Dress code model loaded. Classes: {dresscode_class_names}")

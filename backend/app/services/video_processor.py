@@ -26,8 +26,14 @@ from app.core.globals import (
     PRODUCER_META,
     PRODUCER_LOCK,
 )
-from ultralytics import YOLO
+try:
+    from ultralytics import YOLO
+    YOLO_IMPORT_ERROR = None
+except Exception as _yolo_import_error:
+    YOLO = None
+    YOLO_IMPORT_ERROR = _yolo_import_error
 from turbojpeg import TurboJPEG
+from app.services.cpp_bridge import CppInferenceBridge
 from app.services.dresscode_detector import classify_lower_body, crop_full_person
 from app.services.people_counter import PeopleCounter
 from app.routers.counting_router import (
@@ -167,15 +173,45 @@ def video_producer(
         _cleanup_producer_state(source_path, clear_frame_buffer=True)
         return
 
+    # Inference backend selection (default: existing Python Ultralytics path).
+    use_cpp_inference = os.getenv("USE_CPP_INFERENCE", "").strip().lower() in {"1", "true", "yes", "on"}
+    cpp_bridge = None
+    local_model = None
+
+    if use_cpp_inference:
+        cpp_bridge = CppInferenceBridge(
+            pose_model_path=os.getenv("CPP_POSE_MODEL", "yolo26m-pose.onnx"),
+            classifier_model_path=os.getenv("CPP_DRESSCODE_MODEL", "best.onnx"),
+            class_names_path=os.getenv("CPP_DRESSCODE_LABELS", "best.labels.txt"),
+            tracker_config_path=os.getenv("CPP_TRACKER_CONFIG", "backend/bytetrack_custom.yaml"),
+            device_id=int(os.getenv("CPP_DEVICE_ID", "0")),
+            pose_imgsz=int(os.getenv("CPP_POSE_IMGSZ", "1280")),
+            cls_imgsz=int(os.getenv("CPP_CLS_IMGSZ", "224")),
+            det_conf=float(os.getenv("CPP_DET_CONF", "0.30")),
+            det_iou=float(os.getenv("CPP_DET_IOU", "0.50")),
+            cls_conf_min=float(os.getenv("CPP_CLS_MIN_CONF", "0.0")),
+        )
+        if cpp_bridge.enabled:
+            print(f"[Producer] Using C++ inference backend for {source_path}")
+        else:
+            print(f"[Producer] C++ backend unavailable, falling back to Python for {source_path}")
+            use_cpp_inference = False
+
     # Per-stream model instance: isolates tracker state across concurrent sources.
-    print(f"[Producer] Loading YOLO model for {source_path}")
-    try:
-        local_model = YOLO("yolo26m-pose.pt")
-    except Exception as e:
-        print(f"[Producer] Failed to load YOLO model for {source_path}: {e}")
-        cap.release()
-        _cleanup_producer_state(source_path, clear_frame_buffer=True)
-        return
+    if not use_cpp_inference:
+        if YOLO is None:
+            print(f"[Producer] Ultralytics import failed: {YOLO_IMPORT_ERROR}")
+            cap.release()
+            _cleanup_producer_state(source_path, clear_frame_buffer=True)
+            return
+        print(f"[Producer] Loading YOLO model for {source_path}")
+        try:
+            local_model = YOLO("yolo26m-pose.pt")
+        except Exception as e:
+            print(f"[Producer] Failed to load YOLO model for {source_path}: {e}")
+            cap.release()
+            _cleanup_producer_state(source_path, clear_frame_buffer=True)
+            return
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -251,6 +287,17 @@ def video_producer(
         Each detection dict:
             {track_id, person_bbox, label, confidence, lower_bbox, violation}
         """
+        if use_cpp_inference and cpp_bridge is not None and cpp_bridge.enabled:
+            try:
+                return cpp_bridge.run(
+                    image=img,
+                    frame_index=frame_count,
+                    track_state=track_state,
+                    skip_classification=skip_classification,
+                )
+            except Exception as e:
+                print(f"[Detection][CPP] Error: {e}. Falling back to Python path.")
+
         if local_model is None:
             return [], 0, track_state
 
