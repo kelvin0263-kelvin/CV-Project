@@ -5,6 +5,7 @@ const StreamPlayer = ({ wsUrl, className, alt, onStats, onDetections, onCounting
     const canvasRef = useRef(null);
     const wsRef = useRef(null);
     const detectionsRef = useRef([]);
+    const frameSizeRef = useRef({ width: 640, height: 360 });
     const [status, setStatus] = useState('connecting');
 
     // --- Compute actual image display area within object-contain ---
@@ -14,8 +15,8 @@ const StreamPlayer = ({ wsUrl, className, alt, onStats, onDetections, onCounting
         const rect = img.getBoundingClientRect();
         const containerW = rect.width;
         const containerH = rect.height;
-        // Backend always sends 640x360 (16:9)
-        const imgAspect = 640 / 360;
+        const { width: frameWidth, height: frameHeight } = frameSizeRef.current;
+        const imgAspect = frameWidth / frameHeight;
         const containerAspect = containerW / containerH;
 
         let displayW, displayH, offsetX, offsetY;
@@ -57,10 +58,13 @@ const StreamPlayer = ({ wsUrl, className, alt, onStats, onDetections, onCounting
         if (!area) return;
         const { displayW, displayH, offsetX, offsetY } = area;
 
-        // The detections have coords scaled to 640x360 by the backend.
+        const { width: frameWidth, height: frameHeight } = frameSizeRef.current;
+        if (!frameWidth || !frameHeight) return;
+
+        // Detections are scaled to the streamed frame size by the backend.
         // Scale to the actual displayed image size, with offset for letterboxing.
-        const scaleX = displayW / 640;
-        const scaleY = displayH / 360;
+        const scaleX = displayW / frameWidth;
+        const scaleY = displayH / frameHeight;
 
         detections.forEach((det) => {
             if (!det.person_bbox) return;
@@ -136,6 +140,10 @@ const StreamPlayer = ({ wsUrl, className, alt, onStats, onDetections, onCounting
                 if (data.image && imgRef.current) {
                     imgRef.current.src = `data:image/jpeg;base64,${data.image}`;
                 }
+                frameSizeRef.current = {
+                    width: data.frame_width || 640,
+                    height: data.frame_height || 360,
+                };
                 if (onStats) {
                     onStats({
                         fps: data.fps || 0,

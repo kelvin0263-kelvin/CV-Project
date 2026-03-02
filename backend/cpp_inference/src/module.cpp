@@ -1,7 +1,6 @@
 #include <string>
 
 #include <pybind11/pybind11.h>
-
 #include "inference_core.hpp"
 
 namespace py = pybind11;

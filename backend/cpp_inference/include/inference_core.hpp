@@ -20,6 +20,7 @@ public:
                   float det_conf,
                   float det_iou,
                   float cls_conf_min);
+    ~InferenceCore();
 
     py::dict run_frame(const py::array& image, int frame_index, bool skip_classification);
     py::dict health() const;

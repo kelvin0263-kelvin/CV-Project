@@ -69,6 +69,33 @@ VIOLATION_QUEUE: list = []  # Thread-safe enough for append; consumed elsewhere
 VIOLATION_QUEUE_LOCK = threading.Lock()
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
 def queue_violation_event(event: dict):
     """Append a violation event to the in-memory queue for DB persistence."""
     with VIOLATION_QUEUE_LOCK:
@@ -190,6 +217,7 @@ def video_producer(
             det_conf=float(os.getenv("CPP_DET_CONF", "0.30")),
             det_iou=float(os.getenv("CPP_DET_IOU", "0.50")),
             cls_conf_min=float(os.getenv("CPP_CLS_MIN_CONF", "0.0")),
+            classification_interval_frames=int(os.getenv("CPP_CLASSIFY_INTERVAL", "30")),
         )
         if cpp_bridge.enabled:
             print(f"[Producer] Using C++ inference backend for {source_path}")
@@ -215,8 +243,12 @@ def video_producer(
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    delay = 1.0 / fps
+    source_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    source_fps = source_fps if source_fps > 0 else 30
+    target_fps = _env_float("STREAM_TARGET_FPS", 0.0)
+    effective_fps = min(source_fps, target_fps) if target_fps > 0 else source_fps
+    effective_fps = max(1.0, effective_fps)
+    delay = 1.0 / effective_fps
 
     # Detect CUDA availability once
     cuda_available = hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0
@@ -224,6 +256,21 @@ def video_producer(
         print("[System] CUDA detected: enabling GPU remap/resize")
     else:
         print("[System] CUDA not available, using CPU pipeline")
+
+    perf_log_enabled = _env_flag("VIDEO_PERF_LOG", default=False)
+    perf_log_interval = max(1, _env_int("VIDEO_PERF_LOG_INTERVAL", 60))
+    detection_stride = max(1, _env_int("VIDEO_DETECTION_STRIDE", 1))
+    web_width = max(1, _env_int("STREAM_FRAME_WIDTH", 640))
+    web_height = max(1, _env_int("STREAM_FRAME_HEIGHT", 360))
+    stream_jpeg_quality = min(95, max(20, _env_int("STREAM_JPEG_QUALITY", 40)))
+    web_resize_use_cuda = cuda_available and _env_flag("WEB_RESIZE_USE_CUDA", default=False)
+
+    print(
+        f"[Producer] Effective FPS target for {source_path}: {effective_fps:.1f} "
+        f"(source={source_fps:.1f}, detection_stride={detection_stride}, "
+        f"web={web_width}x{web_height}, jpeg_q={stream_jpeg_quality}, "
+        f"web_resize_cuda={'on' if web_resize_use_cuda else 'off'})"
+    )
 
     # --- Fisheye processor setup ---
     processor = None
@@ -256,23 +303,23 @@ def video_producer(
 
     # --- GPU-aware resize helper ---
     def resize_for_web(img):
-        if cuda_available and hasattr(cv2, "cuda"):
+        if web_resize_use_cuda and hasattr(cv2, "cuda"):
             try:
                 gpu_img = cv2.cuda_GpuMat()
                 gpu_img.upload(img)
-                gpu_resized = cv2.cuda.resize(gpu_img, (640, 360), interpolation=cv2.INTER_AREA)
+                gpu_resized = cv2.cuda.resize(gpu_img, (web_width, web_height), interpolation=cv2.INTER_AREA)
                 return gpu_resized.download()
             except Exception:
                 pass
-        return cv2.resize(img, (640, 360))
+        return cv2.resize(img, (web_width, web_height), interpolation=cv2.INTER_AREA)
 
     # --- Encode frame to base64 JPEG ---
     def encode_frame(img):
         img_small = resize_for_web(img)
         if jpeg:
-            buf = jpeg.encode(img_small, quality=40)
+            buf = jpeg.encode(img_small, quality=stream_jpeg_quality)
         else:
-            _, buf = cv2.imencode('.jpg', img_small, [cv2.IMWRITE_JPEG_QUALITY, 40])
+            _, buf = cv2.imencode('.jpg', img_small, [cv2.IMWRITE_JPEG_QUALITY, stream_jpeg_quality])
         return base64.b64encode(buf).decode('utf-8')
 
     # --- Detection + optional classification for a single view ---
@@ -307,7 +354,7 @@ def video_producer(
             # so tracks survive brief occlusions (e.g. door frame) much better.
             results = local_model.track(
                 source=img,
-                tracker="/workspace/CV-Project/backend/bytetrack_custom.yaml",
+                tracker="D:/FinalYearProjectTCK/CV-Project/backend/bytetrack_custom.yaml",
                 persist=True,
                 verbose=False,
                 classes=[0],        # person only
@@ -390,7 +437,11 @@ def video_producer(
             return [], 0, track_state
 
     # --- Scale detection coordinates to 640x360 for frontend ---
-    def scale_detections(detections, orig_h, orig_w, target_w=640, target_h=360):
+    def scale_detections(detections, orig_h, orig_w, target_w=None, target_h=None):
+        if target_w is None:
+            target_w = web_width
+        if target_h is None:
+            target_h = web_height
         sx = target_w / orig_w
         sy = target_h / orig_h
         scaled = []
@@ -416,7 +467,6 @@ def video_producer(
     current_real_fps = 0.0
 
     # Detection state
-    detection_stride = 1  # Run YOLO every frame (set to 3 to skip frames and save GPU)
     frame_count = 0
     track_state = {}       # {track_id: {label, confidence, last_classified_frame, violation_saved}}
     cached_detections = [] # Reused between detection frames
@@ -515,6 +565,8 @@ def video_producer(
             'people_count': cached_people_count,
             'detections': [],
             'counting_data': {},
+            'frame_width': web_width,
+            'frame_height': web_height,
         }
 
         if is_fisheye and processor:
@@ -579,7 +631,7 @@ def video_producer(
                 t2 = time.time()
 
                 # Perf logging
-                if fps_frame_count % 30 == 0:
+                if perf_log_enabled and frame_count % perf_log_interval == 0:
                     fisheye_ms = (t1 - t0) * 1000
                     detect_encode_ms = (t2 - t1) * 1000
                     total_ms = (t2 - t0) * 1000
@@ -595,6 +647,15 @@ def video_producer(
             # --- Normal (non-fisheye) video processing ---
             try:
                 orig_h, orig_w = frame.shape[:2]
+                current_buffer['original'] = encode_frame(frame)
+                current_buffer['__meta__']['detections'] = {'original': cached_detections}
+                current_buffer['__meta__']['people_count'] = cached_people_count
+                current_buffer['__meta__']['counting_data'] = {
+                    'original': cached_counting_data.get('original', {}),
+                }
+                FRAME_BUFFERS[source_path] = current_buffer
+
+                t_detect_start = time.time()
                 all_views = _get_all_detection_views()
                 dresscode_views = _get_detection_views(source_path)
 
@@ -617,14 +678,22 @@ def video_producer(
                     scaled = scale_detections(detections, orig_h, orig_w)
                     cached_detections = scaled
                     cached_people_count = people_count
-
-                # Encode clean frame
-                current_buffer['original'] = encode_frame(frame)
+                t_detect_end = time.time()
                 current_buffer['__meta__']['detections'] = {'original': cached_detections}
                 current_buffer['__meta__']['people_count'] = cached_people_count
                 current_buffer['__meta__']['counting_data'] = {
                     'original': cached_counting_data.get('original', {}),
                 }
+                t_encode_end = t_detect_start
+
+                if perf_log_enabled and frame_count % perf_log_interval == 0:
+                    detect_ms = (t_detect_end - t_detect_start) * 1000
+                    encode_ms = (t_detect_start - loop_start) * 1000
+                    total_ms = (t_detect_end - loop_start) * 1000
+                    print(
+                        f"[Perf] Detect: {detect_ms:.1f}ms | Encode: {encode_ms:.1f}ms"
+                        f" | Total: {total_ms:.1f}ms | FPS: {current_real_fps:.1f}"
+                    )
 
             except Exception as e:
                 print(f"[Producer] Normal video error: {e}")

@@ -64,6 +64,8 @@ async def websocket_endpoint(websocket: WebSocket, camera_id: str):
                     meta = frames.get('__meta__', {})
                     fps = meta.get('fps', 0)
                     people_count = meta.get('people_count', 0)
+                    frame_width = meta.get('frame_width', 640)
+                    frame_height = meta.get('frame_height', 360)
 
                     # Get detections for this specific view
                     all_detections = meta.get('detections', {})
@@ -77,6 +79,8 @@ async def websocket_endpoint(websocket: WebSocket, camera_id: str):
                         "image": b64_data,
                         "fps": fps,
                         "people_count": people_count,
+                        "frame_width": frame_width,
+                        "frame_height": frame_height,
                         "detections": view_detections,
                         "counting_data": view_counting,
                     })
