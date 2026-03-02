@@ -9,12 +9,15 @@ import StreamPlayer from './StreamPlayer';
 import { getApiBaseUrl, getWSUrl } from '../apiConfig';
 
 const SystemConfiguration = () => {
+    const apiUrl = getApiBaseUrl();
     const [cameras, setCameras] = useState([]);
     const [isAddMode, setIsAddMode] = useState(false);
     const [isEditMode, setIsEditMode] = useState(false);
     const [selectedCamera, setSelectedCamera] = useState(null);
     const [showUpload, setShowUpload] = useState(false);
     const [isUploading, setIsUploading] = useState(false);
+    const [isTestingConnection, setIsTestingConnection] = useState(false);
+    const [testResult, setTestResult] = useState(null);
 
     // File Upload State
     const [selectedFile, setSelectedFile] = useState(null);
@@ -39,7 +42,6 @@ const SystemConfiguration = () => {
 
     const fetchCameras = async () => {
         try {
-            const apiUrl = getApiBaseUrl();
             console.log("SystemConfig fetching from:", apiUrl);
             const res = await fetch(`${apiUrl}/api/cameras`);
             const data = await res.json();
@@ -66,6 +68,7 @@ const SystemConfiguration = () => {
         setSelectedFile(null);
         setEnableFisheye(false);
         setSelectedViews(new Set([0, 1, 2, 3, 4, 5, 6, 7]));
+        setTestResult(null);
     };
 
     const handleAddClick = () => {
@@ -77,12 +80,18 @@ const SystemConfiguration = () => {
         setFormData({
             name: cam.name,
             location: cam.location,
-            rtspUrl: cam.ip,
+            rtspUrl: cam.source_path || '',
             analysisMode: cam.mode,
-            frameRate: cam.fps,
+            frameRate: String(cam.fps ?? 30),
             resolution: cam.resolution,
             enabled: cam.enabled,
         });
+        setEnableFisheye(Boolean(cam.is_fisheye));
+        setSelectedViews(
+            cam.is_fisheye && Number.isInteger(cam.view_index) && cam.view_index >= 0
+                ? new Set([cam.view_index])
+                : new Set([0, 1, 2, 3, 4, 5, 6, 7])
+        );
         setSelectedCamera(cam);
         setIsEditMode(true);
     };
@@ -95,6 +104,9 @@ const SystemConfiguration = () => {
     const handleInputChange = (e) => {
         const { name, value, type, checked } = e.target;
         setFormData(prev => ({ ...prev, [name]: type === 'checkbox' ? checked : value }));
+        if (name === 'rtspUrl' && testResult) {
+            setTestResult(null);
+        }
     };
 
     const handleFileChange = (e) => {
@@ -121,7 +133,6 @@ const SystemConfiguration = () => {
             uploadData.append('camera_name_prefix', formData.name || 'Uploaded Camera');
 
             try {
-                const apiUrl = getApiBaseUrl();
                 // Large files need a generous timeout (10 minutes)
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 10 * 60 * 1000);
@@ -152,30 +163,72 @@ const SystemConfiguration = () => {
             type: 'RTSP',
             status: formData.enabled ? 'Online' : 'Disabled',
             mode: formData.analysisMode,
-            ip: formData.rtspUrl,
+            source_path: formData.rtspUrl.trim(),
             resolution: formData.resolution,
-            fps: parseInt(formData.frameRate),
+            fps: parseInt(formData.frameRate, 10) || 30,
             enabled: formData.enabled,
-            image: '/placeholder.png'
+            image: '',
+            view_index: -1,
+            is_fisheye: false,
         };
 
         try {
+            if (!payload.source_path) {
+                alert("Please enter a RTSP URL.");
+                return;
+            }
+
+            if (enableFisheye) {
+                if (isEditMode) {
+                    alert("Editing RTSP fisheye sources is not supported yet. Delete and recreate the source.");
+                    return;
+                }
+
+                const res = await fetch(`${apiUrl}/api/cameras/rtsp-source`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        name: formData.name,
+                        location: formData.location,
+                        source_path: payload.source_path,
+                        mode: formData.analysisMode,
+                        resolution: formData.resolution,
+                        fps: payload.fps,
+                        enabled: formData.enabled,
+                        enable_fisheye: true,
+                        selected_views: Array.from(selectedViews),
+                    }),
+                });
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    throw new Error(err.detail || 'Failed to create RTSP fisheye source');
+                }
+
+                await fetchCameras();
+                resetForm();
+                return;
+            }
+
             if (isEditMode) {
-                // For MVP: Delete old and add new as 'update' logic is simple on backend
-                const apiUrl = getApiBaseUrl();
-                await fetch(`${apiUrl}/api/cameras/${selectedCamera.id}`, { method: 'DELETE' });
-                await fetch(`${apiUrl}/api/cameras`, {
-                    method: 'POST',
+                const res = await fetch(`${apiUrl}/api/cameras/${selectedCamera.id}`, {
+                    method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
+                    body: JSON.stringify(payload),
                 });
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    throw new Error(err.detail || 'Failed to save camera');
+                }
             } else {
-                const apiUrl = getApiBaseUrl();
-                await fetch(`${apiUrl}/api/cameras`, {
+                const res = await fetch(`${apiUrl}/api/cameras`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
+                    body: JSON.stringify(payload),
                 });
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    throw new Error(err.detail || 'Failed to save camera');
+                }
             }
             await fetchCameras();
             resetForm();
@@ -188,7 +241,6 @@ const SystemConfiguration = () => {
     const handleDelete = async (id) => {
         if (window.confirm("Are you sure you want to remove this camera Source? This will remove it from the dashboard.")) {
             try {
-                const apiUrl = getApiBaseUrl();
                 await fetch(`${apiUrl}/api/cameras/${id}`, { method: 'DELETE' });
                 await fetchCameras();
             } catch (e) {
@@ -197,20 +249,49 @@ const SystemConfiguration = () => {
         }
     };
 
-    // ... existing test connection ...
-    const handleTestConnection = () => {
+    const handleTestConnection = async () => {
         if (!formData.rtspUrl) {
-            alert("Please enter a RTSP URL.");
+            setTestResult({ type: 'error', message: 'Please enter a RTSP URL.' });
             return;
         }
-        // Simulate checking
-        const isSuccess = Math.random() > 0.2;
-        if (isSuccess) {
-            alert("Connection Successful!");
-        } else {
-            alert("Connection Failed: Unable to reach host.");
+
+        setIsTestingConnection(true);
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 8000);
+            const res = await fetch(`${apiUrl}/api/cameras/test-rtsp`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ source_path: formData.rtspUrl.trim() }),
+                signal: controller.signal,
+            });
+            clearTimeout(timeoutId);
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data.ok) {
+                throw new Error(data.detail || 'Unable to reach RTSP stream.');
+            }
+
+            const parts = [];
+            if (data.resolution) parts.push(`Resolution: ${data.resolution}`);
+            if (data.fps) parts.push(`FPS: ${data.fps}`);
+            setTestResult({
+                type: 'success',
+                message: parts.length > 0
+                    ? `Connection successful. ${parts.join(' | ')}`
+                    : 'Connection successful.',
+            });
+        } catch (error) {
+            const message = error?.name === 'AbortError'
+                ? 'Connection test timed out.'
+                : (error?.message || 'Connection test failed.');
+            setTestResult({ type: 'error', message });
+        } finally {
+            setIsTestingConnection(false);
         }
     };
+
+    const isStreamSource = (cam) =>
+        cam.type.includes('RTSP') || cam.type.includes('File') || cam.type.includes('Fisheye');
 
 
     return (
@@ -242,7 +323,7 @@ const SystemConfiguration = () => {
                             {cameras.map((cam) => (
                                 <Card key={cam.id} className={cn("relative group overflow-hidden hover:border-primary/50 transition-all cursor-pointer border-muted", !cam.enabled && "opacity-60")}>
                                     <div className="aspect-video bg-muted relative flex items-center justify-center bg-black">
-                                        {cam.type.includes('File') || cam.type.includes('Fisheye') ? (
+                                        {isStreamSource(cam) ? (
                                             <StreamPlayer
                                                 wsUrl={getWSUrl(`/ws/${cam.id}`)}
                                                 className="w-full h-full"
@@ -256,6 +337,11 @@ const SystemConfiguration = () => {
                                         )}
 
                                         <div className="absolute top-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                            {!cam.is_fisheye && (
+                                                <Button size="icon" variant="secondary" className="h-8 w-8" onClick={() => handleEditClick(cam)}>
+                                                    <Edit2 className="w-4 h-4" />
+                                                </Button>
+                                            )}
                                             <Button size="icon" variant="destructive" className="h-8 w-8" onClick={() => handleDelete(cam.id)}>
                                                 <Trash2 className="w-4 h-4" />
                                             </Button>
@@ -266,7 +352,9 @@ const SystemConfiguration = () => {
                                     </div>
                                     <CardContent className="p-4">
                                         <h3 className="font-semibold text-lg truncate" title={cam.name}>{cam.name}</h3>
-                                        <p className="text-sm text-muted-foreground truncate">{cam.location}</p>
+                                        <p className="text-sm text-muted-foreground truncate">
+                                            {cam.location || cam.source_path || 'No location configured'}
+                                        </p>
                                         <div className="mt-3 flex flex-wrap gap-2">
                                             <span className="text-xs px-2 py-1 bg-secondary rounded-full">{cam.mode}</span>
                                         </div>
@@ -375,20 +463,73 @@ const SystemConfiguration = () => {
                                         </div>
                                     ) : (
                                         // RTSP Specific UI
-                                        <div className="space-y-2">
-                                            <Label>RTSP URL</Label>
+                                        <>
+                                            <div className="space-y-2">
+                                                <Label>RTSP URL</Label>
                                             <div className="flex gap-2">
                                                 <input
                                                     type="text"
                                                     name="rtspUrl"
-                                                    value={formData.rtspUrl}
-                                                    onChange={handleInputChange}
-                                                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                                                    placeholder="rtsp://admin:password@192.168.1.1:554/stream"
-                                                />
-                                                <Button type="button" variant="secondary" onClick={handleTestConnection}>Test</Button>
+                                                        value={formData.rtspUrl}
+                                                        onChange={handleInputChange}
+                                                        className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                                        placeholder="rtsp://admin:password@192.168.1.1:554/stream"
+                                                    />
+                                                    <Button type="button" variant="secondary" onClick={handleTestConnection} disabled={isTestingConnection}>
+                                                    {isTestingConnection ? 'Testing...' : 'Test'}
+                                                </Button>
                                             </div>
-                                        </div>
+                                            {testResult && (
+                                                <div className={cn(
+                                                    "rounded-md border px-3 py-2 text-sm",
+                                                    testResult.type === 'success'
+                                                        ? "border-green-500/30 bg-green-500/10 text-green-600"
+                                                        : "border-red-500/30 bg-red-500/10 text-red-600"
+                                                )}>
+                                                    {testResult.message}
+                                                </div>
+                                            )}
+                                            </div>
+                                            <div className="flex items-center space-x-2">
+                                                <Checkbox
+                                                    id="rtsp-fisheye"
+                                                    checked={enableFisheye}
+                                                    disabled={isEditMode}
+                                                    onCheckedChange={setEnableFisheye}
+                                                />
+                                                <Label htmlFor="rtsp-fisheye">Enable Fisheye Processing (Creates multiple RTSP views)</Label>
+                                            </div>
+                                            {enableFisheye && (
+                                                <div className="space-y-4 border rounded-lg p-4 bg-muted/30">
+                                                    <Label>Select Enabled Views</Label>
+                                                    <div className="grid grid-cols-4 gap-2">
+                                                        {[0, 1, 2, 3, 4, 5, 6, 7].map((idx) => {
+                                                            const angle = idx * 45;
+                                                            return (
+                                                                <div key={idx} className="flex items-center space-x-2 border p-2 rounded hover:bg-muted/50">
+                                                                    <Checkbox
+                                                                        id={`rtsp-view-${idx}`}
+                                                                        checked={selectedViews.has(idx)}
+                                                                        onCheckedChange={(checked) => {
+                                                                            const newSet = new Set(selectedViews);
+                                                                            if (checked) newSet.add(idx);
+                                                                            else newSet.delete(idx);
+                                                                            setSelectedViews(newSet);
+                                                                        }}
+                                                                    />
+                                                                    <Label htmlFor={`rtsp-view-${idx}`} className="cursor-pointer text-xs">
+                                                                        View {idx + 1} ({angle}°)
+                                                                    </Label>
+                                                                </div>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                    <p className="text-xs text-muted-foreground">
+                                                        This creates one camera card per selected fisheye view.
+                                                    </p>
+                                                </div>
+                                            )}
+                                        </>
                                     )}
 
                                     {/* Common Settings */}
@@ -410,8 +551,8 @@ const SystemConfiguration = () => {
 
                                     {/* Footer Actions */}
                                     <div className="flex justify-end gap-2 pt-4">
-                                        <Button type="button" variant="ghost" onClick={resetForm} disabled={isUploading}>Cancel</Button>
-                                        <Button type="submit" disabled={isUploading}>
+                                        <Button type="button" variant="ghost" onClick={resetForm} disabled={isUploading || isTestingConnection}>Cancel</Button>
+                                        <Button type="submit" disabled={isUploading || isTestingConnection}>
                                             {isUploading ? (
                                                 <>
                                                     <Loader2 className="w-4 h-4 mr-2 animate-spin" /> Processing...

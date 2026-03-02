@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete as sa_delete, desc
 
 from app.core.database import get_db, AsyncSessionLocal
+from app.models.camera_model import Camera
 from app.models.people_counting_config import PeopleCountingConfig
 from app.models.people_counting_snapshot import PeopleCountingSnapshot
 from app.models.stream_config import StreamConfig
@@ -33,9 +34,9 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 _counting_configs: dict[str, dict] = {}  # camera_id -> config dict
 
-# Source-path routing: maps source_path -> set of view_keys that need counting
+# Runtime-key routing: maps runtime_key -> set of view_keys that need counting
 _counting_source_map: dict[str, set[str]] = {}
-# Reverse lookup: "source_path||view_key" -> camera_id (for cameras with counting)
+# Reverse lookup: "runtime_key||view_key" -> camera_id (for cameras with counting)
 _counting_camera_resolve: dict[str, str] = {}
 
 
@@ -49,14 +50,14 @@ def get_all_counting_configs() -> dict[str, dict]:
     return dict(_counting_configs)
 
 
-def get_counting_views(source_path: str) -> set[str]:
-    """Get view keys that need counting for a given source_path."""
-    return _counting_source_map.get(source_path, set())
+def get_counting_views(runtime_key: str) -> set[str]:
+    """Get view keys that need counting for a given runtime key."""
+    return _counting_source_map.get(runtime_key, set())
 
 
-def get_counting_camera_id(source_path: str, view_key: str) -> str | None:
-    """Resolve camera_id for a source_path + view_key (counting context)."""
-    return _counting_camera_resolve.get(f"{source_path}||{view_key}")
+def get_counting_camera_id(runtime_key: str, view_key: str) -> str | None:
+    """Resolve camera_id for a runtime key + view key (counting context)."""
+    return _counting_camera_resolve.get(f"{runtime_key}||{view_key}")
 
 
 def _cache_config(camera_id: str, row: PeopleCountingConfig):
@@ -86,6 +87,10 @@ def update_live_counts(camera_id: str, data: dict):
 
 def get_live_counts(camera_id: str) -> dict | None:
     return _live_counts.get(camera_id)
+
+
+def _remove_live_count(camera_id: str):
+    _live_counts.pop(camera_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +125,13 @@ async def counting_snapshot_persistence_loop():
         for snap in items:
             try:
                 async with AsyncSessionLocal() as session:
+                    camera_exists = await session.scalar(
+                        select(Camera.id).where(Camera.id == snap["camera_id"]).limit(1)
+                    )
+                    if camera_exists is None:
+                        print(f"[CountingSnapshot] Dropping snapshot {snap.get('id')}: camera_id {snap['camera_id']} no longer exists")
+                        continue
+
                     row = PeopleCountingSnapshot(
                         id=snap.get("id", str(uuid.uuid4())),
                         camera_id=snap["camera_id"],
@@ -139,7 +151,7 @@ async def counting_snapshot_persistence_loop():
 
 
 # ---------------------------------------------------------------------------
-# Source map rebuild: maps source_path -> view_keys for counting-enabled cameras
+# Source map rebuild: maps runtime_key -> view_keys for counting-enabled cameras
 # ---------------------------------------------------------------------------
 async def _rebuild_source_map(session: AsyncSession):
     """
@@ -161,14 +173,45 @@ async def _rebuild_source_map(session: AsyncSession):
         configs = result.scalars().all()
         for sc in configs:
             view_key = "original" if sc.view_index == -1 else f"partition_{sc.view_index}"
-            src = sc.source_path
-            if src not in new_source_map:
-                new_source_map[src] = set()
-            new_source_map[src].add(view_key)
-            new_resolve[f"{src}||{view_key}"] = sc.camera_id
+            runtime_key = sc.runtime_key or sc.source_path
+            if runtime_key not in new_source_map:
+                new_source_map[runtime_key] = set()
+            new_source_map[runtime_key].add(view_key)
+            new_resolve[f"{runtime_key}||{view_key}"] = sc.camera_id
 
     _counting_source_map = new_source_map
     _counting_camera_resolve = new_resolve
+
+
+async def sync_counting_runtime_from_db(session: AsyncSession):
+    """
+    Rebuild counting caches from the database.
+    This is needed after camera deletion because DB cascade removes rows,
+    but the in-memory cache would otherwise keep stale camera IDs.
+    """
+    global _counting_configs, _live_counts
+
+    result = await session.execute(select(PeopleCountingConfig))
+    rows = result.scalars().all()
+
+    new_configs: dict[str, dict] = {}
+    valid_camera_ids: set[str] = set()
+    for row in rows:
+        valid_camera_ids.add(row.camera_id)
+        new_configs[row.camera_id] = {
+            "enabled": row.enabled,
+            "max_capacity": row.max_capacity,
+            "lines": row.lines or [],
+            "zones": row.zones or [],
+        }
+
+    _counting_configs = new_configs
+    _live_counts = {
+        camera_id: data
+        for camera_id, data in _live_counts.items()
+        if camera_id in valid_camera_ids
+    }
+    await _rebuild_source_map(session)
 
 
 # ---------------------------------------------------------------------------
@@ -178,12 +221,8 @@ async def load_counting_configs_from_db():
     """Called once at startup to populate the in-memory cache."""
     try:
         async with AsyncSessionLocal() as session:
-            result = await session.execute(select(PeopleCountingConfig))
-            rows = result.scalars().all()
-            for row in rows:
-                _cache_config(row.camera_id, row)
-            await _rebuild_source_map(session)
-            print(f"[Startup] Loaded {len(rows)} people counting config(s)")
+            await sync_counting_runtime_from_db(session)
+            print(f"[Startup] Loaded {len(_counting_configs)} people counting config(s)")
     except Exception as e:
         print(f"[Startup] Warning: Could not load counting configs: {e}")
 

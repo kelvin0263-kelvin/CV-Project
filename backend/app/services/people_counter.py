@@ -18,12 +18,13 @@ All line/zone coordinates are stored in normalized (0-1) form.
 """
 
 import math
+import os
 import uuid
 import time
 from typing import Optional
 
-# Set to True to enable detailed per-track debug logging
-DEBUG_COUNTING = True
+# Verbose per-track logging is extremely expensive in the hot path.
+DEBUG_COUNTING = os.getenv("DEBUG_COUNTING", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ---------------------------------------------------------------------------

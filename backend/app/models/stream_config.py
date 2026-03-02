@@ -10,6 +10,7 @@ class StreamConfig(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     camera_id = Column(String, ForeignKey("cameras.id", ondelete="CASCADE"), nullable=False, unique=True)
     source_path = Column(String(1000), nullable=False)
+    runtime_key = Column(String(1500), nullable=False, default="")
     view_index = Column(Integer, nullable=False, default=-1)
     is_fisheye = Column(Boolean, nullable=False, default=False)
 
@@ -17,4 +18,7 @@ class StreamConfig(Base):
     camera = relationship("Camera", backref="stream_config", uselist=False)
 
     def __repr__(self) -> str:
-        return f"<StreamConfig(camera_id={self.camera_id!r}, source={self.source_path!r})>"
+        return (
+            f"<StreamConfig(camera_id={self.camera_id!r}, source={self.source_path!r}, "
+            f"runtime_key={self.runtime_key!r})>"
+        )

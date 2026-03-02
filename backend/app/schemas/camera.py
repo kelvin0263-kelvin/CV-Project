@@ -15,6 +15,9 @@ class CameraCreate(BaseModel):
     fps: int = 30
     enabled: bool = True
     image: str = ""
+    source_path: Optional[str] = None
+    view_index: int = -1
+    is_fisheye: bool = False
 
 
 class CameraRead(BaseModel):
@@ -30,6 +33,9 @@ class CameraRead(BaseModel):
     fps: int
     enabled: bool
     image: str
+    source_path: Optional[str] = None
+    view_index: int = -1
+    is_fisheye: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -46,3 +52,6 @@ class CameraUpdate(BaseModel):
     fps: Optional[int] = None
     enabled: Optional[bool] = None
     image: Optional[str] = None
+    source_path: Optional[str] = None
+    view_index: Optional[int] = None
+    is_fisheye: Optional[bool] = None

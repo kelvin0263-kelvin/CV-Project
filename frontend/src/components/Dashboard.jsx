@@ -15,6 +15,7 @@ const CameraFeedCard = ({ camera }) => {
     const [stats, setStats] = useState({ fps: 0, people_count: 0 });
     const [countingData, setCountingData] = useState({});
     const wsUrl = getWSUrl(`/ws/${camera.id}`);
+    const isStreamSource = camera.type.includes("RTSP") || camera.type.includes("File") || camera.type.includes("Fisheye");
 
     const hasCountingData = countingData && (countingData.total_in > 0 || countingData.total_out > 0);
     const capacityExceeded = countingData?.capacity_exceeded ?? false;
@@ -22,7 +23,7 @@ const CameraFeedCard = ({ camera }) => {
     return (
         <div className="relative group overflow-hidden bg-black rounded-sm border border-border/50 h-full w-full flex items-center justify-center">
             {/* Live Feed or Image */}
-            {camera.type.includes("File") || camera.type.includes("Fisheye") ? (
+            {isStreamSource ? (
                 <StreamPlayer
                     wsUrl={wsUrl}
                     className="w-full h-full"

@@ -1,10 +1,19 @@
 import asyncio
+import os
+import sys
 from logging.config import fileConfig
 
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
+
+# Ensure the backend package root is importable whether Alembic is launched
+# from the repository root or from the backend directory.
+ALEMBIC_DIR = os.path.dirname(os.path.abspath(__file__))
+BACKEND_ROOT = os.path.dirname(ALEMBIC_DIR)
+if BACKEND_ROOT not in sys.path:
+    sys.path.insert(0, BACKEND_ROOT)
 
 # Load application settings (reads .env)
 from app.core.config import settings

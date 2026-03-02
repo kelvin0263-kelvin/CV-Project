@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.core.database import get_db
+from app.models.camera_model import Camera
 from app.models.dresscode_policy import DressCodePolicy
 from app.models.stream_config import StreamConfig
 from app.schemas.dresscode_policy import DressCodePolicyRead, DressCodePolicyUpdate
@@ -40,12 +41,12 @@ async def _sync_policy_to_runtime(db: AsyncSession, policy: DressCodePolicy):
     Resolve enabled_camera_ids -> per-source detection config and push
     the policy to the video processor runtime.
 
-    Builds a mapping keyed by (source_path, view_key) so that multiple
-    videos can each have independent detection settings.
+    Builds a mapping keyed by (runtime_key, view_key) so the same RTSP
+    URL can back multiple independent producer groups.
     """
-    # Maps: source_path -> set of view_keys that should run detection
+    # Maps: runtime_key -> set of view_keys that should run detection
     detection_map: dict[str, set[str]] = {}
-    # Maps: (source_path, view_key) -> camera_id  for DB event tagging
+    # Maps: (runtime_key, view_key) -> camera_id for DB event tagging
     camera_id_map: dict[tuple[str, str], str] = {}
 
     if policy.enabled and policy.enabled_camera_ids:
@@ -57,12 +58,12 @@ async def _sync_policy_to_runtime(db: AsyncSession, policy: DressCodePolicy):
         configs = result.scalars().all()
         for sc in configs:
             view_key = "original" if sc.view_index == -1 else f"partition_{sc.view_index}"
-            src = sc.source_path
+            runtime_key = sc.runtime_key or sc.source_path
 
-            if src not in detection_map:
-                detection_map[src] = set()
-            detection_map[src].add(view_key)
-            camera_id_map[(src, view_key)] = sc.camera_id
+            if runtime_key not in detection_map:
+                detection_map[runtime_key] = set()
+            detection_map[runtime_key].add(view_key)
+            camera_id_map[(runtime_key, view_key)] = sc.camera_id
 
     update_policy({
         "enabled_camera_ids": policy.enabled_camera_ids or [],
@@ -71,6 +72,29 @@ async def _sync_policy_to_runtime(db: AsyncSession, policy: DressCodePolicy):
         "detection_map": detection_map,
         "camera_id_map": {f"{k[0]}||{k[1]}": v for k, v in camera_id_map.items()},
     })
+
+
+async def sync_policy_runtime_from_db(db: AsyncSession) -> DressCodePolicy:
+    """
+    Re-sync runtime policy and prune camera IDs that no longer exist.
+    Camera deletion otherwise leaves stale runtime mappings in memory.
+    """
+    policy = await _get_or_create_policy(db)
+
+    enabled_camera_ids = policy.enabled_camera_ids or []
+    if enabled_camera_ids:
+        result = await db.execute(
+            select(Camera.id).where(Camera.id.in_(enabled_camera_ids))
+        )
+        valid_ids = set(result.scalars().all())
+        filtered_ids = [camera_id for camera_id in enabled_camera_ids if camera_id in valid_ids]
+        if filtered_ids != enabled_camera_ids:
+            policy.enabled_camera_ids = filtered_ids
+            await db.flush()
+            await db.refresh(policy)
+
+    await _sync_policy_to_runtime(db, policy)
+    return policy
 
 
 @router.get("/api/dresscode-policy", response_model=DressCodePolicyRead)
@@ -99,7 +123,4 @@ async def update_policy_endpoint(
     await db.flush()
     await db.refresh(policy)
 
-    # Push updated policy to the video processor runtime
-    await _sync_policy_to_runtime(db, policy)
-
-    return policy
+    return await sync_policy_runtime_from_db(db)

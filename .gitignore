@@ -9,7 +9,7 @@ backend/static/uploads/*
 backend/static/processed/*
 !backend/static/uploads/.gitkeep
 !backend/static/processed/.gitkeep
-
+temp_video_uploads
 # Node
 node_modules/
 dist/

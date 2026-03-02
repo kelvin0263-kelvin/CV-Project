@@ -47,6 +47,20 @@ UPLOAD_ROOT = os.path.abspath(os.path.join(PROJECT_ROOT, "temp_video_uploads"))
 SNAPSHOT_DIR = os.path.join(PROJECT_ROOT, "temp_video_uploads", "snapshots")
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
+
+# Fixed runtime tuning for the current project.
+POSE_MODEL_PATH = os.path.join(BACKEND_ROOT, "yolo26m-pose.pt")
+TRACKER_CONFIG_PATH = os.getenv(
+    "TRACKER_CONFIG_PATH",
+    os.path.join(BACKEND_ROOT, "bytetrack_custom.yaml"),
+)
+YOLO_DEVICE = os.getenv("YOLO_DEVICE")
+POSE_TRACK_IMGSZ = 960
+DETECTION_STRIDE = 4
+RTSP_SCHEMES = ("rtsp://", "rtsps://")
+RTSP_OPEN_TIMEOUT_MS = 5000
+RTSP_READ_TIMEOUT_MS = 5000
+
 # ---------------------------------------------------------------------------
 # Initialize TurboJPEG
 # ---------------------------------------------------------------------------
@@ -77,38 +91,81 @@ def drain_violation_queue() -> list:
     return events
 
 
+def _is_rtsp_source(source_path: str) -> bool:
+    return source_path.strip().lower().startswith(RTSP_SCHEMES)
+
+
+def _build_source_meta(source_path: str) -> dict:
+    is_rtsp_source = _is_rtsp_source(source_path)
+    if is_rtsp_source:
+        return {
+            "is_file_source": False,
+            "is_uploaded_source": False,
+            "is_rtsp_source": True,
+        }
+
+    source_abs = os.path.abspath(source_path)
+    try:
+        is_uploaded_source = os.path.commonpath([source_abs, UPLOAD_ROOT]) == UPLOAD_ROOT
+    except ValueError:
+        is_uploaded_source = False
+
+    return {
+        "is_file_source": os.path.isfile(source_abs),
+        "is_uploaded_source": is_uploaded_source,
+        "is_rtsp_source": False,
+    }
+
+
+def _open_video_capture(source_path: str, source_meta: dict) -> cv2.VideoCapture:
+    cap = cv2.VideoCapture(source_path)
+    if source_meta.get("is_rtsp_source"):
+        if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
+            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, RTSP_OPEN_TIMEOUT_MS)
+        if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, RTSP_READ_TIMEOUT_MS)
+    return cap
+
+
 # ---------------------------------------------------------------------------
 # Producer thread management
 # ---------------------------------------------------------------------------
-def start_producer_thread(source_path: str, is_fisheye: bool, active_views: list = None):
+def start_producer_thread(
+    runtime_key: str,
+    source_path: str,
+    is_fisheye: bool,
+    active_views: list = None,
+):
     with PRODUCER_LOCK:
-        existing = PRODUCER_THREADS.get(source_path)
+        existing = PRODUCER_THREADS.get(runtime_key)
         if existing is not None and existing.is_alive():
             return  # Already running for this source
 
         stop_event = threading.Event()
-        source_abs = os.path.abspath(source_path)
-        source_meta = {
-            "is_file_source": os.path.isfile(source_abs),
-            "is_uploaded_source": os.path.commonpath([source_abs, UPLOAD_ROOT]) == UPLOAD_ROOT,
-        }
+        source_meta = _build_source_meta(source_path)
 
         thread = threading.Thread(
             target=video_producer,
-            args=(source_path, is_fisheye, active_views, stop_event, source_meta),
+            args=(runtime_key, source_path, is_fisheye, active_views, stop_event, source_meta),
             daemon=True,
         )
-        PRODUCER_THREADS[source_path] = thread
-        PRODUCER_STOP_EVENTS[source_path] = stop_event
-        PRODUCER_META[source_path] = source_meta
+        PRODUCER_THREADS[runtime_key] = thread
+        PRODUCER_STOP_EVENTS[runtime_key] = stop_event
+        PRODUCER_META[runtime_key] = {
+            **source_meta,
+            "source_path": source_path,
+            "runtime_key": runtime_key,
+        }
         thread.start()
 
 
-def stop_producer_thread(source_path: str, join_timeout: float = 2.0) -> bool:
+def stop_producer_thread(runtime_key: str, join_timeout: float = 2.0) -> bool:
     """Request producer shutdown for a source. Returns True if fully stopped."""
     with PRODUCER_LOCK:
-        thread = PRODUCER_THREADS.get(source_path)
-        stop_event = PRODUCER_STOP_EVENTS.get(source_path)
+        thread = PRODUCER_THREADS.get(runtime_key)
+        stop_event = PRODUCER_STOP_EVENTS.get(runtime_key)
 
     if thread is None or stop_event is None:
         return True  # Already stopped / unknown source
@@ -118,63 +175,96 @@ def stop_producer_thread(source_path: str, join_timeout: float = 2.0) -> bool:
         thread.join(timeout=join_timeout)
 
     if thread.is_alive():
-        print(f"[Producer] Stop requested but still alive for {source_path}")
+        print(f"[Producer] Stop requested but still alive for {runtime_key}")
         return False
 
-    _cleanup_producer_state(source_path, clear_frame_buffer=True)
+    _cleanup_producer_state(runtime_key, clear_frame_buffer=True)
     return True
 
 
-def is_producer_running(source_path: str) -> bool:
+def stop_all_producer_threads(join_timeout: float = 2.0) -> list[str]:
+    """
+    Request shutdown for all producers and return any sources that
+    failed to stop within the timeout.
+    """
     with PRODUCER_LOCK:
-        thread = PRODUCER_THREADS.get(source_path)
+        runtime_keys = list(PRODUCER_STOP_EVENTS.keys())
+
+    for runtime_key in runtime_keys:
+        stop_event = PRODUCER_STOP_EVENTS.get(runtime_key)
+        if stop_event is not None:
+            stop_event.set()
+
+    still_running: list[str] = []
+    for runtime_key in runtime_keys:
+        thread = PRODUCER_THREADS.get(runtime_key)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=join_timeout)
+        if thread is not None and thread.is_alive():
+            still_running.append(runtime_key)
+        else:
+            _cleanup_producer_state(runtime_key, clear_frame_buffer=True)
+
+    return still_running
+
+
+def is_producer_running(runtime_key: str) -> bool:
+    with PRODUCER_LOCK:
+        thread = PRODUCER_THREADS.get(runtime_key)
         return thread.is_alive() if thread is not None else False
 
 
-def _cleanup_producer_state(source_path: str, clear_frame_buffer: bool):
+def _cleanup_producer_state(runtime_key: str, clear_frame_buffer: bool):
     with PRODUCER_LOCK:
-        PRODUCER_THREADS.pop(source_path, None)
-        PRODUCER_STOP_EVENTS.pop(source_path, None)
-        PRODUCER_META.pop(source_path, None)
+        PRODUCER_THREADS.pop(runtime_key, None)
+        PRODUCER_STOP_EVENTS.pop(runtime_key, None)
+        PRODUCER_META.pop(runtime_key, None)
     if clear_frame_buffer:
-        FRAME_BUFFERS.pop(source_path, None)
+        FRAME_BUFFERS.pop(runtime_key, None)
 
 
 # ---------------------------------------------------------------------------
 # Main producer loop
 # ---------------------------------------------------------------------------
 def video_producer(
+    runtime_key: str,
     source_path: str,
     is_fisheye: bool,
     active_views: list = None,
     stop_event: threading.Event | None = None,
     source_meta: dict | None = None,
 ):
-    print(f"[Producer] Starting loop for {source_path}")
+    print(f"[Producer] Starting loop for runtime_key={runtime_key}, source={source_path}")
 
     if stop_event is None:
         stop_event = threading.Event()
     if source_meta is None:
-        source_abs = os.path.abspath(source_path)
-        source_meta = {
-            "is_file_source": os.path.isfile(source_abs),
-            "is_uploaded_source": os.path.commonpath([source_abs, UPLOAD_ROOT]) == UPLOAD_ROOT,
-        }
+        source_meta = _build_source_meta(source_path)
 
-    cap = cv2.VideoCapture(source_path)
+    cap = _open_video_capture(source_path, source_meta)
+    if not cap.isOpened() and source_meta.get("is_rtsp_source"):
+        for _ in range(5):
+            if stop_event.is_set():
+                break
+            time.sleep(1.0)
+            cap.release()
+            cap = _open_video_capture(source_path, source_meta)
+            if cap.isOpened():
+                break
+
     if not cap.isOpened():
-        print(f"[Producer] Failed to open {source_path}")
-        _cleanup_producer_state(source_path, clear_frame_buffer=True)
+        print(f"[Producer] Failed to open {source_path} (runtime_key={runtime_key})")
+        _cleanup_producer_state(runtime_key, clear_frame_buffer=True)
         return
 
     # Per-stream model instance: isolates tracker state across concurrent sources.
-    print(f"[Producer] Loading YOLO model for {source_path}")
+    print(f"[Producer] Loading YOLO model for runtime_key={runtime_key}, source={source_path}")
     try:
-        local_model = YOLO("yolo26m-pose.pt")
+        local_model = YOLO(POSE_MODEL_PATH)
     except Exception as e:
         print(f"[Producer] Failed to load YOLO model for {source_path}: {e}")
         cap.release()
-        _cleanup_producer_state(source_path, clear_frame_buffer=True)
+        _cleanup_producer_state(runtime_key, clear_frame_buffer=True)
         return
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -258,17 +348,20 @@ def video_producer(
             # YOLO-Pose tracking with BoT-SORT for better occlusion handling.
             # BoT-SORT adds ReID appearance features + improved Kalman filter,
             # so tracks survive brief occlusions (e.g. door frame) much better.
-            results = local_model.track(
-                source=img,
-                tracker="/workspace/CV-Project/backend/bytetrack_custom.yaml",
-                persist=True,
-                verbose=False,
-                classes=[0],        # person only
-                conf=0.30,          # lower threshold: keep detections during partial occlusion
-                iou=0.5,            # more lenient matching: easier to re-associate after occlusion
-                imgsz=1280,         # matches training: imgsz=1280
-                device='0',
-            )
+            track_kwargs = {
+                "source": img,
+                "tracker": TRACKER_CONFIG_PATH,
+                "persist": True,
+                "verbose": False,
+                "classes": [0],     # person only
+                "conf": 0.30,       # lower threshold: keep detections during partial occlusion
+                "iou": 0.5,         # more lenient matching: easier to re-associate after occlusion
+                "imgsz": POSE_TRACK_IMGSZ,
+            }
+            if YOLO_DEVICE:
+                track_kwargs["device"] = YOLO_DEVICE
+
+            results = local_model.track(**track_kwargs)
 
             if not results:
                 return [], 0, track_state
@@ -312,7 +405,7 @@ def video_producer(
                         if keypoints is not None and keypoints.shape[0] > i:
                             kp_row = keypoints[i]
 
-                        cls_result = classify_lower_body(img, box_coords, kp_row, device='0')
+                        cls_result = classify_lower_body(img, box_coords, kp_row, device=YOLO_DEVICE)
 
                         # Update track state
                         if track_id is not None and cls_result is not None:
@@ -361,7 +454,7 @@ def video_producer(
     # -----------------------------------------------------------------------
     # Init buffer and state
     # -----------------------------------------------------------------------
-    FRAME_BUFFERS[source_path] = {}
+    FRAME_BUFFERS[runtime_key] = {}
 
     # FPS calculation
     fps_start_time = time.time()
@@ -369,7 +462,7 @@ def video_producer(
     current_real_fps = 0.0
 
     # Detection state
-    detection_stride = 1  # Run YOLO every frame (set to 3 to skip frames and save GPU)
+    detection_stride = DETECTION_STRIDE
     frame_count = 0
     track_state = {}       # {track_id: {label, confidence, last_classified_frame, violation_saved}}
     cached_detections = [] # Reused between detection frames
@@ -384,13 +477,13 @@ def video_producer(
     # -----------------------------------------------------------------------
     def _get_all_detection_views():
         """Union of dress-code views and people-counting views."""
-        dresscode_views = _get_detection_views(source_path)
-        counting_views = get_counting_views(source_path)
+        dresscode_views = _get_detection_views(runtime_key)
+        counting_views = get_counting_views(runtime_key)
         return dresscode_views | counting_views
 
     def _run_counting_for_view(view_key, detections_unscaled, frame_shape):
         """Run people counting on unscaled detections for a specific view."""
-        camera_id = get_counting_camera_id(source_path, view_key)
+        camera_id = get_counting_camera_id(runtime_key, view_key)
         if camera_id is None:
             return None
 
@@ -432,7 +525,7 @@ def video_producer(
     # -----------------------------------------------------------------------
     while True:
         if stop_event.is_set():
-            print(f"[Producer] Stop requested for {source_path}")
+            print(f"[Producer] Stop requested for runtime_key={runtime_key}, source={source_path}")
             break
 
         loop_start = time.time()
@@ -443,6 +536,12 @@ def video_producer(
             if source_meta.get("is_uploaded_source") and source_meta.get("is_file_source"):
                 print(f"[Producer] EOF reached, stopping uploaded source: {source_path}")
                 break
+
+            if source_meta.get("is_rtsp_source"):
+                cap.release()
+                time.sleep(0.5)
+                cap = _open_video_capture(source_path, source_meta)
+                continue
 
             # Non-upload/live source: transient read failure, keep retrying.
             time.sleep(0.1)
@@ -480,14 +579,14 @@ def video_producer(
                 view_detections = {}  # key -> scaled detections list
 
                 view_counting_data = {}  # key -> counting_data dict
+                all_views = _get_all_detection_views()
+                dresscode_views = _get_detection_views(runtime_key)
 
                 for key, img in processed_frames.items():
                     try:
                         orig_h, orig_w = img.shape[:2]
 
                         # Run detection on target views only, respecting stride
-                        all_views = _get_all_detection_views()
-                        dresscode_views = _get_detection_views(source_path)
                         if run_detection_this_frame and key in all_views:
                             # Skip dress code classification if only counting needs this view
                             only_counting = key not in dresscode_views
@@ -497,7 +596,7 @@ def video_producer(
                             )
                             # Check policy for violations & save snapshots
                             detections = _apply_policy_and_save(
-                                detections, track_state, img, source_path, view_key=key
+                                detections, track_state, img, runtime_key, source_path, view_key=key
                             )
 
                             # Run people counting on unscaled detections
@@ -539,6 +638,7 @@ def video_producer(
                     print(
                         f"[Perf] Fisheye: {fisheye_ms:.1f}ms | Detect+Encode: {detect_encode_ms:.1f}ms"
                         f" | Total: {total_ms:.1f}ms | FPS: {current_real_fps:.1f}"
+                        f" | RuntimeKey: {runtime_key}"
                     )
 
             except Exception as e:
@@ -549,7 +649,7 @@ def video_producer(
             try:
                 orig_h, orig_w = frame.shape[:2]
                 all_views = _get_all_detection_views()
-                dresscode_views = _get_detection_views(source_path)
+                dresscode_views = _get_detection_views(runtime_key)
 
                 if run_detection_this_frame and "original" in all_views:
                     # Skip dress code classification if only counting needs this view
@@ -559,7 +659,7 @@ def video_producer(
                         skip_classification=only_counting,
                     )
                     detections = _apply_policy_and_save(
-                        detections, track_state, frame, source_path, view_key="original"
+                        detections, track_state, frame, runtime_key, source_path, view_key="original"
                     )
 
                     # Run people counting on unscaled detections
@@ -583,7 +683,7 @@ def video_producer(
                 print(f"[Producer] Normal video error: {e}")
 
         # Update global buffer (atomic assignment)
-        FRAME_BUFFERS[source_path] = current_buffer
+        FRAME_BUFFERS[runtime_key] = current_buffer
 
         # --- Timing control ---
         elapsed = time.time() - loop_start
@@ -592,8 +692,8 @@ def video_producer(
             time.sleep(wait)
 
     cap.release()
-    _cleanup_producer_state(source_path, clear_frame_buffer=True)
-    print(f"[Producer] Stopped loop for {source_path}")
+    _cleanup_producer_state(runtime_key, clear_frame_buffer=True)
+    print(f"[Producer] Stopped loop for runtime_key={runtime_key}, source={source_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -604,8 +704,8 @@ _current_policy = {
     "enabled_camera_ids": [],
     "restricted_labels": ["shorts"],
     "confidence_threshold": 0.8,
-    "detection_map": {},       # source_path -> set of view_keys
-    "camera_id_map": {},       # "source_path||view_key" -> camera_id
+    "detection_map": {},       # runtime_key -> set of view_keys
+    "camera_id_map": {},       # "runtime_key||view_key" -> camera_id
 }
 _policy_lock = threading.Lock()
 
@@ -624,21 +724,21 @@ def get_policy() -> dict:
         return dict(_current_policy)
 
 
-def _get_detection_views(source_path: str) -> set:
-    """Get set of view keys that should run detection for a specific source."""
+def _get_detection_views(runtime_key: str) -> set:
+    """Get set of view keys that should run detection for a specific runtime key."""
     p = get_policy()
     detection_map = p.get("detection_map", {})
-    return detection_map.get(source_path, set())
+    return detection_map.get(runtime_key, set())
 
 
-def _get_camera_id(source_path: str, view_key: str) -> str | None:
-    """Resolve the camera_id for a specific source + view."""
+def _get_camera_id(runtime_key: str, view_key: str) -> str | None:
+    """Resolve the camera_id for a specific runtime key + view."""
     p = get_policy()
     camera_id_map = p.get("camera_id_map", {})
-    return camera_id_map.get(f"{source_path}||{view_key}")
+    return camera_id_map.get(f"{runtime_key}||{view_key}")
 
 
-def _apply_policy_and_save(detections, track_state, frame, source_path, view_key=None):
+def _apply_policy_and_save(detections, track_state, frame, runtime_key, source_path, view_key=None):
     """
     Apply the current policy to mark violations and save snapshot evidence.
     Deduplicates by track_id (one snapshot per track).
@@ -647,8 +747,8 @@ def _apply_policy_and_save(detections, track_state, frame, source_path, view_key
     restricted = set(policy.get("restricted_labels", []))
     threshold = policy.get("confidence_threshold", 0.8)
 
-    # Resolve camera_id from the source_path + view_key
-    camera_id = _get_camera_id(source_path, view_key) if view_key else None
+    # Resolve camera_id from the runtime key + view key
+    camera_id = _get_camera_id(runtime_key, view_key) if view_key else None
 
     for det in detections:
         label = det.get("label")

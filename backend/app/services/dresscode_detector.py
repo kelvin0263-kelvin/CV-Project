@@ -9,6 +9,8 @@ The cropping logic mirrors scripts/prepare_training_data.py exactly
 so that inference matches the training data distribution.
 """
 
+import os
+
 import numpy as np
 import cv2
 from ultralytics import YOLO
@@ -16,9 +18,12 @@ from ultralytics import YOLO
 # ---------------------------------------------------------------------------
 # Load classification model once at module level
 # ---------------------------------------------------------------------------
-print("[System] Loading Dress Code Classification Model (best.pt)...")
+BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DRESSCODE_MODEL_PATH = os.getenv("DRESSCODE_MODEL_PATH", os.path.join(BACKEND_ROOT, "best.pt"))
+
+print(f"[System] Loading Dress Code Classification Model ({DRESSCODE_MODEL_PATH})...")
 try:
-    dresscode_model = YOLO("best.pt")
+    dresscode_model = YOLO(DRESSCODE_MODEL_PATH)
     dresscode_class_names = dresscode_model.names  # e.g. {0: 'long_pants', 1: 'shorts'}
     print(f"[System] Dress code model loaded. Classes: {dresscode_class_names}")
 except Exception as e:
@@ -88,7 +93,7 @@ def crop_lower_body(frame: np.ndarray, bbox, keypoints=None) -> tuple:
     return crop, (nx1, ny1, nx2, ny2)
 
 
-def classify_lower_body(frame: np.ndarray, bbox, keypoints=None, device='0') -> dict | None:
+def classify_lower_body(frame: np.ndarray, bbox, keypoints=None, device: str | None = None) -> dict | None:
     """
     Crop the lower body and classify it using best.pt.
 
@@ -118,11 +123,13 @@ def classify_lower_body(frame: np.ndarray, bbox, keypoints=None, device='0') -> 
         return None
 
     try:
-        results = dresscode_model(
-            crop,
-            verbose=False,
-            device=device,
-        )
+        classify_kwargs = {
+            "verbose": False,
+        }
+        if device:
+            classify_kwargs["device"] = device
+
+        results = dresscode_model(crop, **classify_kwargs)
 
         if not results or len(results) == 0:
             return None

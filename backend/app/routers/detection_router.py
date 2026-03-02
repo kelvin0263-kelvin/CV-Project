@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 
 from app.core.database import get_db, AsyncSessionLocal
+from app.models.camera_model import Camera
 from app.models.detection_event import DetectionEvent
 from app.schemas.detection_event import DetectionEventRead
 from app.services.video_processor import drain_violation_queue
@@ -101,6 +102,13 @@ async def violation_persistence_loop():
 
             try:
                 async with AsyncSessionLocal() as session:
+                    camera_exists = await session.scalar(
+                        select(Camera.id).where(Camera.id == camera_id).limit(1)
+                    )
+                    if camera_exists is None:
+                        print(f"[DB] Dropping event {evt['id']}: camera_id {camera_id} no longer exists")
+                        continue
+
                     # Build details dict based on event type
                     event_type = evt.get("event_type", "Dress Code Violation")
                     if event_type == "Capacity Exceeded":

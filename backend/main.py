@@ -1,4 +1,5 @@
 import asyncio
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -10,6 +11,7 @@ from app.routers import camera_router
 from app.routers import policy_router
 from app.routers import detection_router
 from app.routers import counting_router
+from app.services.video_processor import stop_all_producer_threads
 
 
 @asynccontextmanager
@@ -45,6 +47,9 @@ async def lifespan(app: FastAPI):
     # Cleanup
     task.cancel()
     snapshot_task.cancel()
+    still_running = await asyncio.to_thread(stop_all_producer_threads, 2.0)
+    if still_running:
+        print(f"[Shutdown] Producer threads still running: {still_running}")
 
 
 # Initialize App
@@ -67,10 +72,12 @@ app.include_router(counting_router.router)
 
 if __name__ == "__main__":
     import uvicorn
+
+    reload_enabled = os.getenv("UVICORN_RELOAD", "").strip().lower() in {"1", "true", "yes", "on"}
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
+        reload=reload_enabled,
         timeout_keep_alive=300,  # Keep connections alive longer for large uploads
     )
