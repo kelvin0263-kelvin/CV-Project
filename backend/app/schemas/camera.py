@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 
 
@@ -36,6 +36,7 @@ class CameraRead(BaseModel):
     source_path: Optional[str] = None
     view_index: int = -1
     is_fisheye: bool = False
+    analysis_tags: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
 

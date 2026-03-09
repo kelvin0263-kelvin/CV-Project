@@ -5,7 +5,7 @@ from datetime import datetime
 
 class DetectionEventCreate(BaseModel):
     """Schema for creating a detection event."""
-    camera_id: str
+    camera_id: Optional[str] = None
     event_type: str
     details: Optional[dict[str, Any]] = None
 
@@ -13,7 +13,8 @@ class DetectionEventCreate(BaseModel):
 class DetectionEventRead(BaseModel):
     """Schema for reading a detection event (API response)."""
     id: str
-    camera_id: str
+    camera_id: Optional[str] = None
+    camera_name: Optional[str] = None
     event_type: str
     timestamp: datetime
     details: Optional[dict[str, Any]] = None

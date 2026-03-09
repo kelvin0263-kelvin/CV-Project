@@ -9,12 +9,22 @@ import cv2
 
 from pydantic import BaseModel
 
+from app.core.video_capture import open_video_capture
 from app.models.camera_model import Camera
+from app.models.dresscode_policy import DressCodePolicy
+from app.models.people_counting_config import PeopleCountingConfig
 from app.models.stream_config import StreamConfig
 from app.schemas.camera import CameraCreate, CameraRead
 from app.core.database import get_db, AsyncSessionLocal
 from app.core.globals import FRAME_BUFFERS
 from app.services.video_processor import start_producer_thread, stop_producer_thread
+from app.services.upload_sync import (
+    discard_pending_runtime_key,
+    is_pending_runtime_key,
+    list_sync_groups,
+    register_pending_upload,
+    start_sync_group,
+)
 from app.routers.policy_router import sync_policy_runtime_from_db
 from app.routers.counting_router import sync_counting_runtime_from_db
 
@@ -34,9 +44,6 @@ except ValueError:
     WS_MAX_FPS = 30.0
 WS_SEND_INTERVAL = 0.0 if WS_MAX_FPS <= 0 else 1.0 / WS_MAX_FPS
 
-RTSP_OPEN_TIMEOUT_MS = 5000
-RTSP_READ_TIMEOUT_MS = 5000
-
 
 class RTSPConnectionTestRequest(BaseModel):
     source_path: str
@@ -46,7 +53,7 @@ class RTSPSourceCreateRequest(BaseModel):
     name: str
     location: str = ""
     source_path: str
-    mode: str = "People Counting"
+    mode: str = "Unassigned"
     resolution: str = "640x360"
     fps: int = 30
     enabled: bool = True
@@ -76,7 +83,11 @@ async def _sync_runtime_state(db: AsyncSession):
     await sync_counting_runtime_from_db(db)
 
 
-def _build_camera_read(camera: Camera, stream_config: StreamConfig | None = None) -> CameraRead:
+def _build_camera_read(
+    camera: Camera,
+    stream_config: StreamConfig | None = None,
+    analysis_tags: list[str] | None = None,
+) -> CameraRead:
     return CameraRead(
         id=camera.id,
         name=camera.name,
@@ -92,7 +103,41 @@ def _build_camera_read(camera: Camera, stream_config: StreamConfig | None = None
         source_path=stream_config.source_path if stream_config is not None else None,
         view_index=stream_config.view_index if stream_config is not None else -1,
         is_fisheye=bool(stream_config.is_fisheye) if stream_config is not None else False,
+        analysis_tags=analysis_tags or [],
     )
+
+
+async def _derive_analysis_tags_by_camera(
+    session: AsyncSession,
+    camera_ids: list[str],
+) -> dict[str, list[str]]:
+    if not camera_ids:
+        return {}
+
+    tags_map: dict[str, list[str]] = {camera_id: [] for camera_id in camera_ids}
+
+    counting_result = await session.execute(
+        select(PeopleCountingConfig.camera_id).where(
+            PeopleCountingConfig.camera_id.in_(camera_ids),
+            PeopleCountingConfig.enabled.is_(True),
+        )
+    )
+    for camera_id in set(counting_result.scalars().all()):
+        tags_map.setdefault(camera_id, []).append("People Counting")
+
+    policy_result = await session.execute(select(DressCodePolicy).limit(1))
+    policy = policy_result.scalar_one_or_none()
+    if policy is not None and policy.enabled:
+        enabled_dress_ids = set(policy.enabled_camera_ids or [])
+        for camera_id in camera_ids:
+            if camera_id in enabled_dress_ids:
+                tags_map[camera_id].append("Dress Code")
+
+    for camera_id in camera_ids:
+        if not tags_map[camera_id]:
+            tags_map[camera_id].append("Unassigned")
+
+    return tags_map
 
 
 async def _get_stream_config(session: AsyncSession, camera_id: str) -> StreamConfig | None:
@@ -126,6 +171,8 @@ async def _get_active_views_for_runtime(
 
 async def _ensure_stream_running(session: AsyncSession, stream_config: StreamConfig):
     runtime_key = _get_runtime_key(stream_config)
+    if is_pending_runtime_key(runtime_key):
+        return
     active_views = await _get_active_views_for_runtime(
         session,
         runtime_key,
@@ -196,14 +243,7 @@ async def _create_camera_with_stream(
 
 
 def _open_probe_capture(source_path: str) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(source_path)
-    if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
-        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, RTSP_OPEN_TIMEOUT_MS)
-    if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
-        cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, RTSP_READ_TIMEOUT_MS)
-    return cap
+    return open_video_capture(source_path, is_rtsp=True)
 
 
 def _probe_rtsp_stream(source_path: str) -> dict:
@@ -304,7 +344,16 @@ async def get_cameras(db: AsyncSession = Depends(get_db)):
         select(Camera, StreamConfig).outerjoin(StreamConfig, StreamConfig.camera_id == Camera.id)
     )
     rows = result.all()
-    return [_build_camera_read(camera, stream_config) for camera, stream_config in rows]
+    camera_ids = [camera.id for camera, _ in rows]
+    tags_map = await _derive_analysis_tags_by_camera(db, camera_ids)
+    return [
+        _build_camera_read(
+            camera,
+            stream_config,
+            analysis_tags=tags_map.get(camera.id, ["Unassigned"]),
+        )
+        for camera, stream_config in rows
+    ]
 
 
 @router.post("/api/cameras", response_model=CameraRead)
@@ -521,11 +570,35 @@ async def delete_camera(camera_id: str, db: AsyncSession = Depends(get_db)):
 
     # Stop producer for any runtime group that no longer has cameras bound to it.
     for runtime_key in runtime_keys:
+        discard_pending_runtime_key(runtime_key)
         await _stop_producer_if_unused(db, runtime_key)
 
     await _sync_runtime_state(db)
 
     return {"status": "deleted"}
+
+
+@router.get("/api/upload-sync-groups")
+async def get_upload_sync_groups():
+    return {
+        "groups": list_sync_groups(),
+    }
+
+
+@router.post("/api/upload-sync-groups/{group_id}/start")
+async def start_upload_sync_group(group_id: str):
+    try:
+        result = start_sync_group(group_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if result["started_sources"] <= 0:
+        raise HTTPException(status_code=404, detail="No pending uploaded videos found for this sync group.")
+
+    return {
+        "status": "started",
+        **result,
+    }
 
 
 @router.post("/api/upload_and_process")
@@ -534,9 +607,14 @@ async def upload_video(
     enable_fisheye: bool = Form(False),
     camera_name_prefix: str = Form("Camera"),
     selected_views: str = Form(""),  # Comma separated indices, e.g. "0,2,4"
+    sync_start: bool = Form(False),
+    sync_group_id: str = Form(""),
     db: AsyncSession = Depends(get_db),
 ):
     try:
+        if sync_start and not sync_group_id.strip():
+            raise HTTPException(status_code=400, detail="sync_group_id is required when sync_start is enabled.")
+
         file_id = str(uuid.uuid4())[:8]
         filename = f"{file_id}_{file.filename}"
         input_path = os.path.join(UPLOAD_DIR, filename)
@@ -567,8 +645,18 @@ async def upload_video(
                 f"{input_path}#group={uuid.uuid4()}",
             )
 
-        # Start the Producer Thread IMMEDIATELY
-        start_producer_thread(runtime_key, input_path, enable_fisheye, active_view_indices)
+        if sync_start:
+            pending_count = register_pending_upload(
+                sync_group_id,
+                runtime_key=runtime_key,
+                source_path=input_path,
+                is_fisheye=enable_fisheye,
+                active_views=active_view_indices,
+            )
+        else:
+            pending_count = 0
+            # Start the Producer Thread IMMEDIATELY
+            start_producer_thread(runtime_key, input_path, enable_fisheye, active_view_indices)
 
         # Helper to create camera + stream_config in DB
         async def create_cam(suffix: str, view_idx: int) -> CameraRead:
@@ -579,8 +667,8 @@ async def upload_video(
                 name=f"{camera_name_prefix} - {suffix}" if suffix else camera_name_prefix,
                 location="Uploaded Video",
                 type="Fisheye" if enable_fisheye else "File",
-                status="Online",
-                mode="People Counting",
+                status="Pending Sync Start" if sync_start else "Online",
+                mode="Unassigned",
                 ws_url=_default_ws_url(cam_id),
                 resolution="640x360",
                 fps=30,
@@ -617,8 +705,13 @@ async def upload_video(
         return {
             "status": "success",
             "created_cameras": new_cameras,
+            "sync_start": sync_start,
+            "sync_group_id": sync_group_id.strip() if sync_start else None,
+            "pending_sources": pending_count,
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))

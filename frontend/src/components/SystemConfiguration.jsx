@@ -22,6 +22,11 @@ const SystemConfiguration = () => {
     // File Upload State
     const [selectedFile, setSelectedFile] = useState(null);
     const [enableFisheye, setEnableFisheye] = useState(false);
+    const [syncStart, setSyncStart] = useState(false);
+    const [syncGroupId, setSyncGroupId] = useState('test-group');
+    const [syncGroups, setSyncGroups] = useState([]);
+    const [uploadMessage, setUploadMessage] = useState(null);
+    const [startingSyncGroup, setStartingSyncGroup] = useState(false);
     // Default to all 8 views selected
     const [selectedViews, setSelectedViews] = useState(new Set([0, 1, 2, 3, 4, 5, 6, 7]));
 
@@ -30,7 +35,6 @@ const SystemConfiguration = () => {
         name: '',
         location: '',
         rtspUrl: '',
-        analysisMode: 'People Counting',
         frameRate: '30',
         resolution: '1080p',
         enabled: true,
@@ -38,6 +42,7 @@ const SystemConfiguration = () => {
 
     useEffect(() => {
         fetchCameras();
+        fetchSyncGroups();
     }, []);
 
     const fetchCameras = async () => {
@@ -51,12 +56,22 @@ const SystemConfiguration = () => {
         }
     };
 
+    const fetchSyncGroups = async () => {
+        try {
+            const res = await fetch(`${apiUrl}/api/upload-sync-groups`);
+            if (!res.ok) return;
+            const data = await res.json();
+            setSyncGroups(data.groups || []);
+        } catch (error) {
+            console.error("Failed to fetch sync groups:", error);
+        }
+    };
+
     const resetForm = () => {
         setFormData({
             name: '',
             location: '',
             rtspUrl: '',
-            analysisMode: 'People Counting',
             frameRate: '30',
             resolution: '1080p',
             enabled: true,
@@ -67,6 +82,9 @@ const SystemConfiguration = () => {
         setShowUpload(false);
         setSelectedFile(null);
         setEnableFisheye(false);
+        setSyncStart(false);
+        setSyncGroupId('test-group');
+        setUploadMessage(null);
         setSelectedViews(new Set([0, 1, 2, 3, 4, 5, 6, 7]));
         setTestResult(null);
     };
@@ -81,7 +99,6 @@ const SystemConfiguration = () => {
             name: cam.name,
             location: cam.location,
             rtspUrl: cam.source_path || '',
-            analysisMode: cam.mode,
             frameRate: String(cam.fps ?? 30),
             resolution: cam.resolution,
             enabled: cam.enabled,
@@ -122,6 +139,7 @@ const SystemConfiguration = () => {
             if (!selectedFile) return alert("Please select a file");
 
             setIsUploading(true);
+            setUploadMessage(null);
             const uploadData = new FormData();
             uploadData.append('file', selectedFile);
             uploadData.append('enable_fisheye', enableFisheye);
@@ -131,8 +149,15 @@ const SystemConfiguration = () => {
                 uploadData.append('selected_views', views);
             }
             uploadData.append('camera_name_prefix', formData.name || 'Uploaded Camera');
+            uploadData.append('sync_start', syncStart);
+            if (syncStart) {
+                uploadData.append('sync_group_id', syncGroupId.trim());
+            }
 
             try {
+                if (syncStart && !syncGroupId.trim()) {
+                    throw new Error("Please enter a sync group ID.");
+                }
                 // Large files need a generous timeout (10 minutes)
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 10 * 60 * 1000);
@@ -146,9 +171,21 @@ const SystemConfiguration = () => {
                 const data = await res.json();
                 console.log("Upload success:", data);
                 await fetchCameras(); // Refresh list
-                resetForm();
+                await fetchSyncGroups();
+                if (syncStart) {
+                    setSelectedFile(null);
+                    setUploadMessage({
+                        type: 'success',
+                        text: `Uploaded to sync group "${data.sync_group_id}". Pending sources: ${data.pending_sources}.`,
+                    });
+                } else {
+                    resetForm();
+                }
             } catch (err) {
-                alert("Error Uploading: " + err.message);
+                setUploadMessage({
+                    type: 'error',
+                    text: `Error Uploading: ${err.message}`,
+                });
             } finally {
                 setIsUploading(false);
             }
@@ -162,7 +199,7 @@ const SystemConfiguration = () => {
             location: formData.location,
             type: 'RTSP',
             status: formData.enabled ? 'Online' : 'Disabled',
-            mode: formData.analysisMode,
+            mode: selectedCamera?.mode || 'Unassigned',
             source_path: formData.rtspUrl.trim(),
             resolution: formData.resolution,
             fps: parseInt(formData.frameRate, 10) || 30,
@@ -191,7 +228,7 @@ const SystemConfiguration = () => {
                         name: formData.name,
                         location: formData.location,
                         source_path: payload.source_path,
-                        mode: formData.analysisMode,
+                        mode: payload.mode,
                         resolution: formData.resolution,
                         fps: payload.fps,
                         enabled: formData.enabled,
@@ -293,6 +330,41 @@ const SystemConfiguration = () => {
     const isStreamSource = (cam) =>
         cam.type.includes('RTSP') || cam.type.includes('File') || cam.type.includes('Fisheye');
 
+    const handleStartSyncGroup = async () => {
+        if (!syncGroupId.trim()) {
+            setUploadMessage({ type: 'error', text: 'Please enter a sync group ID.' });
+            return;
+        }
+
+        setStartingSyncGroup(true);
+        setUploadMessage(null);
+        try {
+            const res = await fetch(`${apiUrl}/api/upload-sync-groups/${encodeURIComponent(syncGroupId.trim())}/start`, {
+                method: 'POST',
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                throw new Error(data.detail || 'Failed to start sync group.');
+            }
+
+            await fetchCameras();
+            await fetchSyncGroups();
+            setUploadMessage({
+                type: 'success',
+                text: `Started ${data.started_sources} source(s) in sync group "${data.group_id}".`,
+            });
+        } catch (err) {
+            setUploadMessage({
+                type: 'error',
+                text: err.message || 'Failed to start sync group.',
+            });
+        } finally {
+            setStartingSyncGroup(false);
+        }
+    };
+
+    const currentSyncGroup = syncGroups.find((group) => group.group_id === syncGroupId.trim());
+
 
     return (
         <div className="flex flex-col h-full bg-background text-foreground">
@@ -356,7 +428,17 @@ const SystemConfiguration = () => {
                                             {cam.location || cam.source_path || 'No location configured'}
                                         </p>
                                         <div className="mt-3 flex flex-wrap gap-2">
-                                            <span className="text-xs px-2 py-1 bg-secondary rounded-full">{cam.mode}</span>
+                                            {(Array.isArray(cam.analysis_tags) && cam.analysis_tags.length > 0
+                                                ? cam.analysis_tags
+                                                : ['Unassigned']
+                                            ).map((tag) => (
+                                                <span
+                                                    key={`${cam.id}-${tag}`}
+                                                    className="text-xs px-2 py-1 bg-secondary rounded-full"
+                                                >
+                                                    {tag}
+                                                </span>
+                                            ))}
                                         </div>
                                     </CardContent>
                                 </Card>
@@ -430,6 +512,50 @@ const SystemConfiguration = () => {
                                                 <Label htmlFor="fisheye">Enable Fisheye Processing (Generates 8 Views)</Label>
                                             </div>
 
+                                            <div className="space-y-3 rounded-lg border p-3 bg-background/60">
+                                                <div className="flex items-center space-x-2">
+                                                    <Checkbox
+                                                        id="sync-start"
+                                                        checked={syncStart}
+                                                        onCheckedChange={setSyncStart}
+                                                    />
+                                                    <Label htmlFor="sync-start">Synchronize start for uploaded videos</Label>
+                                                </div>
+                                                {syncStart && (
+                                                    <>
+                                                        <div className="space-y-2">
+                                                            <Label htmlFor="sync-group-id">Sync Group ID</Label>
+                                                            <input
+                                                                id="sync-group-id"
+                                                                type="text"
+                                                                value={syncGroupId}
+                                                                onChange={(e) => setSyncGroupId(e.target.value)}
+                                                                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                                                placeholder="test-group"
+                                                            />
+                                                        </div>
+                                                        <div className="flex items-center justify-between rounded-md border p-2 text-xs text-muted-foreground">
+                                                            <span>Pending sources in this group</span>
+                                                            <span className="font-medium text-foreground">
+                                                                {currentSyncGroup?.pending_sources ?? 0}
+                                                            </span>
+                                                        </div>
+                                                        <Button
+                                                            type="button"
+                                                            variant="secondary"
+                                                            onClick={handleStartSyncGroup}
+                                                            disabled={startingSyncGroup || isUploading}
+                                                            className="w-full"
+                                                        >
+                                                            {startingSyncGroup ? 'Starting Sync Group...' : 'Start Sync Group'}
+                                                        </Button>
+                                                        <p className="text-xs text-muted-foreground">
+                                                            Upload multiple files with the same group ID, then start them together.
+                                                        </p>
+                                                    </>
+                                                )}
+                                            </div>
+
                                             {enableFisheye && (
                                                 <div className="space-y-4">
                                                     <Label>Select Enabled Views</Label>
@@ -458,6 +584,17 @@ const SystemConfiguration = () => {
                                                     <p className="text-xs text-muted-foreground">
                                                         Only selected views will be processed and displayed.
                                                     </p>
+                                                </div>
+                                            )}
+
+                                            {uploadMessage && (
+                                                <div className={cn(
+                                                    "rounded-md border px-3 py-2 text-sm",
+                                                    uploadMessage.type === 'success'
+                                                        ? "border-green-500/30 bg-green-500/10 text-green-600"
+                                                        : "border-red-500/30 bg-red-500/10 text-red-600"
+                                                )}>
+                                                    {uploadMessage.text}
                                                 </div>
                                             )}
                                         </div>
@@ -532,22 +669,9 @@ const SystemConfiguration = () => {
                                         </>
                                     )}
 
-                                    {/* Common Settings */}
-                                    <div className="grid grid-cols-2 gap-4">
-                                        <div className="space-y-2">
-                                            <Label>Analysis Mode</Label>
-                                            <select
-                                                name="analysisMode"
-                                                value={formData.analysisMode}
-                                                onChange={handleInputChange}
-                                                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                                            >
-                                                <option>People Counting</option>
-                                                <option>Dress Code</option>
-                                                <option>Fall Detection</option>
-                                            </select>
-                                        </div>
-                                    </div>
+                                    <p className="text-xs text-muted-foreground">
+                                        Analysis tags are assigned from the People Counting and Dress Code pages.
+                                    </p>
 
                                     {/* Footer Actions */}
                                     <div className="flex justify-end gap-2 pt-4">

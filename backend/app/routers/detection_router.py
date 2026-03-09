@@ -96,23 +96,30 @@ async def violation_persistence_loop():
 
         for evt in events:
             camera_id = evt.get("camera_id")
-            if not camera_id:
+            scope = evt.get("scope")
+            if not camera_id and scope != "building":
                 print(f"[DB] Skipping event {evt['id']}: no camera_id resolved")
                 continue
 
             try:
                 async with AsyncSessionLocal() as session:
-                    camera_exists = await session.scalar(
-                        select(Camera.id).where(Camera.id == camera_id).limit(1)
-                    )
-                    if camera_exists is None:
-                        print(f"[DB] Dropping event {evt['id']}: camera_id {camera_id} no longer exists")
-                        continue
+                    camera_name = evt.get("camera_name")
+                    if camera_id:
+                        camera_row = await session.execute(
+                            select(Camera.id, Camera.name).where(Camera.id == camera_id).limit(1)
+                        )
+                        camera_record = camera_row.first()
+                        if camera_record is not None:
+                            camera_id = camera_record.id
+                            camera_name = camera_record.name
+                        else:
+                            camera_name = camera_name or camera_id
 
                     # Build details dict based on event type
                     event_type = evt.get("event_type", "Dress Code Violation")
                     if event_type == "Capacity Exceeded":
                         details = {
+                            "scope": scope or "camera",
                             "occupancy": evt.get("occupancy"),
                             "max_capacity": evt.get("max_capacity"),
                         }
@@ -129,6 +136,7 @@ async def violation_persistence_loop():
                     db_event = DetectionEvent(
                         id=evt["id"],
                         camera_id=camera_id,
+                        camera_name=camera_name,
                         event_type=event_type,
                         details=details,
                     )

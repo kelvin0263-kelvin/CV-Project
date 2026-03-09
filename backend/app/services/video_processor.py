@@ -1,7 +1,7 @@
 """
 Video Producer Service
 
-Reads video frames, runs YOLO-Pose tracking (ByteTrack), classifies
+Reads video frames, runs YOLO-Pose tracking (BoT-SORT), classifies
 lower-body clothing via dresscode_detector, and streams clean frames
 + detection metadata to FRAME_BUFFERS for WebSocket consumption.
 """
@@ -13,12 +13,17 @@ import base64
 import sys
 import os
 import uuid
+import queue
+import hashlib
+import re
+import subprocess
 import numpy as np
 
 # Ensure backend root is in path to import DefishVideoCV
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from DefishVideoCV import FisheyeMultiView
+from app.core.video_capture import is_rtsp_source, open_video_capture
 from app.core.globals import (
     FRAME_BUFFERS,
     PRODUCER_THREADS,
@@ -27,10 +32,14 @@ from app.core.globals import (
     PRODUCER_LOCK,
 )
 from ultralytics import YOLO
+from ultralytics.trackers.track import TRACKER_MAP
 from turbojpeg import TurboJPEG
-from app.services.dresscode_detector import classify_lower_body, crop_full_person
+from ultralytics.utils import IterableSimpleNamespace, YAML
+from app.services.dresscode_detector import classify_lower_body_batch, crop_full_person
+from app.services.building_counter import ingest_sensor_events
 from app.services.people_counter import PeopleCounter
 from app.routers.counting_router import (
+    consume_counting_reset,
     get_counting_views,
     get_counting_camera_id,
     get_counting_config,
@@ -49,17 +58,65 @@ os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
 
 # Fixed runtime tuning for the current project.
-POSE_MODEL_PATH = os.path.join(BACKEND_ROOT, "yolo26m-pose.pt")
+POSE_MODEL_PATH = os.path.join(BACKEND_ROOT, "yolo26n-pose.pt")
 TRACKER_CONFIG_PATH = os.getenv(
     "TRACKER_CONFIG_PATH",
-    os.path.join(BACKEND_ROOT, "bytetrack_custom.yaml"),
+    os.path.join(BACKEND_ROOT, "botsort_custom.yaml"),
 )
 YOLO_DEVICE = os.getenv("YOLO_DEVICE")
-POSE_TRACK_IMGSZ = 960
-DETECTION_STRIDE = 4
-RTSP_SCHEMES = ("rtsp://", "rtsps://")
-RTSP_OPEN_TIMEOUT_MS = 5000
-RTSP_READ_TIMEOUT_MS = 5000
+
+
+def _get_env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_env_str(name: str, default: str) -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    return value or default
+
+
+POSE_TRACK_IMGSZ = max(320, _get_env_int("POSE_TRACK_IMGSZ", 736))
+DETECTION_STRIDE = max(1, _get_env_int("DETECTION_STRIDE", 4))
+COUNTING_SNAPSHOT_HEARTBEAT_SEC = max(60, _get_env_int("COUNTING_SNAPSHOT_HEARTBEAT_SEC", 300))
+DRESSCODE_RECLASSIFY_FRAMES = max(1, _get_env_int("DRESSCODE_RECLASSIFY_FRAMES", 30))
+PERF_LOG_INTERVAL_FRAMES = max(1, _get_env_int("PERF_LOG_INTERVAL_FRAMES", 30))
+PERF_STAGE_LOGS = _get_env_bool("PERF_STAGE_LOGS", True)
+MULTI_STREAM_BATCH_INFER = _get_env_bool("MULTI_STREAM_BATCH_INFER", True)
+BATCH_INFER_WINDOW_MS = max(1, _get_env_int("BATCH_INFER_WINDOW_MS", 5))
+BATCH_INFER_MAX_BATCH = max(1, _get_env_int("BATCH_INFER_MAX_BATCH", 8))
+BATCH_INFER_WAIT_MS = max(50, _get_env_int("BATCH_INFER_WAIT_MS", 1500))
+RTSP_MAX_CONSECUTIVE_READ_FAILURES = max(1, _get_env_int("RTSP_MAX_CONSECUTIVE_READ_FAILURES", 5))
+RTSP_READ_FAILURE_BACKOFF_MS = max(0, _get_env_int("RTSP_READ_FAILURE_BACKOFF_MS", 100))
+NVENC_OUTPUT_ENABLED = _get_env_bool("NVENC_OUTPUT_ENABLED", False)
+NVENC_OUTPUT_DIR = _get_env_str(
+    "NVENC_OUTPUT_DIR",
+    os.path.join(PROJECT_ROOT, "temp_video_uploads", "nvenc_outputs"),
+)
+NVENC_OUTPUT_CONTAINER = _get_env_str("NVENC_OUTPUT_CONTAINER", "mp4").lower()
+NVENC_CODEC = _get_env_str("NVENC_CODEC", "h264_nvenc")
+NVENC_PRESET = _get_env_str("NVENC_PRESET", "p4")
+NVENC_TUNE = _get_env_str("NVENC_TUNE", "ll")
+NVENC_RATE_CONTROL = _get_env_str("NVENC_RATE_CONTROL", "vbr")
+NVENC_BITRATE_K = max(256, _get_env_int("NVENC_BITRATE_K", 2500))
+NVENC_MAXRATE_K = max(NVENC_BITRATE_K, _get_env_int("NVENC_MAXRATE_K", 3500))
+NVENC_BUFSIZE_K = max(NVENC_MAXRATE_K, _get_env_int("NVENC_BUFSIZE_K", 7000))
+FFMPEG_BIN = _get_env_str("FFMPEG_BIN", "ffmpeg")
 
 # ---------------------------------------------------------------------------
 # Initialize TurboJPEG
@@ -92,7 +149,7 @@ def drain_violation_queue() -> list:
 
 
 def _is_rtsp_source(source_path: str) -> bool:
-    return source_path.strip().lower().startswith(RTSP_SCHEMES)
+    return is_rtsp_source(source_path)
 
 
 def _build_source_meta(source_path: str) -> dict:
@@ -118,15 +175,444 @@ def _build_source_meta(source_path: str) -> dict:
 
 
 def _open_video_capture(source_path: str, source_meta: dict) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(source_path)
-    if source_meta.get("is_rtsp_source"):
-        if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
-            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, RTSP_OPEN_TIMEOUT_MS)
-        if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
-            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, RTSP_READ_TIMEOUT_MS)
-    return cap
+    return open_video_capture(source_path, is_rtsp=bool(source_meta.get("is_rtsp_source")))
+
+
+def _sanitize_token(value: str, fallback: str = "stream") -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", (value or "").strip()).strip("._-")
+    return cleaned or fallback
+
+
+class _NvencOutputWriter:
+    """Optional FFmpeg NVENC sink for processed frames."""
+
+    def __init__(self, runtime_key: str, view_key: str, fps: float):
+        self.runtime_key = runtime_key
+        self.view_key = view_key
+        self.fps = max(1.0, float(fps) if fps else 30.0)
+        self.process: subprocess.Popen | None = None
+        self.width: int | None = None
+        self.height: int | None = None
+        self.output_path: str | None = None
+        self.disabled = False
+
+    def _output_ext(self) -> str:
+        return "mkv" if NVENC_OUTPUT_CONTAINER == "mkv" else "mp4"
+
+    def _build_output_path(self) -> str:
+        os.makedirs(NVENC_OUTPUT_DIR, exist_ok=True)
+        runtime_hash = hashlib.sha1(self.runtime_key.encode("utf-8", errors="ignore")).hexdigest()[:10]
+        view_label = _sanitize_token(self.view_key, fallback="view")[:32]
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        suffix = uuid.uuid4().hex[:6]
+        return os.path.join(NVENC_OUTPUT_DIR, f"{runtime_hash}_{view_label}_{ts}_{suffix}.{self._output_ext()}")
+
+    def _build_cmd(self, width: int, height: int) -> list[str]:
+        cmd = [
+            FFMPEG_BIN,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s:v",
+            f"{width}x{height}",
+            "-r",
+            f"{self.fps:.3f}",
+            "-i",
+            "-",
+            "-an",
+            "-c:v",
+            NVENC_CODEC,
+            "-preset",
+            NVENC_PRESET,
+        ]
+        if NVENC_TUNE:
+            cmd.extend(["-tune", NVENC_TUNE])
+        if NVENC_RATE_CONTROL:
+            cmd.extend(["-rc", NVENC_RATE_CONTROL])
+        cmd.extend(
+            [
+                "-b:v",
+                f"{NVENC_BITRATE_K}k",
+                "-maxrate",
+                f"{NVENC_MAXRATE_K}k",
+                "-bufsize",
+                f"{NVENC_BUFSIZE_K}k",
+                "-pix_fmt",
+                "yuv420p",
+            ]
+        )
+        if self._output_ext() == "mp4":
+            cmd.extend(["-movflags", "+faststart"])
+        cmd.append(self.output_path or self._build_output_path())
+        return cmd
+
+    def _start(self, frame: np.ndarray) -> bool:
+        if self.disabled:
+            return False
+        if frame is None or frame.size == 0:
+            return False
+
+        height, width = frame.shape[:2]
+        if height <= 0 or width <= 0:
+            return False
+
+        self.width = int(width)
+        self.height = int(height)
+        self.output_path = self._build_output_path()
+        cmd = self._build_cmd(self.width, self.height)
+
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(
+                f"[NVENC] Started writer for runtime_key={self.runtime_key}, "
+                f"view={self.view_key}, output={self.output_path}"
+            )
+            return True
+        except FileNotFoundError:
+            print(f"[NVENC] FFmpeg executable not found: {FFMPEG_BIN}")
+        except Exception as e:
+            print(f"[NVENC] Failed to start writer for {self.runtime_key} ({self.view_key}): {e}")
+
+        self.disabled = True
+        self.process = None
+        return False
+
+    def write(self, frame: np.ndarray) -> bool:
+        if self.disabled:
+            return False
+        if frame is None or frame.size == 0:
+            return False
+        if self.process is None and not self._start(frame):
+            return False
+        if self.process is None or self.process.stdin is None:
+            return False
+        if self.process.poll() is not None:
+            self.disabled = True
+            print(
+                f"[NVENC] Writer exited early for runtime_key={self.runtime_key}, "
+                f"view={self.view_key}"
+            )
+            return False
+
+        out = frame
+        if self.width and self.height and (frame.shape[1] != self.width or frame.shape[0] != self.height):
+            out = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
+
+        try:
+            self.process.stdin.write(out.tobytes())
+            return True
+        except Exception as e:
+            print(f"[NVENC] Failed to write frame for {self.runtime_key} ({self.view_key}): {e}")
+            self.close()
+            self.disabled = True
+            return False
+
+    def close(self):
+        proc = self.process
+        self.process = None
+        if proc is None:
+            return
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Shared multi-stream batched inference engine
+# ---------------------------------------------------------------------------
+class _BatchInferenceEngine:
+    def __init__(self):
+        self._req_queue: queue.Queue = queue.Queue()
+        self._trackers: dict[str, object] = {}
+        self._tracker_lock = threading.Lock()
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+
+        tracker_cfg_raw = YAML.load(TRACKER_CONFIG_PATH)
+        self._tracker_cfg = IterableSimpleNamespace(**tracker_cfg_raw)
+        tracker_type = getattr(self._tracker_cfg, "tracker_type", "")
+        if tracker_type not in TRACKER_MAP:
+            raise ValueError(f"Unsupported tracker type: {tracker_type}")
+        self._tracker_cls = TRACKER_MAP[tracker_type]
+
+        print("[BatchInfer] Loading shared YOLO model...")
+        self._model = YOLO(POSE_MODEL_PATH)
+        self._worker.start()
+        print(
+            f"[BatchInfer] Ready: tracker={tracker_type}, window={BATCH_INFER_WINDOW_MS}ms, "
+            f"max_batch={BATCH_INFER_MAX_BATCH}"
+        )
+
+    def _get_tracker(self, stream_id: str):
+        with self._tracker_lock:
+            tracker = self._trackers.get(stream_id)
+            if tracker is None:
+                tracker = self._tracker_cls(args=self._tracker_cfg, frame_rate=30)
+                self._trackers[stream_id] = tracker
+            return tracker
+
+    def infer(
+        self,
+        *,
+        stream_id: str,
+        img: np.ndarray,
+        frame_count: int,
+        track_state: dict,
+        skip_classification: bool,
+    ) -> tuple[list[dict], int, dict, dict]:
+        done = threading.Event()
+        req = {
+            "stream_id": stream_id,
+            "img": img,
+            "frame_count": frame_count,
+            "track_state": track_state,
+            "skip_classification": skip_classification,
+            "done": done,
+            "result": None,
+        }
+        self._req_queue.put(req)
+
+        if not done.wait(timeout=BATCH_INFER_WAIT_MS / 1000.0):
+            return [], 0, track_state, {
+                "detect_ms": 0.0,
+                "detect_total_ms": 0.0,
+                "batch_size": 1,
+                "classify_ms": 0.0,
+                "classify_candidates": 0,
+                "classified": 0,
+            }
+
+        result = req.get("result")
+        if result is None:
+            return [], 0, track_state, {
+                "detect_ms": 0.0,
+                "detect_total_ms": 0.0,
+                "batch_size": 1,
+                "classify_ms": 0.0,
+                "classify_candidates": 0,
+                "classified": 0,
+            }
+        return result
+
+    def _worker_loop(self):
+        batch_window_sec = BATCH_INFER_WINDOW_MS / 1000.0
+
+        while True:
+            first = self._req_queue.get()
+            if first is None:
+                return
+
+            batch = [first]
+            deadline = time.perf_counter() + batch_window_sec
+            while len(batch) < BATCH_INFER_MAX_BATCH:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                try:
+                    item = self._req_queue.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                if item is None:
+                    continue
+                batch.append(item)
+
+            self._process_batch(batch)
+
+    def _process_batch(self, batch: list[dict]):
+        detect_started_at = time.perf_counter()
+        images = [item["img"] for item in batch]
+
+        predict_kwargs = {
+            "source": images,
+            "verbose": False,
+            "classes": [0],
+            "conf": 0.30,
+            "iou": 0.5,
+            "imgsz": POSE_TRACK_IMGSZ,
+        }
+        if YOLO_DEVICE:
+            predict_kwargs["device"] = YOLO_DEVICE
+
+        try:
+            results = self._model.predict(**predict_kwargs)
+        except Exception as e:
+            print(f"[BatchInfer] Predict error: {e}")
+            for req in batch:
+                req["result"] = (
+                    [],
+                    0,
+                    req["track_state"],
+                    {
+                        "detect_ms": 0.0,
+                        "detect_total_ms": 0.0,
+                        "batch_size": len(batch),
+                        "classify_ms": 0.0,
+                        "classify_candidates": 0,
+                        "classified": 0,
+                    },
+                )
+                req["done"].set()
+            return
+
+        detect_ms_total = (time.perf_counter() - detect_started_at) * 1000.0
+        detect_ms_each = detect_ms_total / max(1, len(batch))
+
+        processed = 0
+        for req, result in zip(batch, results):
+            processed += 1
+            detections: list[dict] = []
+            classify_candidates: list[dict] = []
+            classified_count = 0
+            classify_ms = 0.0
+
+            boxes = result.boxes
+            tracker = self._get_tracker(req["stream_id"])
+            if boxes is None:
+                tracked = np.empty((0, 8), dtype=np.float32)
+            else:
+                tracked = tracker.update(boxes.cpu().numpy(), img=req["img"])
+
+            keypoints = None
+            if not req["skip_classification"] and result.keypoints is not None:
+                keypoints = result.keypoints.xy.cpu().numpy()
+
+            track_state = req["track_state"]
+            for row in tracked:
+                x1, y1, x2, y2, tid, _score, _cls, det_idx = row.tolist()
+                track_id = int(tid)
+                det_index = int(det_idx)
+                person_bbox = [float(x1), float(y1), float(x2), float(y2)]
+
+                cls_result = None
+                if not req["skip_classification"]:
+                    cached = track_state.get(track_id)
+                    if cached is not None:
+                        frames_since = req["frame_count"] - cached.get("last_classified_frame", 0)
+                        if (
+                            frames_since < DRESSCODE_RECLASSIFY_FRAMES
+                            and cached.get("label") is not None
+                            and cached.get("confidence") is not None
+                        ):
+                            cls_result = {
+                                "label": cached.get("label"),
+                                "confidence": cached.get("confidence"),
+                                "lower_bbox": cached.get("lower_bbox"),
+                            }
+                    if cls_result is None:
+                        kp_row = None
+                        if keypoints is not None and 0 <= det_index < keypoints.shape[0]:
+                            kp_row = keypoints[det_index]
+                        classify_candidates.append(
+                            {
+                                "det_pos": len(detections),
+                                "track_id": track_id,
+                                "bbox": person_bbox,
+                                "keypoints": kp_row,
+                            }
+                        )
+
+                detections.append(
+                    {
+                        "track_id": track_id,
+                        "person_bbox": person_bbox,
+                        "label": cls_result["label"] if cls_result else None,
+                        "confidence": cls_result["confidence"] if cls_result else None,
+                        "lower_bbox": cls_result["lower_bbox"] if cls_result else None,
+                        "violation": False,
+                    }
+                )
+
+            if not req["skip_classification"] and classify_candidates:
+                classify_started_at = time.perf_counter()
+                batch_results = classify_lower_body_batch(
+                    req["img"],
+                    [{"bbox": item["bbox"], "keypoints": item["keypoints"]} for item in classify_candidates],
+                    device=YOLO_DEVICE,
+                )
+                classify_ms = (time.perf_counter() - classify_started_at) * 1000.0
+
+                for cand, cls_result in zip(classify_candidates, batch_results):
+                    if cls_result is None:
+                        continue
+                    det = detections[cand["det_pos"]]
+                    det["label"] = cls_result["label"]
+                    det["confidence"] = cls_result["confidence"]
+                    det["lower_bbox"] = cls_result.get("lower_bbox")
+                    classified_count += 1
+
+                    track_id = cand["track_id"]
+                    if track_id not in track_state:
+                        track_state[track_id] = {"violation_saved": False}
+                    track_state[track_id].update(
+                        {
+                            "label": cls_result["label"],
+                            "confidence": cls_result["confidence"],
+                            "lower_bbox": cls_result.get("lower_bbox"),
+                            "last_classified_frame": req["frame_count"],
+                        }
+                    )
+
+            req["result"] = (
+                detections,
+                len(tracked),
+                track_state,
+                {
+                    "detect_ms": detect_ms_each,
+                    "detect_total_ms": detect_ms_total,
+                    "batch_size": len(batch),
+                    "classify_ms": classify_ms,
+                    "classify_candidates": len(classify_candidates),
+                    "classified": classified_count,
+                },
+            )
+            req["done"].set()
+
+        if processed < len(batch):
+            for req in batch[processed:]:
+                req["result"] = (
+                    [],
+                    0,
+                    req["track_state"],
+                    {
+                        "detect_ms": 0.0,
+                        "detect_total_ms": 0.0,
+                        "batch_size": len(batch),
+                        "classify_ms": 0.0,
+                        "classify_candidates": 0,
+                        "classified": 0,
+                    },
+                )
+                req["done"].set()
+
+
+_BATCH_INFER_ENGINE: _BatchInferenceEngine | None = None
+_BATCH_INFER_LOCK = threading.Lock()
+
+
+def _get_batch_infer_engine() -> _BatchInferenceEngine:
+    global _BATCH_INFER_ENGINE
+    with _BATCH_INFER_LOCK:
+        if _BATCH_INFER_ENGINE is None:
+            _BATCH_INFER_ENGINE = _BatchInferenceEngine()
+        return _BATCH_INFER_ENGINE
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +623,8 @@ def start_producer_thread(
     source_path: str,
     is_fisheye: bool,
     active_views: list = None,
+    sync_barrier: threading.Barrier | None = None,
+    sync_state: dict | None = None,
 ):
     with PRODUCER_LOCK:
         existing = PRODUCER_THREADS.get(runtime_key)
@@ -148,7 +636,16 @@ def start_producer_thread(
 
         thread = threading.Thread(
             target=video_producer,
-            args=(runtime_key, source_path, is_fisheye, active_views, stop_event, source_meta),
+            args=(
+                runtime_key,
+                source_path,
+                is_fisheye,
+                active_views,
+                stop_event,
+                source_meta,
+                sync_barrier,
+                sync_state,
+            ),
             daemon=True,
         )
         PRODUCER_THREADS[runtime_key] = thread
@@ -233,6 +730,8 @@ def video_producer(
     active_views: list = None,
     stop_event: threading.Event | None = None,
     source_meta: dict | None = None,
+    sync_barrier: threading.Barrier | None = None,
+    sync_state: dict | None = None,
 ):
     print(f"[Producer] Starting loop for runtime_key={runtime_key}, source={source_path}")
 
@@ -257,15 +756,26 @@ def video_producer(
         _cleanup_producer_state(runtime_key, clear_frame_buffer=True)
         return
 
-    # Per-stream model instance: isolates tracker state across concurrent sources.
-    print(f"[Producer] Loading YOLO model for runtime_key={runtime_key}, source={source_path}")
-    try:
-        local_model = YOLO(POSE_MODEL_PATH)
-    except Exception as e:
-        print(f"[Producer] Failed to load YOLO model for {source_path}: {e}")
-        cap.release()
-        _cleanup_producer_state(runtime_key, clear_frame_buffer=True)
-        return
+    local_model = None
+    # Ensure shared batch inference engine is ready once.
+    if MULTI_STREAM_BATCH_INFER:
+        try:
+            _get_batch_infer_engine()
+        except Exception as e:
+            print(f"[Producer] Failed to initialize batch inference engine: {e}")
+            cap.release()
+            _cleanup_producer_state(runtime_key, clear_frame_buffer=True)
+            return
+    else:
+        # Legacy per-stream detector path.
+        print(f"[Producer] Loading YOLO model for runtime_key={runtime_key}, source={source_path}")
+        try:
+            local_model = YOLO(POSE_MODEL_PATH)
+        except Exception as e:
+            print(f"[Producer] Failed to load YOLO model for {source_path}: {e}")
+            cap.release()
+            _cleanup_producer_state(runtime_key, clear_frame_buffer=True)
+            return
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -278,6 +788,11 @@ def video_producer(
         print("[System] CUDA detected: enabling GPU remap/resize")
     else:
         print("[System] CUDA not available, using CPU pipeline")
+    if NVENC_OUTPUT_ENABLED:
+        print(
+            f"[NVENC] Enabled: codec={NVENC_CODEC}, preset={NVENC_PRESET}, "
+            f"container={NVENC_OUTPUT_CONTAINER}, output_dir={NVENC_OUTPUT_DIR}"
+        )
 
     # --- Fisheye processor setup ---
     processor = None
@@ -330,21 +845,46 @@ def video_producer(
         return base64.b64encode(buf).decode('utf-8')
 
     # --- Detection + optional classification for a single view ---
-    def run_detection_and_classify(img, frame_count, track_state, skip_classification=False):
+    def run_detection_and_classify(
+        img,
+        frame_count,
+        track_state,
+        skip_classification=False,
+        view_key: str = "original",
+    ):
         """
         Run YOLO-Pose tracking on a full-res image.
         If skip_classification is False, also runs dress code classification.
 
         Returns:
-            (detections_list, people_count, updated_track_state)
+            (detections_list, people_count, updated_track_state, perf_dict)
 
         Each detection dict:
-            {track_id, person_bbox, label, confidence, lower_bbox, violation}
+            {track_id, person_bbox, count_anchor, label, confidence, lower_bbox, violation}
         """
+        if MULTI_STREAM_BATCH_INFER:
+            engine = _get_batch_infer_engine()
+            stream_id = f"{runtime_key}||{view_key}"
+            return engine.infer(
+                stream_id=stream_id,
+                img=img,
+                frame_count=frame_count,
+                track_state=track_state,
+                skip_classification=skip_classification,
+            )
+
         if local_model is None:
-            return [], 0, track_state
+            return [], 0, track_state, {
+                "detect_ms": 0.0,
+                "detect_total_ms": 0.0,
+                "batch_size": 1,
+                "classify_ms": 0.0,
+                "classify_candidates": 0,
+                "classified": 0,
+            }
 
         try:
+            detect_started_at = time.perf_counter()
             # YOLO-Pose tracking with BoT-SORT for better occlusion handling.
             # BoT-SORT adds ReID appearance features + improved Kalman filter,
             # so tracks survive brief occlusions (e.g. door frame) much better.
@@ -364,7 +904,15 @@ def video_producer(
             results = local_model.track(**track_kwargs)
 
             if not results:
-                return [], 0, track_state
+                detect_ms = (time.perf_counter() - detect_started_at) * 1000.0
+                return [], 0, track_state, {
+                    "detect_ms": detect_ms,
+                    "detect_total_ms": detect_ms,
+                    "batch_size": 1,
+                    "classify_ms": 0.0,
+                    "classify_candidates": 0,
+                    "classified": 0,
+                }
 
             r = results[0]
             boxes_xyxy = r.boxes.xyxy.cpu().numpy() if r.boxes is not None else np.empty((0, 4))
@@ -373,10 +921,17 @@ def video_producer(
                 if r.boxes is not None and r.boxes.id is not None
                 else []
             )
-            keypoints = r.keypoints.xy.cpu().numpy() if r.keypoints is not None else None
+            keypoints = None
+            # Counting-only views do not need keypoints; skip extraction to avoid extra GPU->CPU copies.
+            if not skip_classification and r.keypoints is not None:
+                keypoints = r.keypoints.xy.cpu().numpy()
+            detect_ms = (time.perf_counter() - detect_started_at) * 1000.0
 
             people_count = len(boxes_xyxy)
             detections = []
+            classify_candidates = []
+            classified_count = 0
+            classify_ms = 0.0
 
             for i, box_coords in enumerate(boxes_xyxy):
                 track_id = int(track_ids[i]) if i < len(track_ids) and track_ids[i] is not None else None
@@ -391,32 +946,27 @@ def video_producer(
                     if track_id is not None and track_id in track_state:
                         cached = track_state[track_id]
                         frames_since = frame_count - cached.get("last_classified_frame", 0)
-                        if frames_since < 30:
+                        if (
+                            frames_since < DRESSCODE_RECLASSIFY_FRAMES
+                            and cached.get("label") is not None
+                            and cached.get("confidence") is not None
+                        ):
                             # Reuse cached label
                             cls_result = {
-                                "label": cached["label"],
-                                "confidence": cached["confidence"],
+                                "label": cached.get("label"),
+                                "confidence": cached.get("confidence"),
                                 "lower_bbox": cached.get("lower_bbox"),
                             }
 
-                    # Classify if no cached result
+                    # Queue for batch classification if no cached result.
                     if cls_result is None:
-                        kp_row = None
-                        if keypoints is not None and keypoints.shape[0] > i:
-                            kp_row = keypoints[i]
-
-                        cls_result = classify_lower_body(img, box_coords, kp_row, device=YOLO_DEVICE)
-
-                        # Update track state
-                        if track_id is not None and cls_result is not None:
-                            if track_id not in track_state:
-                                track_state[track_id] = {"violation_saved": False}
-                            track_state[track_id].update({
-                                "label": cls_result["label"],
-                                "confidence": cls_result["confidence"],
-                                "lower_bbox": cls_result.get("lower_bbox"),
-                                "last_classified_frame": frame_count,
-                            })
+                        kp_row = keypoints[i] if keypoints is not None and keypoints.shape[0] > i else None
+                        classify_candidates.append({
+                            "det_index": i,
+                            "track_id": track_id,
+                            "bbox": box_coords,
+                            "keypoints": kp_row,
+                        })
 
                 # Build detection entry
                 det = {
@@ -429,11 +979,54 @@ def video_producer(
                 }
                 detections.append(det)
 
-            return detections, people_count, track_state
+            if not skip_classification and classify_candidates:
+                classify_started_at = time.perf_counter()
+                batch_results = classify_lower_body_batch(
+                    img,
+                    [{"bbox": item["bbox"], "keypoints": item["keypoints"]} for item in classify_candidates],
+                    device=YOLO_DEVICE,
+                )
+                classify_ms = (time.perf_counter() - classify_started_at) * 1000.0
+
+                for item, cls_result in zip(classify_candidates, batch_results):
+                    if cls_result is None:
+                        continue
+                    det = detections[item["det_index"]]
+                    det["label"] = cls_result["label"]
+                    det["confidence"] = cls_result["confidence"]
+                    det["lower_bbox"] = cls_result.get("lower_bbox")
+                    classified_count += 1
+
+                    track_id = item["track_id"]
+                    if track_id is not None:
+                        if track_id not in track_state:
+                            track_state[track_id] = {"violation_saved": False}
+                        track_state[track_id].update({
+                            "label": cls_result["label"],
+                            "confidence": cls_result["confidence"],
+                            "lower_bbox": cls_result.get("lower_bbox"),
+                            "last_classified_frame": frame_count,
+                        })
+
+            return detections, people_count, track_state, {
+                "detect_ms": detect_ms,
+                "detect_total_ms": detect_ms,
+                "batch_size": 1,
+                "classify_ms": classify_ms,
+                "classify_candidates": len(classify_candidates),
+                "classified": classified_count,
+            }
 
         except Exception as e:
             print(f"[Detection] Error: {e}")
-            return [], 0, track_state
+            return [], 0, track_state, {
+                "detect_ms": 0.0,
+                "detect_total_ms": 0.0,
+                "batch_size": 1,
+                "classify_ms": 0.0,
+                "classify_candidates": 0,
+                "classified": 0,
+            }
 
     # --- Scale detection coordinates to 640x360 for frontend ---
     def scale_detections(detections, orig_h, orig_w, target_w=640, target_h=360):
@@ -445,6 +1038,12 @@ def video_producer(
             if sd.get("person_bbox"):
                 b = sd["person_bbox"]
                 sd["person_bbox"] = [round(b[0]*sx), round(b[1]*sy), round(b[2]*sx), round(b[3]*sy)]
+            if sd.get("count_anchor"):
+                p = sd["count_anchor"]
+                sd["count_anchor"] = [round(p[0]*sx), round(p[1]*sy)]
+            if sd.get("display_anchor"):
+                p = sd["display_anchor"]
+                sd["display_anchor"] = [round(p[0]*sx), round(p[1]*sy)]
             if sd.get("lower_bbox"):
                 b = sd["lower_bbox"]
                 sd["lower_bbox"] = [round(b[0]*sx), round(b[1]*sy), round(b[2]*sx), round(b[3]*sy)]
@@ -464,6 +1063,8 @@ def video_producer(
     # Detection state
     detection_stride = DETECTION_STRIDE
     frame_count = 0
+    decoded_frame_index = -1
+    rtsp_read_failures = 0
     track_state = {}       # {track_id: {label, confidence, last_classified_frame, violation_saved}}
     cached_detections = [] # Reused between detection frames
     cached_people_count = 0
@@ -471,6 +1072,42 @@ def video_producer(
     # People counting state: view_key -> PeopleCounter instance
     people_counters: dict[str, PeopleCounter] = {}
     cached_counting_data: dict[str, dict] = {}  # view_key -> last counting result
+    counting_event_state: dict[str, dict[str, int]] = {}  # view_key -> previous total counts
+    nvenc_writers: dict[str, _NvencOutputWriter] = {}
+    sync_started_at = None
+
+    if sync_barrier is not None:
+        try:
+            print(f"[Producer] Waiting for sync start: runtime_key={runtime_key}")
+            sync_barrier.wait(timeout=30.0)
+            sync_started_at = (sync_state or {}).get("started_at") or time.perf_counter()
+            print(f"[Producer] Sync start released: runtime_key={runtime_key}")
+        except threading.BrokenBarrierError:
+            print(f"[Producer] Sync start barrier broken, continuing unsynchronized: runtime_key={runtime_key}")
+    elif sync_state is not None:
+        sync_started_at = (sync_state or {}).get("started_at") or time.perf_counter()
+
+    sync_timeline_active = bool(
+        sync_started_at is not None and source_meta.get("is_uploaded_source") and source_meta.get("is_file_source")
+    )
+
+    def _write_nvenc_frame(view_key: str, img: np.ndarray) -> float:
+        if not NVENC_OUTPUT_ENABLED:
+            return 0.0
+        writer = nvenc_writers.get(view_key)
+        if writer is None:
+            writer = _NvencOutputWriter(runtime_key, view_key, fps)
+            nvenc_writers[view_key] = writer
+        started_at = time.perf_counter()
+        writer.write(img)
+        return (time.perf_counter() - started_at) * 1000.0
+
+    def _skip_file_frame() -> bool:
+        nonlocal decoded_frame_index
+        skipped = cap.grab()
+        if skipped:
+            decoded_frame_index += 1
+        return skipped
 
     # -----------------------------------------------------------------------
     # Helper: get all views needing detection (dress code OR counting)
@@ -495,27 +1132,60 @@ def video_producer(
         if view_key not in people_counters:
             people_counters[view_key] = PeopleCounter(config)
             print(f"[Counting] Created counter for {view_key} (camera={camera_id}), "
-                  f"lines={len(config.get('lines', []))}, zones={len(config.get('zones', []))}")
+                  f"lines={len(config.get('lines', []))}, "
+                  f"frame_exclude_areas={len(config.get('frame_exclude_areas', []))}")
         else:
             # Hot-reload config changes
             people_counters[view_key].update_config(config)
 
         counter = people_counters[view_key]
+        if consume_counting_reset(camera_id):
+            counter.reset()
+            counting_event_state[view_key] = {
+                "total_in": 0,
+                "total_out": 0,
+            }
+            counting_data = counter._empty_result()
+            update_live_counts(camera_id, counting_data)
+            return counting_data
+
         counting_data = counter.update(detections_unscaled, frame_shape)
+
+        prev_state = counting_event_state.get(view_key, {"total_in": 0, "total_out": 0})
+        total_in = int(counting_data.get("total_in", 0) or 0)
+        total_out = int(counting_data.get("total_out", 0) or 0)
+        delta_in = max(0, total_in - int(prev_state.get("total_in", 0) or 0))
+        delta_out = max(0, total_out - int(prev_state.get("total_out", 0) or 0))
+        counting_event_state[view_key] = {
+            "total_in": total_in,
+            "total_out": total_out,
+        }
 
         # Publish live counts
         update_live_counts(camera_id, counting_data)
 
-        # Check capacity alert
-        alert = counter.check_capacity_alert()
-        if alert:
-            alert["camera_id"] = camera_id
-            queue_violation_event(alert)
+        if delta_in or delta_out:
+            event_time = time.time()
+            sensor_events = []
+            for idx in range(delta_in):
+                sensor_events.append({
+                    "direction": "in",
+                    "timestamp": event_time + (idx * 0.001),
+                    "count_after": total_in - delta_in + idx + 1,
+                })
+            for idx in range(delta_out):
+                sensor_events.append({
+                    "direction": "out",
+                    "timestamp": event_time + ((delta_in + idx) * 0.001),
+                    "count_after": total_out - delta_out + idx + 1,
+                })
+            building_alert = ingest_sensor_events(camera_id, sensor_events)
+            if building_alert:
+                queue_violation_event(building_alert)
 
-        # Periodic snapshot
-        if counter.should_snapshot(interval=10.0):
+        # Snapshot on change + periodic heartbeat to preserve timeline continuity.
+        if counter.should_snapshot(heartbeat_interval=COUNTING_SNAPSHOT_HEARTBEAT_SEC):
             snap = counter.get_snapshot_data(camera_id)
-            snap["zone_counts"] = counting_data.get("zone_counts", {})
             queue_counting_snapshot(snap)
 
         return counting_data
@@ -528,8 +1198,24 @@ def video_producer(
             print(f"[Producer] Stop requested for runtime_key={runtime_key}, source={source_path}")
             break
 
+        if sync_timeline_active and fps > 0:
+            target_frame_index = max(0, int((time.perf_counter() - sync_started_at) * fps))
+            while decoded_frame_index < target_frame_index - 1:
+                if not _skip_file_frame():
+                    break
+
         loop_start = time.time()
+        read_started_at = time.perf_counter()
         ret, frame = cap.read()
+        decode_ms = (time.perf_counter() - read_started_at) * 1000.0
+        if ret:
+            decoded_frame_index += 1
+            if rtsp_read_failures > 0 and source_meta.get("is_rtsp_source"):
+                print(
+                    f"[Producer] Recovered RTSP stream after {rtsp_read_failures} failed read(s): "
+                    f"runtime_key={runtime_key}"
+                )
+                rtsp_read_failures = 0
 
         if not ret:
             # Uploaded file source reached EOF: stop producer automatically.
@@ -538,9 +1224,25 @@ def video_producer(
                 break
 
             if source_meta.get("is_rtsp_source"):
+                rtsp_read_failures += 1
+                if rtsp_read_failures < RTSP_MAX_CONSECUTIVE_READ_FAILURES:
+                    if rtsp_read_failures == 1:
+                        print(
+                            f"[Producer] RTSP read failed; tolerating up to "
+                            f"{RTSP_MAX_CONSECUTIVE_READ_FAILURES} consecutive failures before reconnect: "
+                            f"runtime_key={runtime_key}"
+                        )
+                    time.sleep(RTSP_READ_FAILURE_BACKOFF_MS / 1000.0)
+                    continue
+
+                print(
+                    f"[Producer] RTSP read failed {rtsp_read_failures} consecutive times; reconnecting: "
+                    f"runtime_key={runtime_key}"
+                )
                 cap.release()
                 time.sleep(0.5)
                 cap = _open_video_capture(source_path, source_meta)
+                rtsp_read_failures = 0
                 continue
 
             # Non-upload/live source: transient read failure, keep retrying.
@@ -558,8 +1260,21 @@ def video_producer(
 
         run_detection_this_frame = (frame_count % detection_stride == 0)
 
-        # --- Timing ---
-        t0 = time.time()
+        stage_ms = {
+            "decode": decode_ms,
+            "fisheye": 0.0,
+            "detect": 0.0,
+            "detect_total_batch": 0.0,
+            "classify": 0.0,
+            "policy_queue": 0.0,
+            "counting": 0.0,
+            "encode": 0.0,
+            "nvenc": 0.0,
+        }
+        classify_candidates = 0
+        classified_count = 0
+        detect_batch_size_sum = 0
+        detect_batch_samples = 0
 
         current_buffer = {}
         current_buffer['__meta__'] = {
@@ -572,8 +1287,9 @@ def video_producer(
         if is_fisheye and processor:
             try:
                 # 1. Fisheye processing (full resolution)
+                fisheye_started_at = time.perf_counter()
                 processed_frames, _, _ = processor.process_frame(frame, overlay=True, view_id=None)
-                t1 = time.time()
+                stage_ms["fisheye"] += (time.perf_counter() - fisheye_started_at) * 1000.0
 
                 # 2. Process each view
                 view_detections = {}  # key -> scaled detections list
@@ -590,17 +1306,29 @@ def video_producer(
                         if run_detection_this_frame and key in all_views:
                             # Skip dress code classification if only counting needs this view
                             only_counting = key not in dresscode_views
-                            detections, people_count, track_state = run_detection_and_classify(
+                            detections, people_count, track_state, perf = run_detection_and_classify(
                                 img, frame_count, track_state,
                                 skip_classification=only_counting,
+                                view_key=key,
                             )
+                            stage_ms["detect"] += perf.get("detect_ms", 0.0)
+                            stage_ms["detect_total_batch"] += perf.get("detect_total_ms", 0.0)
+                            stage_ms["classify"] += perf.get("classify_ms", 0.0)
+                            classify_candidates += perf.get("classify_candidates", 0)
+                            classified_count += perf.get("classified", 0)
+                            detect_batch_size_sum += perf.get("batch_size", 1)
+                            detect_batch_samples += 1
                             # Check policy for violations & save snapshots
+                            policy_started_at = time.perf_counter()
                             detections = _apply_policy_and_save(
                                 detections, track_state, img, runtime_key, source_path, view_key=key
                             )
+                            stage_ms["policy_queue"] += (time.perf_counter() - policy_started_at) * 1000.0
 
                             # Run people counting on unscaled detections
+                            counting_started_at = time.perf_counter()
                             cd = _run_counting_for_view(key, detections, (orig_h, orig_w))
+                            stage_ms["counting"] += (time.perf_counter() - counting_started_at) * 1000.0
                             if cd is not None:
                                 view_counting_data[key] = cd
                                 cached_counting_data[key] = cd
@@ -618,7 +1346,10 @@ def video_producer(
                             view_detections[key] = []
 
                         # Encode clean frame (no plot)
+                        encode_started_at = time.perf_counter()
                         current_buffer[key] = encode_frame(img)
+                        stage_ms["encode"] += (time.perf_counter() - encode_started_at) * 1000.0
+                        stage_ms["nvenc"] += _write_nvenc_frame(key, img)
 
                     except Exception as e:
                         print(f"Encoding error for {key}: {e}")
@@ -627,19 +1358,6 @@ def video_producer(
                 current_buffer['__meta__']['detections'] = view_detections
                 current_buffer['__meta__']['people_count'] = cached_people_count
                 current_buffer['__meta__']['counting_data'] = view_counting_data
-
-                t2 = time.time()
-
-                # Perf logging
-                if fps_frame_count % 30 == 0:
-                    fisheye_ms = (t1 - t0) * 1000
-                    detect_encode_ms = (t2 - t1) * 1000
-                    total_ms = (t2 - t0) * 1000
-                    print(
-                        f"[Perf] Fisheye: {fisheye_ms:.1f}ms | Detect+Encode: {detect_encode_ms:.1f}ms"
-                        f" | Total: {total_ms:.1f}ms | FPS: {current_real_fps:.1f}"
-                        f" | RuntimeKey: {runtime_key}"
-                    )
 
             except Exception as e:
                 print(f"[Producer] Error: {e}")
@@ -654,16 +1372,28 @@ def video_producer(
                 if run_detection_this_frame and "original" in all_views:
                     # Skip dress code classification if only counting needs this view
                     only_counting = "original" not in dresscode_views
-                    detections, people_count, track_state = run_detection_and_classify(
+                    detections, people_count, track_state, perf = run_detection_and_classify(
                         frame, frame_count, track_state,
                         skip_classification=only_counting,
+                        view_key="original",
                     )
+                    stage_ms["detect"] += perf.get("detect_ms", 0.0)
+                    stage_ms["detect_total_batch"] += perf.get("detect_total_ms", 0.0)
+                    stage_ms["classify"] += perf.get("classify_ms", 0.0)
+                    classify_candidates += perf.get("classify_candidates", 0)
+                    classified_count += perf.get("classified", 0)
+                    detect_batch_size_sum += perf.get("batch_size", 1)
+                    detect_batch_samples += 1
+                    policy_started_at = time.perf_counter()
                     detections = _apply_policy_and_save(
                         detections, track_state, frame, runtime_key, source_path, view_key="original"
                     )
+                    stage_ms["policy_queue"] += (time.perf_counter() - policy_started_at) * 1000.0
 
                     # Run people counting on unscaled detections
+                    counting_started_at = time.perf_counter()
                     cd = _run_counting_for_view("original", detections, (orig_h, orig_w))
+                    stage_ms["counting"] += (time.perf_counter() - counting_started_at) * 1000.0
                     if cd is not None:
                         cached_counting_data["original"] = cd
 
@@ -672,7 +1402,10 @@ def video_producer(
                     cached_people_count = people_count
 
                 # Encode clean frame
+                encode_started_at = time.perf_counter()
                 current_buffer['original'] = encode_frame(frame)
+                stage_ms["encode"] += (time.perf_counter() - encode_started_at) * 1000.0
+                stage_ms["nvenc"] += _write_nvenc_frame("original", frame)
                 current_buffer['__meta__']['detections'] = {'original': cached_detections}
                 current_buffer['__meta__']['people_count'] = cached_people_count
                 current_buffer['__meta__']['counting_data'] = {
@@ -682,15 +1415,52 @@ def video_producer(
             except Exception as e:
                 print(f"[Producer] Normal video error: {e}")
 
+        if PERF_STAGE_LOGS and (frame_count % PERF_LOG_INTERVAL_FRAMES == 0):
+            total_stage_ms = (
+                stage_ms["decode"]
+                + stage_ms["fisheye"]
+                + stage_ms["detect"]
+                + stage_ms["classify"]
+                + stage_ms["policy_queue"]
+                + stage_ms["counting"]
+                + stage_ms["encode"]
+                + stage_ms["nvenc"]
+            )
+            avg_detect_batch = (detect_batch_size_sum / detect_batch_samples) if detect_batch_samples else 0.0
+            print(
+                f"[Perf] decode={stage_ms['decode']:.1f}ms "
+                f"fisheye={stage_ms['fisheye']:.1f}ms "
+                f"detect={stage_ms['detect']:.1f}ms "
+                f"detect_total_batch={stage_ms['detect_total_batch']:.1f}ms "
+                f"avg_detect_batch={avg_detect_batch:.2f} "
+                f"classify={stage_ms['classify']:.1f}ms "
+                f"policy_queue={stage_ms['policy_queue']:.1f}ms "
+                f"counting={stage_ms['counting']:.1f}ms "
+                f"encode={stage_ms['encode']:.1f}ms "
+                f"nvenc={stage_ms['nvenc']:.1f}ms "
+                f"total={total_stage_ms:.1f}ms "
+                f"classify_batch={classified_count}/{classify_candidates} "
+                f"fps={current_real_fps:.1f} "
+                f"runtime_key={runtime_key}"
+            )
+
         # Update global buffer (atomic assignment)
         FRAME_BUFFERS[runtime_key] = current_buffer
 
         # --- Timing control ---
-        elapsed = time.time() - loop_start
-        wait = delay - elapsed
-        if wait > 0:
-            time.sleep(wait)
+        if sync_timeline_active and fps > 0:
+            next_frame_deadline = sync_started_at + ((decoded_frame_index + 1) / fps)
+            wait = next_frame_deadline - time.perf_counter()
+            if wait > 0:
+                time.sleep(wait)
+        else:
+            elapsed = time.time() - loop_start
+            wait = delay - elapsed
+            if wait > 0:
+                time.sleep(wait)
 
+    for writer in nvenc_writers.values():
+        writer.close()
     cap.release()
     _cleanup_producer_state(runtime_key, clear_frame_buffer=True)
     print(f"[Producer] Stopped loop for runtime_key={runtime_key}, source={source_path}")

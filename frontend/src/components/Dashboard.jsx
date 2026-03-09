@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Card, CardContent } from './ui/card';
 import { Button } from './ui/button';
-import { HardDrive, Circle, ChevronRight, LayoutGrid, Users, Shirt, AlertTriangle, ShieldCheck, Maximize2, Minimize2, ArrowDownToLine, ArrowUpFromLine } from 'lucide-react';
+import { HardDrive, Circle, ChevronRight, LayoutGrid, Users, Shirt, ShieldCheck, Maximize2, Minimize2, ArrowDownToLine, ArrowUpFromLine } from 'lucide-react';
 import StreamPlayer from './StreamPlayer';
 import { getApiBaseUrl, getWSUrl } from '../apiConfig';
 
@@ -18,7 +18,6 @@ const CameraFeedCard = ({ camera }) => {
     const isStreamSource = camera.type.includes("RTSP") || camera.type.includes("File") || camera.type.includes("Fisheye");
 
     const hasCountingData = countingData && (countingData.total_in > 0 || countingData.total_out > 0);
-    const capacityExceeded = countingData?.capacity_exceeded ?? false;
 
     return (
         <div className="relative group overflow-hidden bg-black rounded-sm border border-border/50 h-full w-full flex items-center justify-center">
@@ -65,16 +64,6 @@ const CameraFeedCard = ({ camera }) => {
                         </div>
                     </div>
                 </div>
-
-                {/* Capacity exceeded warning */}
-                {capacityExceeded && (
-                    <div className="absolute bottom-4 left-4 right-4 flex justify-center">
-                        <div className="bg-red-500/80 text-white text-xs px-3 py-1.5 rounded-full backdrop-blur-sm flex items-center gap-1.5 animate-pulse">
-                            <AlertTriangle className="w-3 h-3" />
-                            Capacity Exceeded ({countingData.occupancy}/{countingData.max_capacity})
-                        </div>
-                    </div>
-                )}
             </div>
         </div>
     );
@@ -87,11 +76,7 @@ const Dashboard = () => {
     const [page, setPage] = useState(0);
     const containerRef = useRef(null);
 
-    useEffect(() => {
-        fetchCameras();
-    }, []);
-
-    const fetchCameras = async () => {
+    async function fetchCameras() {
         try {
             const apiUrl = getApiBaseUrl();
             console.log("Dashboard fetching from:", apiUrl);
@@ -102,7 +87,14 @@ const Dashboard = () => {
         } catch (error) {
             console.error("Failed to fetch cameras:", error);
         }
-    };
+    }
+
+    useEffect(() => {
+        const timeoutId = setTimeout(() => {
+            void fetchCameras();
+        }, 0);
+        return () => clearTimeout(timeoutId);
+    }, []);
 
     const totalCameras = cameras.length;
     const totalPages = Math.ceil(totalCameras / layout) || 1;

@@ -1,45 +1,40 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 
 /**
- * CountingCanvas - Interactive SVG overlay for drawing counting lines/zones
- * and displaying live counting data.
+ * CountingCanvas - Interactive SVG overlay for drawing counting lines,
+ * frame exclusion areas, and displaying live counting data.
  *
  * All coordinates are normalised to the ACTUAL VIDEO AREA (0-1),
  * compensating for object-contain letterboxing/pillarboxing.
  *
  * Props:
  *   lines            - array of line configs [{id, name, points, direction}]
- *   zones            - array of zone configs [{id, name, points, zone_type?, group_id?}]
+ *   frameExcludeAreas - array of exclusion areas [{id, name, points}]
  *   countingData     - live counting data from WebSocket
- *   drawingMode      - 'line' | 'roi' | null
- *   drawingZoneType  - 'outside' | 'door' | 'inside' | null (color hint for ROI drawing)
+ *   drawingMode      - 'line' | 'frame_exclude' | null
  *   onLineDrawn      - callback({points, direction})
- *   onZoneDrawn      - callback({points})
+ *   onFrameExcludeAreaDrawn - callback({points})
  *   containerRef     - ref to the video container for sizing
  */
 
-// Zone-type colour palette
-const ZONE_COLORS = {
-    outside: { fill: 'rgba(249, 115, 22, 0.15)', stroke: '#f97316', label: '#f97316' },  // orange
-    door:    { fill: 'rgba(250, 204, 21, 0.15)', stroke: '#facc15', label: '#facc15' },  // yellow
-    inside:  { fill: 'rgba(34, 197, 94, 0.15)',  stroke: '#22c55e', label: '#22c55e' },  // green
-    default: { fill: 'rgba(59, 130, 246, 0.15)', stroke: '#3b82f6', label: '#3b82f6' },  // blue
+const FRAME_EXCLUDE_COLORS = {
+    fill: 'rgba(14, 165, 233, 0.14)',
+    stroke: '#0ea5e9',
+    label: '#0ea5e9',
 };
 
-const ZONE_TYPE_LABELS = {
-    outside: 'Outside',
-    door: 'Door',
-    inside: 'Inside',
+const DRAWING_COLORS = {
+    frame_exclude: FRAME_EXCLUDE_COLORS,
+    default: { fill: 'rgba(59, 130, 246, 0.15)', stroke: '#3b82f6', label: '#3b82f6' },  // blue
 };
 
 const CountingCanvas = ({
     lines = [],
-    zones = [],
+    frameExcludeAreas = [],
     countingData = {},
     drawingMode = null,
-    drawingZoneType = null,
     onLineDrawn,
-    onZoneDrawn,
+    onFrameExcludeAreaDrawn,
     containerRef,
 }) => {
     const svgRef = useRef(null);
@@ -139,7 +134,7 @@ const CountingCanvas = ({
         }
     }, [drawingMode, getMousePos, toNorm, isInVideoArea]);
 
-    const handleMouseUp = useCallback((e) => {
+    const handleMouseUp = useCallback(() => {
         if (!drawingMode) return;
         if (drawingMode === 'line' && lineStart && lineEnd) {
             const dist = Math.hypot(lineEnd.x - lineStart.x, lineEnd.y - lineStart.y);
@@ -152,7 +147,7 @@ const CountingCanvas = ({
     }, [drawingMode, lineStart, lineEnd, onLineDrawn]);
 
     const handleClick = useCallback((e) => {
-        if (drawingMode !== 'roi') return;
+        if (drawingMode !== 'frame_exclude') return;
         const pos = getMousePos(e);
         if (!pos || !isInVideoArea(pos.px, pos.py)) return;
         const norm = toNorm(pos.px, pos.py);
@@ -160,35 +155,34 @@ const CountingCanvas = ({
     }, [drawingMode, getMousePos, toNorm, isInVideoArea]);
 
     const handleDoubleClick = useCallback((e) => {
-        if (drawingMode !== 'roi') return;
+        if (drawingMode !== 'frame_exclude') return;
         e.preventDefault();
         if (polygonPoints.length >= 3) {
-            onZoneDrawn?.({ points: polygonPoints.map(p => [p.x, p.y]) });
+            onFrameExcludeAreaDrawn?.({ points: polygonPoints.map(p => [p.x, p.y]) });
         }
         setPolygonPoints([]);
-    }, [drawingMode, polygonPoints, onZoneDrawn]);
+    }, [drawingMode, polygonPoints, onFrameExcludeAreaDrawn]);
 
     useEffect(() => {
-        setLineStart(null);
-        setLineEnd(null);
-        setPolygonPoints([]);
-        setMousePos(null);
+        const resetId = window.requestAnimationFrame(() => {
+            setLineStart(null);
+            setLineEnd(null);
+            setPolygonPoints([]);
+            setMousePos(null);
+        });
+        return () => window.cancelAnimationFrame(resetId);
     }, [drawingMode]);
 
-    // --- Helpers ---
-    const getZoneColor = (zone) => {
-        const ztype = zone?.zone_type;
-        return ZONE_COLORS[ztype] || ZONE_COLORS.default;
-    };
-
     const getDrawingColor = () => {
-        return ZONE_COLORS[drawingZoneType] || ZONE_COLORS.default;
+        return DRAWING_COLORS[drawingMode] || DRAWING_COLORS.default;
     };
 
     // --- Render saved counting line ---
     const renderLine = (line, index) => {
         const pts = line.points || [];
         if (pts.length < 2) return null;
+        const countEvent = line.count_event === 'out' ? 'OUT' : 'IN';
+        const lineColor = line.count_event === 'out' ? '#ef4444' : '#facc15';
         const p1 = toPx(pts[0][0], pts[0][1]);
         const p2 = toPx(pts[1][0], pts[1][1]);
         const midX = (p1.x + p2.x) / 2;
@@ -206,55 +200,42 @@ const CountingCanvas = ({
         return (
             <g key={`line-${line.id || index}`}>
                 <line x1={p1.x} y1={p1.y} x2={p2.x} y2={p2.y}
-                    stroke="#facc15" strokeWidth="3" strokeDasharray="8,4" strokeLinecap="round" />
-                <circle cx={arrowX} cy={arrowY} r="6" fill="#facc15" opacity="0.8" />
+                    stroke={lineColor} strokeWidth="3" strokeDasharray="8,4" strokeLinecap="round" />
+                <circle cx={arrowX} cy={arrowY} r="6" fill={lineColor} opacity="0.8" />
                 <text x={arrowX} y={arrowY + 1} textAnchor="middle" dominantBaseline="middle"
-                    fill="#000" fontSize="8" fontWeight="bold">IN</text>
-                <text x={midX} y={midY - 10} textAnchor="middle" fill="#facc15"
+                    fill="#000" fontSize="8" fontWeight="bold">{countEvent}</text>
+                <text x={midX} y={midY - 10} textAnchor="middle" fill={lineColor}
                     fontSize="11" fontWeight="bold" style={{ textShadow: '1px 1px 2px rgba(0,0,0,0.8)' }}>
                     {line.name || `Line ${index + 1}`}
                 </text>
-                <circle cx={p1.x} cy={p1.y} r="5" fill="#facc15" stroke="#000" strokeWidth="1" />
-                <circle cx={p2.x} cy={p2.y} r="5" fill="#facc15" stroke="#000" strokeWidth="1" />
+                <circle cx={p1.x} cy={p1.y} r="5" fill={lineColor} stroke="#000" strokeWidth="1" />
+                <circle cx={p2.x} cy={p2.y} r="5" fill={lineColor} stroke="#000" strokeWidth="1" />
             </g>
         );
     };
 
-    // --- Render saved zone (colour-coded by type) ---
-    const renderZone = (zone, index) => {
-        const pts = zone.points || [];
+    const renderFrameExcludeArea = (area, index) => {
+        const pts = area.points || [];
         if (pts.length < 3) return null;
 
-        const colors = getZoneColor(zone);
+        const colors = FRAME_EXCLUDE_COLORS;
         const pixelPts = pts.map(p => toPx(p[0], p[1]));
         const pointsStr = pixelPts.map(p => `${p.x},${p.y}`).join(' ');
         const cx = pixelPts.reduce((s, p) => s + p.x, 0) / pixelPts.length;
         const cy = pixelPts.reduce((s, p) => s + p.y, 0) / pixelPts.length;
 
-        const typeLabel = ZONE_TYPE_LABELS[zone.zone_type] || '';
-        const zoneName = zone.name || `Zone ${index + 1}`;
-        const displayLabel = typeLabel ? `${typeLabel}` : zoneName;
-
-        // For standalone zones show people count
-        const zoneCount = !zone.group_id ? (countingData?.zone_counts?.[zone.id] ?? '-') : null;
+        const displayLabel = area.name || `No Frame Count ${index + 1}`;
 
         return (
-            <g key={`zone-${zone.id || index}`}>
+            <g key={`frame-exclude-${area.id || index}`}>
                 <polygon points={pointsStr}
                     fill={colors.fill} stroke={colors.stroke} strokeWidth="2" strokeDasharray="6,3" />
-                {/* Zone label */}
-                <rect x={cx - 45} y={cy - (zoneCount !== null ? 18 : 10)} width="90"
-                    height={zoneCount !== null ? 36 : 22} rx="6" fill="rgba(0,0,0,0.65)" />
-                <text x={cx} y={cy - (zoneCount !== null ? 4 : 0)} textAnchor="middle" fill={colors.label}
+                <rect x={cx - 45} y={cy - 10} width="90"
+                    height="22" rx="6" fill="rgba(0,0,0,0.65)" />
+                <text x={cx} y={cy} textAnchor="middle" fill={colors.label}
                     fontSize="10" fontWeight="bold">
                     {displayLabel}
                 </text>
-                {zoneCount !== null && (
-                    <text x={cx} y={cy + 12} textAnchor="middle" fill="#fff" fontSize="12" fontWeight="bold">
-                        {zoneCount} people
-                    </text>
-                )}
-                {/* Vertex dots */}
                 {pixelPts.map((p, i) => (
                     <circle key={i} cx={p.x} cy={p.y} r="4" fill={colors.stroke} stroke="#fff" strokeWidth="1" />
                 ))}
@@ -276,7 +257,7 @@ const CountingCanvas = ({
             );
         }
 
-        if (drawingMode === 'roi' && polygonPoints.length > 0) {
+        if (drawingMode === 'frame_exclude' && polygonPoints.length > 0) {
             const pixelPts = polygonPoints.map(p => toPx(p.x, p.y));
 
             for (let i = 0; i < pixelPts.length - 1; i++) {
@@ -315,12 +296,11 @@ const CountingCanvas = ({
 
             if (polygonPoints.length >= 3) {
                 const hintY = videoArea.offsetY + 20;
-                const typeHint = drawingZoneType ? ` (${ZONE_TYPE_LABELS[drawingZoneType] || drawingZoneType})` : '';
                 elements.push(
                     <text key="poly-hint" x={svgSize.width / 2} y={hintY}
                         textAnchor="middle" fill={drawColor.stroke} fontSize="12" fontWeight="bold"
                         style={{ textShadow: '1px 1px 2px rgba(0,0,0,0.8)' }}>
-                        Double-click to close{typeHint} ({polygonPoints.length} points)
+                        Double-click to close No Frame Count ({polygonPoints.length} points)
                     </text>
                 );
             }
@@ -354,7 +334,7 @@ const CountingCanvas = ({
                     fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="1" strokeDasharray="4,4" />
             )}
 
-            {zones.map((zone, i) => renderZone(zone, i))}
+            {frameExcludeAreas.map((area, i) => renderFrameExcludeArea(area, i))}
             {lines.map((line, i) => renderLine(line, i))}
             {renderDrawing()}
 

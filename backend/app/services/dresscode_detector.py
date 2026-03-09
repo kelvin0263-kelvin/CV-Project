@@ -154,6 +154,82 @@ def classify_lower_body(frame: np.ndarray, bbox, keypoints=None, device: str | N
         return None
 
 
+def classify_lower_body_batch(
+    frame: np.ndarray,
+    bbox_keypoint_items: list[dict],
+    device: str | None = None,
+) -> list[dict | None]:
+    """
+    Batch classify lower-body crops for one frame.
+
+    Args:
+        frame: Full-resolution frame
+        bbox_keypoint_items: List of {"bbox": [...], "keypoints": ...}
+        device: CUDA device id
+
+    Returns:
+        List aligned with input items. Each entry is classification dict or None.
+    """
+    if dresscode_model is None:
+        return [None] * len(bbox_keypoint_items)
+
+    if not bbox_keypoint_items:
+        return []
+
+    pending_indices: list[int] = []
+    crops: list[np.ndarray] = []
+    lower_bboxes: list[tuple[int, int, int, int]] = []
+    results: list[dict | None] = [None] * len(bbox_keypoint_items)
+
+    for idx, item in enumerate(bbox_keypoint_items):
+        bbox = item.get("bbox")
+        keypoints = item.get("keypoints")
+        if bbox is None:
+            continue
+
+        crop, lower_bbox = crop_lower_body(frame, bbox, keypoints)
+        if crop is None:
+            continue
+        if crop.shape[0] < 32 or crop.shape[1] < 32:
+            continue
+
+        pending_indices.append(idx)
+        crops.append(crop)
+        lower_bboxes.append(lower_bbox)
+
+    if not crops:
+        return results
+
+    classify_kwargs = {
+        "verbose": False,
+    }
+    if device:
+        classify_kwargs["device"] = device
+
+    try:
+        raw_results = dresscode_model(crops, **classify_kwargs)
+    except Exception as e:
+        print(f"[DressCode] Batch classification error: {e}")
+        return results
+
+    for batch_pos, raw in enumerate(raw_results):
+        if raw.probs is None:
+            continue
+
+        top1_idx = int(raw.probs.top1)
+        top1_conf = float(raw.probs.top1conf)
+        label = dresscode_class_names.get(top1_idx, f"class_{top1_idx}")
+
+        result_index = pending_indices[batch_pos]
+        results[result_index] = {
+            "label": label,
+            "confidence": round(top1_conf, 3),
+            "lower_bbox": list(map(int, lower_bboxes[batch_pos])),
+        }
+
+    return results
+
+
 def crop_full_person(frame: np.ndarray, bbox, padding_percent=0.05) -> np.ndarray | None:
     """
     Crop the full person with slight padding for snapshot evidence.

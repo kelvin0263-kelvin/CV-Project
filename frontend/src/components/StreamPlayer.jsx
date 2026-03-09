@@ -1,6 +1,14 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 
-const StreamPlayer = ({ wsUrl, className, alt, onStats, onDetections, onCountingData }) => {
+const StreamPlayer = ({
+    wsUrl,
+    className,
+    alt,
+    onStats,
+    onDetections,
+    onCountingData,
+    showCountingAnchors = false,
+}) => {
     const imgRef = useRef(null);
     const canvasRef = useRef(null);
     const wsRef = useRef(null);
@@ -111,8 +119,25 @@ const StreamPlayer = ({ wsUrl, className, alt, onStats, onDetections, onCounting
                 ctx.fillStyle = '#ffffff';
                 ctx.fillText(idLabel, sx1 + 3, sy1 + 11 * scaleY);
             }
+
+            const anchorPoint = Array.isArray(det.display_anchor) && det.display_anchor.length >= 2
+                ? det.display_anchor
+                : det.count_anchor;
+            if (showCountingAnchors && Array.isArray(anchorPoint) && anchorPoint.length >= 2) {
+                const [ax, ay] = anchorPoint;
+                const anchorX = ax * scaleX + offsetX;
+                const anchorY = ay * scaleY + offsetY;
+
+                ctx.beginPath();
+                ctx.arc(anchorX, anchorY, Math.max(3, 4 * scaleX), 0, Math.PI * 2);
+                ctx.fillStyle = '#facc15';
+                ctx.fill();
+                ctx.lineWidth = 1.5;
+                ctx.strokeStyle = '#111827';
+                ctx.stroke();
+            }
         });
-    }, []);
+    }, [getImageDisplayArea, showCountingAnchors]);
 
     useEffect(() => {
         if (!wsUrl) return;
