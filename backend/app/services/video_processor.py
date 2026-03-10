@@ -17,6 +17,7 @@ import queue
 import hashlib
 import re
 import subprocess
+import inspect
 import numpy as np
 
 # Ensure backend root is in path to import DefishVideoCV
@@ -36,6 +37,7 @@ from ultralytics.trackers.track import TRACKER_MAP
 from turbojpeg import TurboJPEG
 from ultralytics.utils import IterableSimpleNamespace, YAML
 from app.services.dresscode_detector import classify_lower_body_batch, crop_full_person
+from app.services.fall_detector import is_person_in_fall_pose
 from app.services.building_counter import ingest_sensor_events
 from app.services.people_counter import PeopleCounter
 from app.routers.counting_router import (
@@ -45,6 +47,11 @@ from app.routers.counting_router import (
     get_counting_config,
     update_live_counts,
     queue_counting_snapshot,
+)
+from app.routers.fall_detection_router import (
+    get_fall_detection_camera_id,
+    get_fall_detection_config,
+    get_fall_detection_views,
 )
 
 # ---------------------------------------------------------------------------
@@ -58,7 +65,7 @@ os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
 
 # Fixed runtime tuning for the current project.
-POSE_MODEL_PATH = os.path.join(BACKEND_ROOT, "yolo26n-pose.pt")
+POSE_MODEL_PATH = os.path.join(BACKEND_ROOT, "yolo26m-pose.pt")
 TRACKER_CONFIG_PATH = os.getenv(
     "TRACKER_CONFIG_PATH",
     os.path.join(BACKEND_ROOT, "botsort_custom.yaml"),
@@ -92,7 +99,7 @@ def _get_env_str(name: str, default: str) -> str:
 
 
 POSE_TRACK_IMGSZ = max(320, _get_env_int("POSE_TRACK_IMGSZ", 736))
-DETECTION_STRIDE = max(1, _get_env_int("DETECTION_STRIDE", 4))
+DETECTION_STRIDE = max(1, _get_env_int("DETECTION_STRIDE", 1))
 COUNTING_SNAPSHOT_HEARTBEAT_SEC = max(60, _get_env_int("COUNTING_SNAPSHOT_HEARTBEAT_SEC", 300))
 DRESSCODE_RECLASSIFY_FRAMES = max(1, _get_env_int("DRESSCODE_RECLASSIFY_FRAMES", 30))
 PERF_LOG_INTERVAL_FRAMES = max(1, _get_env_int("PERF_LOG_INTERVAL_FRAMES", 30))
@@ -181,6 +188,28 @@ def _open_video_capture(source_path: str, source_meta: dict) -> cv2.VideoCapture
 def _sanitize_token(value: str, fallback: str = "stream") -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", (value or "").strip()).strip("._-")
     return cleaned or fallback
+
+
+try:
+    _FALL_POSE_ACCEPTS_SENSITIVITY = "detection_sensitivity" in inspect.signature(
+        is_person_in_fall_pose
+    ).parameters
+except (TypeError, ValueError):
+    _FALL_POSE_ACCEPTS_SENSITIVITY = False
+
+
+def _is_person_in_fall_pose_compat(
+    person_bbox,
+    keypoints_data,
+    detection_sensitivity,
+):
+    if _FALL_POSE_ACCEPTS_SENSITIVITY:
+        return is_person_in_fall_pose(
+            person_bbox,
+            keypoints_data,
+            detection_sensitivity=detection_sensitivity,
+        )
+    return is_person_in_fall_pose(person_bbox, keypoints_data)
 
 
 class _NvencOutputWriter:
@@ -377,6 +406,7 @@ class _BatchInferenceEngine:
         frame_count: int,
         track_state: dict,
         skip_classification: bool,
+        need_fall_detection: bool,
     ) -> tuple[list[dict], int, dict, dict]:
         done = threading.Event()
         req = {
@@ -385,6 +415,7 @@ class _BatchInferenceEngine:
             "frame_count": frame_count,
             "track_state": track_state,
             "skip_classification": skip_classification,
+            "need_fall_detection": need_fall_detection,
             "done": done,
             "result": None,
         }
@@ -490,9 +521,13 @@ class _BatchInferenceEngine:
             else:
                 tracked = tracker.update(boxes.cpu().numpy(), img=req["img"])
 
-            keypoints = None
-            if not req["skip_classification"] and result.keypoints is not None:
-                keypoints = result.keypoints.xy.cpu().numpy()
+            keypoints_xy = None
+            keypoints_with_conf = None
+            if result.keypoints is not None:
+                if not req["skip_classification"]:
+                    keypoints_xy = result.keypoints.xy.cpu().numpy()
+                if req.get("need_fall_detection"):
+                    keypoints_with_conf = result.keypoints.data.cpu().numpy()
 
             track_state = req["track_state"]
             for row in tracked:
@@ -500,6 +535,13 @@ class _BatchInferenceEngine:
                 track_id = int(tid)
                 det_index = int(det_idx)
                 person_bbox = [float(x1), float(y1), float(x2), float(y2)]
+
+                kp_row_xy = None
+                if keypoints_xy is not None and 0 <= det_index < keypoints_xy.shape[0]:
+                    kp_row_xy = keypoints_xy[det_index]
+                kp_row_fall = None
+                if keypoints_with_conf is not None and 0 <= det_index < keypoints_with_conf.shape[0]:
+                    kp_row_fall = keypoints_with_conf[det_index]
 
                 cls_result = None
                 if not req["skip_classification"]:
@@ -517,15 +559,12 @@ class _BatchInferenceEngine:
                                 "lower_bbox": cached.get("lower_bbox"),
                             }
                     if cls_result is None:
-                        kp_row = None
-                        if keypoints is not None and 0 <= det_index < keypoints.shape[0]:
-                            kp_row = keypoints[det_index]
                         classify_candidates.append(
                             {
                                 "det_pos": len(detections),
                                 "track_id": track_id,
                                 "bbox": person_bbox,
-                                "keypoints": kp_row,
+                                "keypoints": kp_row_xy,
                             }
                         )
 
@@ -537,6 +576,9 @@ class _BatchInferenceEngine:
                         "confidence": cls_result["confidence"] if cls_result else None,
                         "lower_bbox": cls_result["lower_bbox"] if cls_result else None,
                         "violation": False,
+                        "fall_pose": False,
+                        "fall_detected": False,
+                        "keypoints_data": kp_row_fall,
                     }
                 )
 
@@ -850,6 +892,7 @@ def video_producer(
         frame_count,
         track_state,
         skip_classification=False,
+        need_fall_detection=False,
         view_key: str = "original",
     ):
         """
@@ -860,7 +903,7 @@ def video_producer(
             (detections_list, people_count, updated_track_state, perf_dict)
 
         Each detection dict:
-            {track_id, person_bbox, count_anchor, label, confidence, lower_bbox, violation}
+            {track_id, person_bbox, count_anchor, label, confidence, lower_bbox, violation, fall_pose, fall_detected}
         """
         if MULTI_STREAM_BATCH_INFER:
             engine = _get_batch_infer_engine()
@@ -871,6 +914,7 @@ def video_producer(
                 frame_count=frame_count,
                 track_state=track_state,
                 skip_classification=skip_classification,
+                need_fall_detection=need_fall_detection,
             )
 
         if local_model is None:
@@ -921,10 +965,13 @@ def video_producer(
                 if r.boxes is not None and r.boxes.id is not None
                 else []
             )
-            keypoints = None
-            # Counting-only views do not need keypoints; skip extraction to avoid extra GPU->CPU copies.
-            if not skip_classification and r.keypoints is not None:
-                keypoints = r.keypoints.xy.cpu().numpy()
+            keypoints_xy = None
+            keypoints_with_conf = None
+            if r.keypoints is not None:
+                if not skip_classification:
+                    keypoints_xy = r.keypoints.xy.cpu().numpy()
+                if need_fall_detection:
+                    keypoints_with_conf = r.keypoints.data.cpu().numpy()
             detect_ms = (time.perf_counter() - detect_started_at) * 1000.0
 
             people_count = len(boxes_xyxy)
@@ -937,6 +984,12 @@ def video_producer(
                 track_id = int(track_ids[i]) if i < len(track_ids) and track_ids[i] is not None else None
 
                 person_bbox = list(map(float, box_coords))
+                kp_row_xy = keypoints_xy[i] if keypoints_xy is not None and keypoints_xy.shape[0] > i else None
+                kp_row_fall = (
+                    keypoints_with_conf[i]
+                    if keypoints_with_conf is not None and keypoints_with_conf.shape[0] > i
+                    else None
+                )
 
                 cls_result = None
 
@@ -960,12 +1013,11 @@ def video_producer(
 
                     # Queue for batch classification if no cached result.
                     if cls_result is None:
-                        kp_row = keypoints[i] if keypoints is not None and keypoints.shape[0] > i else None
                         classify_candidates.append({
                             "det_index": i,
                             "track_id": track_id,
                             "bbox": box_coords,
-                            "keypoints": kp_row,
+                            "keypoints": kp_row_xy,
                         })
 
                 # Build detection entry
@@ -976,6 +1028,9 @@ def video_producer(
                     "confidence": cls_result["confidence"] if cls_result else None,
                     "lower_bbox": cls_result["lower_bbox"] if cls_result else None,
                     "violation": False,  # Will be set by policy check later
+                    "fall_pose": False,
+                    "fall_detected": False,
+                    "keypoints_data": kp_row_fall,
                 }
                 detections.append(det)
 
@@ -1035,6 +1090,7 @@ def video_producer(
         scaled = []
         for d in detections:
             sd = dict(d)
+            sd.pop("keypoints_data", None)
             if sd.get("person_bbox"):
                 b = sd["person_bbox"]
                 sd["person_bbox"] = [round(b[0]*sx), round(b[1]*sy), round(b[2]*sx), round(b[3]*sy)]
@@ -1065,7 +1121,7 @@ def video_producer(
     frame_count = 0
     decoded_frame_index = -1
     rtsp_read_failures = 0
-    track_state = {}       # {track_id: {label, confidence, last_classified_frame, violation_saved}}
+    track_state = {}       # Per-track dress-code and fall-detection state.
     cached_detections = [] # Reused between detection frames
     cached_people_count = 0
 
@@ -1110,13 +1166,14 @@ def video_producer(
         return skipped
 
     # -----------------------------------------------------------------------
-    # Helper: get all views needing detection (dress code OR counting)
+    # Helper: get all views needing detection
     # -----------------------------------------------------------------------
-    def _get_all_detection_views():
-        """Union of dress-code views and people-counting views."""
+    def _get_all_detection_views(source_path: str):
+        """Union of dress-code, people-counting, and fall-detection views."""
         dresscode_views = _get_detection_views(runtime_key)
         counting_views = get_counting_views(runtime_key)
-        return dresscode_views | counting_views
+        fall_views = get_fall_detection_views(source_path)
+        return dresscode_views | counting_views | fall_views
 
     def _run_counting_for_view(view_key, detections_unscaled, frame_shape):
         """Run people counting on unscaled detections for a specific view."""
@@ -1189,6 +1246,88 @@ def video_producer(
             queue_counting_snapshot(snap)
 
         return counting_data
+
+    def _run_fall_detection_for_view(view_key, detections_unscaled, frame, source_path):
+        """Run fall detection on unscaled detections for a specific view."""
+        camera_id = get_fall_detection_camera_id(source_path, view_key)
+        if camera_id is None:
+            for det in detections_unscaled:
+                det["fall_pose"] = False
+                det["fall_detected"] = False
+            return detections_unscaled
+
+        config = get_fall_detection_config(camera_id)
+        if config is None or not config.get("enabled", True):
+            for det in detections_unscaled:
+                det["fall_pose"] = False
+                det["fall_detected"] = False
+            return detections_unscaled
+
+        detection_sensitivity = int(config.get("detection_sensitivity", 75) or 75)
+        inactivity_timer_seconds = max(0.1, float(config.get("inactivity_timer_seconds", 1.0) or 1.0))
+        now_ts = time.time()
+
+        for det in detections_unscaled:
+            track_id = det.get("track_id")
+            person_bbox = det.get("person_bbox")
+            keypoints_data = det.get("keypoints_data")
+            fall_pose = bool(
+                person_bbox
+                and keypoints_data is not None
+                and _is_person_in_fall_pose_compat(
+                    person_bbox,
+                    keypoints_data,
+                    detection_sensitivity,
+                )
+            )
+            det["fall_pose"] = fall_pose
+            det["fall_detected"] = False
+
+            if track_id is None:
+                continue
+
+            if track_id not in track_state:
+                track_state[track_id] = {"violation_saved": False}
+            ts = track_state[track_id]
+
+            if not fall_pose:
+                ts.pop("fall_started_at", None)
+                ts["fall_saved"] = False
+                continue
+
+            started_at = ts.get("fall_started_at")
+            if started_at is None:
+                started_at = now_ts
+                ts["fall_started_at"] = started_at
+
+            fall_confirmed = (now_ts - started_at) >= inactivity_timer_seconds
+            if ts.get("fall_saved", False):
+                fall_confirmed = True
+
+            det["fall_detected"] = fall_confirmed
+
+            if fall_confirmed and not ts.get("fall_saved", False):
+                snapshot_id = str(uuid.uuid4())
+                person_crop = crop_full_person(frame, det["person_bbox"])
+                snapshot_path = None
+                if person_crop is not None:
+                    snapshot_path = os.path.join(SNAPSHOT_DIR, f"{snapshot_id}.jpg")
+                    cv2.imwrite(snapshot_path, person_crop)
+
+                queue_violation_event({
+                    "id": snapshot_id,
+                    "camera_id": camera_id,
+                    "source_path": source_path,
+                    "track_id": track_id,
+                    "event_type": "Fall Detected",
+                    "person_bbox": det["person_bbox"],
+                    "snapshot_path": snapshot_path,
+                    "detection_sensitivity": detection_sensitivity,
+                    "inactivity_timer_seconds": inactivity_timer_seconds,
+                })
+                ts["fall_saved"] = True
+
+        return detections_unscaled
 
     # -----------------------------------------------------------------------
     # Main loop
@@ -1295,8 +1434,9 @@ def video_producer(
                 view_detections = {}  # key -> scaled detections list
 
                 view_counting_data = {}  # key -> counting_data dict
-                all_views = _get_all_detection_views()
+                all_views = _get_all_detection_views(source_path)
                 dresscode_views = _get_detection_views(runtime_key)
+                fall_views = get_fall_detection_views(source_path)
 
                 for key, img in processed_frames.items():
                     try:
@@ -1304,11 +1444,12 @@ def video_producer(
 
                         # Run detection on target views only, respecting stride
                         if run_detection_this_frame and key in all_views:
-                            # Skip dress code classification if only counting needs this view
-                            only_counting = key not in dresscode_views
+                            needs_fall_detection = key in fall_views
+                            skip_classification = key not in dresscode_views
                             detections, people_count, track_state, perf = run_detection_and_classify(
                                 img, frame_count, track_state,
-                                skip_classification=only_counting,
+                                skip_classification=skip_classification,
+                                need_fall_detection=needs_fall_detection,
                                 view_key=key,
                             )
                             stage_ms["detect"] += perf.get("detect_ms", 0.0)
@@ -1324,6 +1465,9 @@ def video_producer(
                                 detections, track_state, img, runtime_key, source_path, view_key=key
                             )
                             stage_ms["policy_queue"] += (time.perf_counter() - policy_started_at) * 1000.0
+
+                            if needs_fall_detection:
+                                detections = _run_fall_detection_for_view(key, detections, img, source_path)
 
                             # Run people counting on unscaled detections
                             counting_started_at = time.perf_counter()
@@ -1366,15 +1510,17 @@ def video_producer(
             # --- Normal (non-fisheye) video processing ---
             try:
                 orig_h, orig_w = frame.shape[:2]
-                all_views = _get_all_detection_views()
+                all_views = _get_all_detection_views(source_path)
                 dresscode_views = _get_detection_views(runtime_key)
+                fall_views = get_fall_detection_views(source_path)
 
                 if run_detection_this_frame and "original" in all_views:
-                    # Skip dress code classification if only counting needs this view
-                    only_counting = "original" not in dresscode_views
+                    needs_fall_detection = "original" in fall_views
+                    skip_classification = "original" not in dresscode_views
                     detections, people_count, track_state, perf = run_detection_and_classify(
                         frame, frame_count, track_state,
-                        skip_classification=only_counting,
+                        skip_classification=skip_classification,
+                        need_fall_detection=needs_fall_detection,
                         view_key="original",
                     )
                     stage_ms["detect"] += perf.get("detect_ms", 0.0)
@@ -1389,6 +1535,9 @@ def video_producer(
                         detections, track_state, frame, runtime_key, source_path, view_key="original"
                     )
                     stage_ms["policy_queue"] += (time.perf_counter() - policy_started_at) * 1000.0
+
+                    if needs_fall_detection:
+                        detections = _run_fall_detection_for_view("original", detections, frame, source_path)
 
                     # Run people counting on unscaled detections
                     counting_started_at = time.perf_counter()

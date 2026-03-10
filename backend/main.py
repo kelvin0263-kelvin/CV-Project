@@ -11,6 +11,9 @@ from app.routers import camera_router
 from app.routers import policy_router
 from app.routers import detection_router
 from app.routers import counting_router
+from app.routers import auth_router
+from app.routers import fall_detection_router
+from app.services import auth_service
 from app.services.video_processor import stop_all_producer_threads
 
 
@@ -19,6 +22,16 @@ async def lifespan(app: FastAPI):
     """Create tables if they don't exist (dev convenience). In production use Alembic."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # Ensure the default admin account exists when the database is reachable.
+    try:
+        async with AsyncSessionLocal() as db:
+            changed = await auth_service.ensure_default_admin(db)
+            await db.commit()
+            if changed:
+                print("[Startup] Default admin account is ready")
+    except Exception as e:
+        print(f"[Startup] Warning: Could not ensure default admin account: {e}")
 
     # Sync dress code policy to runtime on startup
     try:
@@ -35,6 +48,12 @@ async def lifespan(app: FastAPI):
         await counting_router.load_counting_configs_from_db()
     except Exception as e:
         print(f"[Startup] Warning: Could not load counting configs: {e}")
+
+    # Load fall detection configs from DB into in-memory cache
+    try:
+        await fall_detection_router.load_fall_detection_configs_from_db()
+    except Exception as e:
+        print(f"[Startup] Warning: Could not load fall detection configs: {e}")
 
     # Start background task to persist violation events from the video producer
     task = asyncio.create_task(detection_router.violation_persistence_loop())
@@ -69,6 +88,8 @@ app.include_router(camera_router.router)
 app.include_router(policy_router.router)
 app.include_router(detection_router.router)
 app.include_router(counting_router.router)
+app.include_router(auth_router.router)
+app.include_router(fall_detection_router.router)
 
 if __name__ == "__main__":
     import uvicorn

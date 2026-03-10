@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from app.core.video_capture import open_video_capture
 from app.models.camera_model import Camera
 from app.models.dresscode_policy import DressCodePolicy
+from app.models.fall_detection_config import FallDetectionConfig
 from app.models.people_counting_config import PeopleCountingConfig
 from app.models.stream_config import StreamConfig
 from app.schemas.camera import CameraCreate, CameraRead
@@ -132,6 +133,15 @@ async def _derive_analysis_tags_by_camera(
         for camera_id in camera_ids:
             if camera_id in enabled_dress_ids:
                 tags_map[camera_id].append("Dress Code")
+
+    fall_result = await session.execute(
+        select(FallDetectionConfig.camera_id).where(
+            FallDetectionConfig.camera_id.in_(camera_ids),
+            FallDetectionConfig.enabled.is_(True),
+        )
+    )
+    for camera_id in set(fall_result.scalars().all()):
+        tags_map.setdefault(camera_id, []).append("Fall Detection")
 
     for camera_id in camera_ids:
         if not tags_map[camera_id]:

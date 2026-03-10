@@ -8,6 +8,33 @@ import { Label } from './ui/label';
 import StreamPlayer from './StreamPlayer';
 import { getApiBaseUrl, getWSUrl } from '../apiConfig';
 
+const CAMERA_ANALYSIS_TAGS_UPDATED_EVENT = 'camera-analysis-tags-updated';
+
+const inferOverlayMode = (analysisTags = []) => {
+    const normalizedTags = new Set(
+        (Array.isArray(analysisTags) ? analysisTags : []).map((tag) => String(tag).toLowerCase())
+    );
+
+    const hasCounting = normalizedTags.has('people counting');
+    const hasFall = normalizedTags.has('fall detection');
+    const hasDressCode = normalizedTags.has('dress code');
+    const activeModes = [hasCounting, hasFall, hasDressCode].filter(Boolean).length;
+
+    if (activeModes !== 1) {
+        return 'auto';
+    }
+    if (hasCounting) {
+        return 'counting';
+    }
+    if (hasFall) {
+        return 'fall';
+    }
+    if (hasDressCode) {
+        return 'dress-code';
+    }
+    return 'auto';
+};
+
 const SystemConfiguration = () => {
     const apiUrl = getApiBaseUrl();
     const [cameras, setCameras] = useState([]);
@@ -43,6 +70,17 @@ const SystemConfiguration = () => {
     useEffect(() => {
         fetchCameras();
         fetchSyncGroups();
+    }, []);
+
+    useEffect(() => {
+        const handleCameraTagsUpdated = () => {
+            fetchCameras();
+        };
+
+        window.addEventListener(CAMERA_ANALYSIS_TAGS_UPDATED_EVENT, handleCameraTagsUpdated);
+        return () => {
+            window.removeEventListener(CAMERA_ANALYSIS_TAGS_UPDATED_EVENT, handleCameraTagsUpdated);
+        };
     }, []);
 
     const fetchCameras = async () => {
@@ -392,7 +430,9 @@ const SystemConfiguration = () => {
                 <div className="flex-1 overflow-auto pr-2">
                     {!isAddMode && !isEditMode && !showUpload && (
                         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-                            {cameras.map((cam) => (
+                            {cameras.map((cam) => {
+                                const overlayMode = inferOverlayMode(cam.analysis_tags);
+                                return (
                                 <Card key={cam.id} className={cn("relative group overflow-hidden hover:border-primary/50 transition-all cursor-pointer border-muted", !cam.enabled && "opacity-60")}>
                                     <div className="aspect-video bg-muted relative flex items-center justify-center bg-black">
                                         {isStreamSource(cam) ? (
@@ -400,6 +440,8 @@ const SystemConfiguration = () => {
                                                 wsUrl={getWSUrl(`/ws/${cam.id}`)}
                                                 className="w-full h-full"
                                                 alt="Live Stream"
+                                                overlayMode={overlayMode}
+                                                showCountingAnchors={overlayMode === 'counting'}
                                             />
                                         ) : (
                                             <div className="flex flex-col items-center">
@@ -442,7 +484,8 @@ const SystemConfiguration = () => {
                                         </div>
                                     </CardContent>
                                 </Card>
-                            ))}
+                                );
+                            })}
                         </div>
                     )}
 
@@ -670,7 +713,7 @@ const SystemConfiguration = () => {
                                     )}
 
                                     <p className="text-xs text-muted-foreground">
-                                        Analysis tags are assigned from the People Counting and Dress Code pages.
+                                        Analysis tags are assigned from the People Counting, Dress Code, and Fall Detection pages.
                                     </p>
 
                                     {/* Footer Actions */}

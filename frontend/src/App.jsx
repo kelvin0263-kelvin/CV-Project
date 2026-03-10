@@ -10,20 +10,27 @@ import Login from './components/Login';
 import FallDetection from './components/FallDetection';
 import AccountSettings from './components/AccountSettings';
 import VideoUpload from './components/VideoUpload';
+import { clearAuthSession, getStoredToken, storeAuthSession, subscribeAuthChanges } from './apiConfig';
 
 function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(() => {
-    return localStorage.getItem('isAuthenticated') === 'true';
+    return Boolean(getStoredToken());
   });
 
-  const handleLogin = () => {
+  useEffect(() => {
+    return subscribeAuthChanges(() => {
+      setIsAuthenticated(Boolean(getStoredToken()));
+    });
+  }, []);
+
+  const handleLogin = (accessToken, user) => {
+    storeAuthSession(accessToken, user);
     setIsAuthenticated(true);
-    localStorage.setItem('isAuthenticated', 'true');
   };
 
   const handleLogout = () => {
+    clearAuthSession();
     setIsAuthenticated(false);
-    localStorage.removeItem('isAuthenticated');
   };
 
   return (

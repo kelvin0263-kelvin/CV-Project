@@ -81,7 +81,7 @@ def process_video(video_path, output_base_dir, tracker_cfg="bytetrack.yaml", def
 
     # Load Model (YOLO-Pose for keypoints)
     print("Loading yolo26n-Pose model...")
-    model = YOLO("yolo26m-pose.pt")  # Load an official Pose model
+    model = YOLO("D:/FinalYearProjectTCK/CV-Project/backend/yolo26m-pose.pt")  # Load an official Pose model
 
 
     # Open Video

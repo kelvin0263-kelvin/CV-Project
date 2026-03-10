@@ -9,6 +9,7 @@ from app.models.building_counting_config import BuildingCountingConfig
 from app.models.building_counting_snapshot import BuildingCountingSnapshot
 from app.models.people_counting_config import PeopleCountingConfig
 from app.models.people_counting_snapshot import PeopleCountingSnapshot
+from app.models.fall_detection_config import FallDetectionConfig
 
 __all__ = [
     "Base",
@@ -21,4 +22,5 @@ __all__ = [
     "BuildingCountingSnapshot",
     "PeopleCountingConfig",
     "PeopleCountingSnapshot",
+    "FallDetectionConfig",
 ]

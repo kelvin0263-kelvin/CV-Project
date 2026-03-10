@@ -465,7 +465,15 @@ const PeopleCounting = () => {
             <div ref={videoContainerRef} className="relative flex-1 min-h-[400px]">
                 {wsUrl ? (
                     <>
-                        <StreamPlayer wsUrl={wsUrl} className="w-full h-full" alt={selectedCam?.name || 'Camera Feed'} onStats={handleStats} onCountingData={handleCountingData} showCountingAnchors />
+                        <StreamPlayer
+                            wsUrl={wsUrl}
+                            className="w-full h-full"
+                            alt={selectedCam?.name || 'Camera Feed'}
+                            onStats={handleStats}
+                            onCountingData={handleCountingData}
+                            showCountingAnchors
+                            overlayMode="counting"
+                        />
                         <CountingCanvas
                             lines={lines}
                             frameExcludeAreas={validFrameExcludeAreas}

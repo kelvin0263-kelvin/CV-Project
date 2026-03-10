@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { NavLink, Outlet, Link } from 'react-router-dom';
 import { LayoutDashboard, Users, Shirt, Activity, BarChart3, Settings, Bell, LogOut, ArrowDownCircle, UploadCloud, AlertTriangle, X } from 'lucide-react';
 import { cn } from '../lib/utils';
-import { getApiBaseUrl } from '../apiConfig';
+import { getApiBaseUrl, getStoredUser } from '../apiConfig';
 import { Button } from './ui/button';
 
 const SidebarItem = ({ to, icon, label }) => {
@@ -90,6 +90,9 @@ const describeNotification = (event) => {
         const occupancy = event?.details?.occupancy ?? 0;
         const maxCapacity = event?.details?.max_capacity;
         return `Occupancy is ${occupancy}${maxCapacity ? ` / ${maxCapacity}` : ''}.`;
+    }
+    if (event?.event_type === 'Fall Detected') {
+        return 'A person remained in a fall pose long enough to trigger an alert.';
     }
 
     const label = event?.details?.label;
@@ -192,7 +195,9 @@ const Layout = ({ onLogout }) => {
                 if (!isMounted || !Array.isArray(data)) return;
 
                 const relevantEvents = data.filter((event) => (
-                    event?.event_type === 'Dress Code Violation' || event?.event_type === 'Capacity Exceeded'
+                    event?.event_type === 'Dress Code Violation'
+                    || event?.event_type === 'Capacity Exceeded'
+                    || event?.event_type === 'Fall Detected'
                 ));
 
                 setNotifications(relevantEvents);
@@ -245,6 +250,8 @@ const Layout = ({ onLogout }) => {
     const unreadCount = visibleNotifications.filter((event) => (
         parseApiTimestampMs(event?.timestamp) > lastNotificationReadAt
     )).length;
+    const currentUser = getStoredUser();
+    const userInitial = (currentUser?.username || currentUser?.email || 'A').charAt(0).toUpperCase();
 
     const handleNotificationToggle = () => {
         setShowNotificationsPanel((current) => {
@@ -371,12 +378,13 @@ const Layout = ({ onLogout }) => {
                                     <div className="max-h-[26rem] overflow-y-auto">
                                         {visibleNotifications.length === 0 ? (
                                             <div className="px-4 py-6 text-sm text-muted-foreground">
-                                                No dress code or capacity alerts yet.
+                                                No dress code, fall detection, or capacity alerts yet.
                                             </div>
                                         ) : (
                                             visibleNotifications.map((event) => {
                                                 const isUnread = parseApiTimestampMs(event?.timestamp) > lastNotificationReadAt;
                                                 const isCapacityEvent = event?.event_type === 'Capacity Exceeded';
+                                                const isFallEvent = event?.event_type === 'Fall Detected';
 
                                                 return (
                                                     <div
@@ -390,15 +398,25 @@ const Layout = ({ onLogout }) => {
                                                             <div
                                                                 className={cn(
                                                                     'mt-0.5 rounded-full p-2',
-                                                                    isCapacityEvent ? 'bg-red-500/10 text-red-500' : 'bg-amber-500/10 text-amber-600',
+                                                                    isCapacityEvent
+                                                                        ? 'bg-red-500/10 text-red-500'
+                                                                        : isFallEvent
+                                                                            ? 'bg-orange-500/10 text-orange-600'
+                                                                            : 'bg-amber-500/10 text-amber-600',
                                                                 )}
                                                             >
-                                                                {isCapacityEvent ? <AlertTriangle className="h-4 w-4" /> : <Shirt className="h-4 w-4" />}
+                                                                {isCapacityEvent ? (
+                                                                    <AlertTriangle className="h-4 w-4" />
+                                                                ) : isFallEvent ? (
+                                                                    <ArrowDownCircle className="h-4 w-4" />
+                                                                ) : (
+                                                                    <Shirt className="h-4 w-4" />
+                                                                )}
                                                             </div>
                                                             <div className="min-w-0 flex-1">
                                                                 <div className="flex items-center gap-2">
                                                                     <span className="text-sm font-medium text-foreground">
-                                                                        {isCapacityEvent ? 'Maximum Capacity Exceeded' : 'Dress Code Violation'}
+                                                                        {isCapacityEvent ? 'Maximum Capacity Exceeded' : isFallEvent ? 'Fall Detected' : 'Dress Code Violation'}
                                                                     </span>
                                                                     {isUnread && (
                                                                         <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-primary">
@@ -424,7 +442,7 @@ const Layout = ({ onLogout }) => {
                             )}
                         </div>
                         <Link to="/account" className="h-8 w-8 rounded-full bg-primary/20 flex items-center justify-center text-primary font-bold hover:bg-primary/30 transition-colors">
-                            A
+                            {userInitial}
                         </Link>
                         <button onClick={onLogout} className="h-8 w-8 rounded-full border bg-background p-0 text-muted-foreground hover:text-foreground" title="Logout">
                             <LogOut className="h-4 w-4 mx-auto" />

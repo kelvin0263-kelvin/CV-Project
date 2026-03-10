@@ -8,6 +8,7 @@ const StreamPlayer = ({
     onDetections,
     onCountingData,
     showCountingAnchors = false,
+    overlayMode = 'auto',
 }) => {
     const imgRef = useRef(null);
     const canvasRef = useRef(null);
@@ -42,6 +43,90 @@ const StreamPlayer = ({
         }
         return { displayW, displayH, offsetX, offsetY };
     }, []);
+
+    const getOverlayVisual = useCallback((det) => {
+        const normalizedMode = String(overlayMode || 'auto').toLowerCase();
+        const isViolation = Boolean(det.violation);
+        const isFallDetected = Boolean(det.fall_detected);
+        const isFallPose = Boolean(det.fall_pose);
+        const confidence = Math.round((det.confidence || 0) * 100);
+        const clothingLabel = det.label
+            ? `${det.label.replace(/_/g, ' ')} ${confidence}%`
+            : 'Person';
+
+        if (normalizedMode === 'counting') {
+            return {
+                color: '#06b6d4',
+                lineWidth: 2.5,
+                dash: [8, 4],
+                label: det.track_id !== null && det.track_id !== undefined ? `Track ${det.track_id}` : 'Counting target',
+                labelTextColor: '#ffffff',
+                labelBgColor: '#0891b2',
+                showTrackId: false,
+            };
+        }
+
+        if (normalizedMode === 'fall') {
+            if (isFallDetected) {
+                return {
+                    color: '#ef4444',
+                    lineWidth: 3,
+                    dash: [],
+                    label: 'Fall detected',
+                    labelTextColor: '#ffffff',
+                    labelBgColor: '#b91c1c',
+                    showTrackId: true,
+                };
+            }
+
+            if (isFallPose) {
+                return {
+                    color: '#f59e0b',
+                    lineWidth: 2.5,
+                    dash: [],
+                    label: 'Fall risk',
+                    labelTextColor: '#111827',
+                    labelBgColor: '#fbbf24',
+                    showTrackId: true,
+                };
+            }
+
+            return {
+                color: '#94a3b8',
+                lineWidth: 2,
+                dash: [4, 4],
+                label: null,
+                labelTextColor: '#ffffff',
+                labelBgColor: '#475569',
+                showTrackId: true,
+            };
+        }
+
+        if (normalizedMode === 'dress-code' || normalizedMode === 'dresscode') {
+            return {
+                color: isViolation ? '#ef4444' : '#2563eb',
+                lineWidth: isViolation ? 3 : 2,
+                dash: [],
+                label: clothingLabel,
+                labelTextColor: '#ffffff',
+                labelBgColor: isViolation ? '#b91c1c' : '#1d4ed8',
+                showTrackId: true,
+            };
+        }
+
+        const eventLabel = isFallDetected ? 'Fall detected' : isFallPose ? 'Fall risk' : null;
+        return {
+            color: isViolation || isFallDetected ? '#ef4444' : isFallPose ? '#f59e0b' : '#22c55e',
+            lineWidth: 2,
+            dash: [],
+            label: det.label
+                ? `${det.label.replace(/_/g, ' ')} ${confidence}%`
+                : eventLabel,
+            labelTextColor: '#ffffff',
+            labelBgColor: isViolation || isFallDetected ? '#dc2626' : isFallPose ? '#f59e0b' : '#16a34a',
+            showTrackId: true,
+        };
+    }, [overlayMode]);
 
     // --- Draw detections on canvas overlay ---
     const drawDetections = useCallback((detections) => {
@@ -78,25 +163,24 @@ const StreamPlayer = ({
             const sy1 = y1 * scaleY + offsetY;
             const sw = (x2 - x1) * scaleX;
             const sh = (y2 - y1) * scaleY;
-
-            const isViolation = det.violation;
-            const color = isViolation ? '#ef4444' : '#22c55e'; // red vs green
+            const visual = getOverlayVisual(det);
 
             // Draw person bounding box
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 2;
+            ctx.setLineDash(Array.isArray(visual.dash) ? visual.dash : []);
+            ctx.strokeStyle = visual.color;
+            ctx.lineWidth = visual.lineWidth || 2;
             ctx.strokeRect(sx1, sy1, sw, sh);
 
             // Draw label background + text
-            if (det.label) {
-                const label = `${det.label.replace(/_/g, ' ')} ${Math.round((det.confidence || 0) * 100)}%`;
+            const label = visual.label;
+            if (label) {
                 ctx.font = `bold ${Math.max(10, 12 * scaleX)}px sans-serif`;
                 const textMetrics = ctx.measureText(label);
                 const textHeight = 14 * scaleY;
                 const padding = 4 * scaleX;
 
                 // Background
-                ctx.fillStyle = color;
+                ctx.fillStyle = visual.labelBgColor || visual.color;
                 ctx.fillRect(
                     sx1,
                     sy1 - textHeight - padding * 2,
@@ -105,12 +189,13 @@ const StreamPlayer = ({
                 );
 
                 // Text
-                ctx.fillStyle = '#ffffff';
+                ctx.fillStyle = visual.labelTextColor || '#ffffff';
                 ctx.fillText(label, sx1 + padding, sy1 - padding);
             }
 
             // Draw track ID if available
-            if (det.track_id !== null && det.track_id !== undefined) {
+            ctx.setLineDash([]);
+            if (visual.showTrackId && det.track_id !== null && det.track_id !== undefined) {
                 const idLabel = `ID: ${det.track_id}`;
                 ctx.font = `${Math.max(9, 10 * scaleX)}px sans-serif`;
                 ctx.fillStyle = 'rgba(0,0,0,0.6)';
@@ -137,7 +222,7 @@ const StreamPlayer = ({
                 ctx.stroke();
             }
         });
-    }, [getImageDisplayArea, showCountingAnchors]);
+    }, [getImageDisplayArea, getOverlayVisual, showCountingAnchors]);
 
     useEffect(() => {
         if (!wsUrl) return;

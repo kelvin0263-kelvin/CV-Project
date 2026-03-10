@@ -795,6 +795,8 @@ const Reporting = () => {
             let url = `${apiUrl}/api/detection-events?limit=200`;
             if (selectedCategory === 'Dress Code') {
                 url += '&event_type=Dress Code Violation';
+            } else if (selectedCategory === 'Fall Detection') {
+                url += '&event_type=Fall Detected';
             } else if (selectedCategory === 'People Counting') {
                 url += '&event_type=Capacity Exceeded';
             }
@@ -952,7 +954,7 @@ const Reporting = () => {
             const eventRows = filteredEvents.map(e => ({ ...e, _isSnapshot: false }));
             return [...eventRows, ...snapshotRows].sort((a, b) => getTimestampMs(b.timestamp) - getTimestampMs(a.timestamp));
         }
-        // Dress Code only
+        // Detection-only categories
         return filteredEvents.map(e => ({ ...e, _isSnapshot: false }));
     })();
 
@@ -1068,7 +1070,7 @@ const Reporting = () => {
                     <div className="space-y-2">
                         <label className="text-sm font-medium">Report Category</label>
                         <div className="flex bg-muted rounded-md p-1 h-10 items-center">
-                            {['All', 'Dress Code', 'People Counting'].map(cat => (
+                            {['All', 'Dress Code', 'Fall Detection', 'People Counting'].map(cat => (
                                 <button key={cat} onClick={() => handleCategoryChange(cat)}
                                     className={cn("px-3 py-1.5 text-sm font-medium rounded-sm transition-all flex-1 whitespace-nowrap",
                                         selectedCategory === cat ? "bg-background shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground")}>

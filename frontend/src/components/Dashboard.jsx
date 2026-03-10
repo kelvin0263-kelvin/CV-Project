@@ -11,11 +11,37 @@ const RECENT_DETECTIONS = [
     { id: 3, type: 'Person', time: '10:39 AM', camera: 'Corridor B', image: '/hallway.png', person: 'Visitor' },
 ];
 
+const inferOverlayMode = (analysisTags = []) => {
+    const normalizedTags = new Set(
+        (Array.isArray(analysisTags) ? analysisTags : []).map((tag) => String(tag).toLowerCase())
+    );
+
+    const hasCounting = normalizedTags.has('people counting');
+    const hasFall = normalizedTags.has('fall detection');
+    const hasDressCode = normalizedTags.has('dress code');
+    const activeModes = [hasCounting, hasFall, hasDressCode].filter(Boolean).length;
+
+    if (activeModes !== 1) {
+        return 'auto';
+    }
+    if (hasCounting) {
+        return 'counting';
+    }
+    if (hasFall) {
+        return 'fall';
+    }
+    if (hasDressCode) {
+        return 'dress-code';
+    }
+    return 'auto';
+};
+
 const CameraFeedCard = ({ camera }) => {
     const [stats, setStats] = useState({ fps: 0, people_count: 0 });
     const [countingData, setCountingData] = useState({});
     const wsUrl = getWSUrl(`/ws/${camera.id}`);
     const isStreamSource = camera.type.includes("RTSP") || camera.type.includes("File") || camera.type.includes("Fisheye");
+    const overlayMode = inferOverlayMode(camera.analysis_tags);
 
     const hasCountingData = countingData && (countingData.total_in > 0 || countingData.total_out > 0);
 
@@ -29,6 +55,8 @@ const CameraFeedCard = ({ camera }) => {
                     alt={camera.name}
                     onStats={setStats}
                     onCountingData={setCountingData}
+                    overlayMode={overlayMode}
+                    showCountingAnchors={overlayMode === 'counting'}
                 />
             ) : (
                 <div className="absolute inset-0 bg-muted/20 flex items-center justify-center text-muted-foreground">

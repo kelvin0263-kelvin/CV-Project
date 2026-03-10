@@ -123,6 +123,15 @@ async def violation_persistence_loop():
                             "occupancy": evt.get("occupancy"),
                             "max_capacity": evt.get("max_capacity"),
                         }
+                    elif event_type == "Fall Detected":
+                        details = {
+                            "person_bbox": evt.get("person_bbox"),
+                            "track_id": evt.get("track_id"),
+                            "snapshot_path": evt.get("snapshot_path"),
+                            "source_path": evt.get("source_path"),
+                            "detection_sensitivity": evt.get("detection_sensitivity"),
+                            "inactivity_timer_seconds": evt.get("inactivity_timer_seconds"),
+                        }
                     else:
                         details = {
                             "label": evt.get("label"),
