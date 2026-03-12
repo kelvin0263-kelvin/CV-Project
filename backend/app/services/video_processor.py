@@ -18,6 +18,7 @@ import hashlib
 import re
 import subprocess
 import inspect
+from collections import deque
 import numpy as np
 
 # Ensure backend root is in path to import DefishVideoCV
@@ -65,65 +66,46 @@ os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
 
 # Fixed runtime tuning for the current project.
-POSE_MODEL_PATH = os.path.join(BACKEND_ROOT, "yolo26m-pose.pt")
-TRACKER_CONFIG_PATH = os.getenv(
-    "TRACKER_CONFIG_PATH",
-    os.path.join(BACKEND_ROOT, "botsort_custom.yaml"),
-)
-YOLO_DEVICE = os.getenv("YOLO_DEVICE")
-
-
-def _get_env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return default
-
-
-def _get_env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _get_env_str(name: str, default: str) -> str:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    value = raw.strip()
-    return value or default
-
-
-POSE_TRACK_IMGSZ = max(320, _get_env_int("POSE_TRACK_IMGSZ", 736))
-DETECTION_STRIDE = max(1, _get_env_int("DETECTION_STRIDE", 1))
-COUNTING_SNAPSHOT_HEARTBEAT_SEC = max(60, _get_env_int("COUNTING_SNAPSHOT_HEARTBEAT_SEC", 300))
-DRESSCODE_RECLASSIFY_FRAMES = max(1, _get_env_int("DRESSCODE_RECLASSIFY_FRAMES", 30))
-PERF_LOG_INTERVAL_FRAMES = max(1, _get_env_int("PERF_LOG_INTERVAL_FRAMES", 30))
-PERF_STAGE_LOGS = _get_env_bool("PERF_STAGE_LOGS", True)
-MULTI_STREAM_BATCH_INFER = _get_env_bool("MULTI_STREAM_BATCH_INFER", True)
-BATCH_INFER_WINDOW_MS = max(1, _get_env_int("BATCH_INFER_WINDOW_MS", 5))
-BATCH_INFER_MAX_BATCH = max(1, _get_env_int("BATCH_INFER_MAX_BATCH", 8))
-BATCH_INFER_WAIT_MS = max(50, _get_env_int("BATCH_INFER_WAIT_MS", 1500))
-RTSP_MAX_CONSECUTIVE_READ_FAILURES = max(1, _get_env_int("RTSP_MAX_CONSECUTIVE_READ_FAILURES", 5))
-RTSP_READ_FAILURE_BACKOFF_MS = max(0, _get_env_int("RTSP_READ_FAILURE_BACKOFF_MS", 100))
-NVENC_OUTPUT_ENABLED = _get_env_bool("NVENC_OUTPUT_ENABLED", False)
-NVENC_OUTPUT_DIR = _get_env_str(
-    "NVENC_OUTPUT_DIR",
-    os.path.join(PROJECT_ROOT, "temp_video_uploads", "nvenc_outputs"),
-)
-NVENC_OUTPUT_CONTAINER = _get_env_str("NVENC_OUTPUT_CONTAINER", "mp4").lower()
-NVENC_CODEC = _get_env_str("NVENC_CODEC", "h264_nvenc")
-NVENC_PRESET = _get_env_str("NVENC_PRESET", "p4")
-NVENC_TUNE = _get_env_str("NVENC_TUNE", "ll")
-NVENC_RATE_CONTROL = _get_env_str("NVENC_RATE_CONTROL", "vbr")
-NVENC_BITRATE_K = max(256, _get_env_int("NVENC_BITRATE_K", 2500))
-NVENC_MAXRATE_K = max(NVENC_BITRATE_K, _get_env_int("NVENC_MAXRATE_K", 3500))
-NVENC_BUFSIZE_K = max(NVENC_MAXRATE_K, _get_env_int("NVENC_BUFSIZE_K", 7000))
-FFMPEG_BIN = _get_env_str("FFMPEG_BIN", "ffmpeg")
+POSE_MODEL_PATH = os.path.join(BACKEND_ROOT, "yolo26n-pose.pt")
+TRACKER_CONFIG_PATH = os.path.join(BACKEND_ROOT, "botsort_custom.yaml")
+YOLO_DEVICE = None
+POSE_TRACK_IMGSZ = 736
+DETECTION_STRIDE = 3
+COUNTING_SNAPSHOT_HEARTBEAT_SEC = 300
+DRESSCODE_RECLASSIFY_FRAMES = 30
+PERF_LOG_INTERVAL_FRAMES = 30
+PERF_STAGE_LOGS = True
+MULTI_STREAM_BATCH_INFER = True
+BATCH_INFER_WINDOW_MS = 5
+BATCH_INFER_MAX_BATCH = 8
+BATCH_INFER_WAIT_MS = 1500
+ASYNC_CAPTURE_ENABLED = True
+ASYNC_CAPTURE_QUEUE_SIZE = 2
+ASYNC_CAPTURE_READ_TIMEOUT_MS = 1000
+RTSP_ENABLE_NVDEC = False
+RTSP_MAX_CONSECUTIVE_READ_FAILURES = 120
+RTSP_READ_FAILURE_BACKOFF_MS = 50
+RTSP_CORRUPT_FRAME_DETECTION_ENABLED = False
+RTSP_CORRUPT_FRAME_RECOVERY_THRESHOLD = 999
+RTSP_KEEP_LAST_FRAME_ON_RECOVERY = True
+RTSP_CORRUPT_FRAME_STDDEV_MAX = 4.0
+RTSP_CORRUPT_FRAME_RANGE_MAX = 18.0
+RTSP_CORRUPT_FRAME_COLOR_DELTA_MAX = 2.5
+RTSP_CORRUPT_FRAME_DIFF_MIN = 18.0
+RTSP_CORRUPT_FRAME_EDGE_VAR_MAX = 0.0
+RTSP_HW_FALLBACK_FAILURE_WINDOW_SEC = 10.0
+RTSP_HW_FALLBACK_FAILURE_THRESHOLD = 3
+NVENC_OUTPUT_ENABLED = True
+NVENC_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "temp_video_uploads", "nvenc_outputs")
+NVENC_OUTPUT_CONTAINER = "mp4"
+NVENC_CODEC = "h264_nvenc"
+NVENC_PRESET = "p4"
+NVENC_TUNE = "ll"
+NVENC_RATE_CONTROL = "vbr"
+NVENC_BITRATE_K = 2500
+NVENC_MAXRATE_K = 3500
+NVENC_BUFSIZE_K = 7000
+FFMPEG_BIN = "ffmpeg"
 
 # ---------------------------------------------------------------------------
 # Initialize TurboJPEG
@@ -155,17 +137,14 @@ def drain_violation_queue() -> list:
     return events
 
 
-def _is_rtsp_source(source_path: str) -> bool:
-    return is_rtsp_source(source_path)
-
-
 def _build_source_meta(source_path: str) -> dict:
-    is_rtsp_source = _is_rtsp_source(source_path)
-    if is_rtsp_source:
+    is_rtsp_stream = is_rtsp_source(source_path)
+    if is_rtsp_stream:
         return {
             "is_file_source": False,
             "is_uploaded_source": False,
             "is_rtsp_source": True,
+            "is_network_stream_source": True,
         }
 
     source_abs = os.path.abspath(source_path)
@@ -178,16 +157,278 @@ def _build_source_meta(source_path: str) -> dict:
         "is_file_source": os.path.isfile(source_abs),
         "is_uploaded_source": is_uploaded_source,
         "is_rtsp_source": False,
+        "is_network_stream_source": False,
     }
-
-
-def _open_video_capture(source_path: str, source_meta: dict) -> cv2.VideoCapture:
-    return open_video_capture(source_path, is_rtsp=bool(source_meta.get("is_rtsp_source")))
 
 
 def _sanitize_token(value: str, fallback: str = "stream") -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", (value or "").strip()).strip("._-")
     return cleaned or fallback
+
+
+def _build_frame_health_signature(frame: np.ndarray) -> np.ndarray | None:
+    if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+        return None
+    if frame.ndim < 2 or frame.shape[0] < 2 or frame.shape[1] < 2:
+        return None
+
+    small = cv2.resize(frame, (64, 36), interpolation=cv2.INTER_AREA)
+    if small.ndim == 2:
+        gray = small.astype(np.float32)
+    else:
+        if small.shape[2] > 3:
+            small = small[:, :, :3]
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    return gray
+
+
+def _set_runtime_stream_status(
+    runtime_key: str,
+    *,
+    status: str,
+    reason: str | None = None,
+    clear_images: bool = False,
+):
+    with PRODUCER_LOCK:
+        current_buffer = FRAME_BUFFERS.get(runtime_key)
+        if clear_images or current_buffer is None:
+            current_buffer = {}
+        else:
+            current_buffer = {
+                key: value for key, value in current_buffer.items() if key == "__meta__"
+            }
+
+        meta = dict(current_buffer.get("__meta__", {}))
+        meta["stream_status"] = status
+        if reason:
+            meta["stream_reason"] = reason
+        else:
+            meta.pop("stream_reason", None)
+        current_buffer["__meta__"] = meta
+        FRAME_BUFFERS[runtime_key] = current_buffer
+
+
+def _detect_corrupted_rtsp_frame(
+    frame: np.ndarray,
+    previous_signature: np.ndarray | None,
+) -> tuple[bool, str | None, np.ndarray | None]:
+    signature = _build_frame_health_signature(frame)
+    if signature is None:
+        return True, "empty_or_invalid_frame", None
+
+    if not np.isfinite(signature).all():
+        return True, "non_finite_pixels", None
+
+    if not RTSP_CORRUPT_FRAME_DETECTION_ENABLED:
+        return False, None, signature
+
+    stddev = float(signature.std())
+    luma_range = float(signature.max() - signature.min())
+
+    color_delta = 0.0
+    if frame.ndim == 3 and frame.shape[2] >= 3:
+        small = cv2.resize(frame[:, :, :3], (64, 36), interpolation=cv2.INTER_AREA).astype(np.float32)
+        color_delta = float(
+            (
+                np.abs(small[:, :, 0] - small[:, :, 1])
+                + np.abs(small[:, :, 1] - small[:, :, 2])
+                + np.abs(small[:, :, 0] - small[:, :, 2])
+            ).mean() / 3.0
+        )
+
+    if previous_signature is None:
+        return False, None, signature
+
+    frame_diff = float(np.mean(np.abs(signature - previous_signature)))
+    edge_var = float(cv2.Laplacian(signature, cv2.CV_32F).var())
+    if (
+        stddev <= RTSP_CORRUPT_FRAME_STDDEV_MAX
+        and luma_range <= RTSP_CORRUPT_FRAME_RANGE_MAX
+        and color_delta <= RTSP_CORRUPT_FRAME_COLOR_DELTA_MAX
+        and frame_diff >= RTSP_CORRUPT_FRAME_DIFF_MIN
+    ):
+        reason = (
+            "suspected_decoder_corruption"
+            f"(std={stddev:.1f},range={luma_range:.1f},color={color_delta:.1f},diff={frame_diff:.1f})"
+        )
+        return True, reason, signature
+
+    if (
+        RTSP_CORRUPT_FRAME_EDGE_VAR_MAX > 0.0
+        and edge_var <= RTSP_CORRUPT_FRAME_EDGE_VAR_MAX
+        and frame_diff >= (RTSP_CORRUPT_FRAME_DIFF_MIN * 0.75)
+        and stddev <= max(RTSP_CORRUPT_FRAME_STDDEV_MAX * 2.0, RTSP_CORRUPT_FRAME_STDDEV_MAX + 4.0)
+        and color_delta <= max(RTSP_CORRUPT_FRAME_COLOR_DELTA_MAX * 2.0, 6.0)
+    ):
+        reason = (
+            "suspected_blurred_decoder_corruption"
+            f"(edge_var={edge_var:.1f},std={stddev:.1f},range={luma_range:.1f},"
+            f"color={color_delta:.1f},diff={frame_diff:.1f})"
+        )
+        return True, reason, signature
+
+    return False, None, signature
+
+
+def _build_perf_dict(
+    *,
+    detect_ms: float = 0.0,
+    detect_total_ms: float | None = None,
+    batch_size: int = 1,
+    classify_ms: float = 0.0,
+    classify_candidates: int = 0,
+    classified: int = 0,
+    infer_wait_ms: float = 0.0,
+    infer_predict_ms: float = 0.0,
+    infer_predict_total_ms: float | None = None,
+    infer_post_ms: float = 0.0,
+) -> dict:
+    return {
+        "detect_ms": detect_ms,
+        "detect_total_ms": detect_ms if detect_total_ms is None else detect_total_ms,
+        "batch_size": batch_size,
+        "classify_ms": classify_ms,
+        "classify_candidates": classify_candidates,
+        "classified": classified,
+        "infer_wait_ms": infer_wait_ms,
+        "infer_predict_ms": infer_predict_ms,
+        "infer_predict_total_ms": (
+            infer_predict_ms if infer_predict_total_ms is None else infer_predict_total_ms
+        ),
+        "infer_post_ms": infer_post_ms,
+    }
+
+
+def _empty_detection_result(
+    track_state: dict,
+    *,
+    batch_size: int = 1,
+    detect_ms: float = 0.0,
+    detect_total_ms: float | None = None,
+    infer_wait_ms: float = 0.0,
+) -> tuple[list[dict], int, dict, dict]:
+    return [], 0, track_state, _build_perf_dict(
+        detect_ms=detect_ms,
+        detect_total_ms=detect_total_ms,
+        batch_size=batch_size,
+        infer_wait_ms=infer_wait_ms,
+    )
+
+
+def _handle_rtsp_capture_failure_common(
+    *,
+    reason: str,
+    runtime_key: str,
+    rtsp_read_failures: int,
+    recent_rtsp_failure_times: deque[float],
+    capture_allow_hwaccel: bool,
+    reopen_capture,
+) -> tuple[int, bool, bool]:
+    rtsp_read_failures += 1
+    is_decoder_corruption = (
+        reason.startswith("suspected_decoder_corruption")
+        or reason.startswith("suspected_blurred_decoder_corruption")
+    )
+    clear_images_on_recovery = not RTSP_KEEP_LAST_FRAME_ON_RECOVERY
+    failure_now = time.time()
+    recent_rtsp_failure_times.append(failure_now)
+    while (
+        recent_rtsp_failure_times
+        and (failure_now - recent_rtsp_failure_times[0]) > RTSP_HW_FALLBACK_FAILURE_WINDOW_SEC
+    ):
+        recent_rtsp_failure_times.popleft()
+
+    if is_decoder_corruption and rtsp_read_failures < RTSP_CORRUPT_FRAME_RECOVERY_THRESHOLD:
+        if rtsp_read_failures == 1:
+            print(
+                f"[Producer] Decoder corruption suspected; tolerating up to "
+                f"{RTSP_CORRUPT_FRAME_RECOVERY_THRESHOLD} consecutive corrupted frame(s) "
+                f"before reconnect: runtime_key={runtime_key}, last_reason={reason}"
+            )
+        time.sleep(RTSP_READ_FAILURE_BACKOFF_MS / 1000.0)
+        return rtsp_read_failures, capture_allow_hwaccel, False
+
+    if is_decoder_corruption and capture_allow_hwaccel:
+        capture_allow_hwaccel = False
+        _set_runtime_stream_status(
+            runtime_key,
+            status="recovering",
+            reason=reason,
+            clear_images=clear_images_on_recovery,
+        )
+        print(
+            f"[Producer] Decoder corruption detected with hardware decode; switching immediately "
+            f"to software decode: runtime_key={runtime_key}, last_reason={reason}"
+        )
+        reopen_capture(0.2, capture_allow_hwaccel)
+        recent_rtsp_failure_times.clear()
+        return 0, capture_allow_hwaccel, True
+
+    if is_decoder_corruption:
+        _set_runtime_stream_status(
+            runtime_key,
+            status="recovering",
+            reason=reason,
+            clear_images=clear_images_on_recovery,
+        )
+        print(
+            f"[Producer] Decoder corruption detected; reconnecting immediately: "
+            f"runtime_key={runtime_key}, last_reason={reason}"
+        )
+        reopen_capture(0.2, capture_allow_hwaccel)
+        recent_rtsp_failure_times.clear()
+        return 0, capture_allow_hwaccel, True
+
+    if capture_allow_hwaccel and len(recent_rtsp_failure_times) >= RTSP_HW_FALLBACK_FAILURE_THRESHOLD:
+        capture_allow_hwaccel = False
+        _set_runtime_stream_status(
+            runtime_key,
+            status="recovering",
+            reason=reason,
+            clear_images=clear_images_on_recovery,
+        )
+        print(
+            f"[Producer] RTSP decoder unstable with hardware decode; switching to software decode "
+            f"after {len(recent_rtsp_failure_times)} failures within "
+            f"{RTSP_HW_FALLBACK_FAILURE_WINDOW_SEC:.1f}s: runtime_key={runtime_key}, "
+            f"last_reason={reason}"
+        )
+        reopen_capture(0.5, capture_allow_hwaccel)
+        recent_rtsp_failure_times.clear()
+        return 0, capture_allow_hwaccel, True
+
+    if rtsp_read_failures < RTSP_MAX_CONSECUTIVE_READ_FAILURES:
+        if rtsp_read_failures == 1:
+            print(
+                f"[Producer] RTSP frame failure ({reason}); tolerating up to "
+                f"{RTSP_MAX_CONSECUTIVE_READ_FAILURES} consecutive failures before recovery: "
+                f"runtime_key={runtime_key}"
+            )
+        time.sleep(RTSP_READ_FAILURE_BACKOFF_MS / 1000.0)
+        return rtsp_read_failures, capture_allow_hwaccel, False
+
+    switch_to_software = bool(capture_allow_hwaccel)
+    if switch_to_software:
+        capture_allow_hwaccel = False
+        print(
+            f"[Producer] RTSP decoder unstable after {rtsp_read_failures} consecutive failures; "
+            f"switching to software decode: runtime_key={runtime_key}, last_reason={reason}"
+        )
+    else:
+        print(
+            f"[Producer] RTSP frame failure persisted for {rtsp_read_failures} consecutive reads; "
+            f"reconnecting: runtime_key={runtime_key}, last_reason={reason}"
+        )
+
+    _set_runtime_stream_status(
+        runtime_key,
+        status="recovering",
+        reason=reason,
+        clear_images=clear_images_on_recovery,
+    )
+    reopen_capture(0.5, capture_allow_hwaccel)
+    recent_rtsp_failure_times.clear()
+    return 0, capture_allow_hwaccel, True
 
 
 try:
@@ -419,29 +660,23 @@ class _BatchInferenceEngine:
             "done": done,
             "result": None,
         }
+        wait_started_at = time.perf_counter()
         self._req_queue.put(req)
 
         if not done.wait(timeout=BATCH_INFER_WAIT_MS / 1000.0):
-            return [], 0, track_state, {
-                "detect_ms": 0.0,
-                "detect_total_ms": 0.0,
-                "batch_size": 1,
-                "classify_ms": 0.0,
-                "classify_candidates": 0,
-                "classified": 0,
-            }
+            infer_wait_ms = (time.perf_counter() - wait_started_at) * 1000.0
+            return _empty_detection_result(track_state, infer_wait_ms=infer_wait_ms)
 
         result = req.get("result")
         if result is None:
-            return [], 0, track_state, {
-                "detect_ms": 0.0,
-                "detect_total_ms": 0.0,
-                "batch_size": 1,
-                "classify_ms": 0.0,
-                "classify_candidates": 0,
-                "classified": 0,
-            }
-        return result
+            infer_wait_ms = (time.perf_counter() - wait_started_at) * 1000.0
+            return _empty_detection_result(track_state, infer_wait_ms=infer_wait_ms)
+
+        infer_wait_ms = (time.perf_counter() - wait_started_at) * 1000.0
+        detections, people_count, updated_track_state, perf = result
+        perf = dict(perf)
+        perf["infer_wait_ms"] = infer_wait_ms
+        return detections, people_count, updated_track_state, perf
 
     def _worker_loop(self):
         batch_window_sec = BATCH_INFER_WINDOW_MS / 1000.0
@@ -487,18 +722,9 @@ class _BatchInferenceEngine:
         except Exception as e:
             print(f"[BatchInfer] Predict error: {e}")
             for req in batch:
-                req["result"] = (
-                    [],
-                    0,
+                req["result"] = _empty_detection_result(
                     req["track_state"],
-                    {
-                        "detect_ms": 0.0,
-                        "detect_total_ms": 0.0,
-                        "batch_size": len(batch),
-                        "classify_ms": 0.0,
-                        "classify_candidates": 0,
-                        "classified": 0,
-                    },
+                    batch_size=len(batch),
                 )
                 req["done"].set()
             return
@@ -513,6 +739,7 @@ class _BatchInferenceEngine:
             classify_candidates: list[dict] = []
             classified_count = 0
             classify_ms = 0.0
+            req_post_started_at = time.perf_counter()
 
             boxes = result.boxes
             tracker = self._get_tracker(req["stream_id"])
@@ -612,35 +839,31 @@ class _BatchInferenceEngine:
                         }
                     )
 
+            req_total_post_ms = (time.perf_counter() - req_post_started_at) * 1000.0
+            req_post_ms = max(0.0, req_total_post_ms - classify_ms)
             req["result"] = (
                 detections,
                 len(tracked),
                 track_state,
-                {
-                    "detect_ms": detect_ms_each,
-                    "detect_total_ms": detect_ms_total,
-                    "batch_size": len(batch),
-                    "classify_ms": classify_ms,
-                    "classify_candidates": len(classify_candidates),
-                    "classified": classified_count,
-                },
+                _build_perf_dict(
+                    detect_ms=detect_ms_each,
+                    detect_total_ms=detect_ms_total,
+                    batch_size=len(batch),
+                    classify_ms=classify_ms,
+                    classify_candidates=len(classify_candidates),
+                    classified=classified_count,
+                    infer_predict_ms=detect_ms_each,
+                    infer_predict_total_ms=detect_ms_total,
+                    infer_post_ms=req_post_ms,
+                ),
             )
             req["done"].set()
 
         if processed < len(batch):
             for req in batch[processed:]:
-                req["result"] = (
-                    [],
-                    0,
+                req["result"] = _empty_detection_result(
                     req["track_state"],
-                    {
-                        "detect_ms": 0.0,
-                        "detect_total_ms": 0.0,
-                        "batch_size": len(batch),
-                        "classify_ms": 0.0,
-                        "classify_candidates": 0,
-                        "classified": 0,
-                    },
+                    batch_size=len(batch),
                 )
                 req["done"].set()
 
@@ -655,6 +878,203 @@ def _get_batch_infer_engine() -> _BatchInferenceEngine:
         if _BATCH_INFER_ENGINE is None:
             _BATCH_INFER_ENGINE = _BatchInferenceEngine()
         return _BATCH_INFER_ENGINE
+
+
+class _AsyncFrameReader:
+    """Owns VideoCapture in a separate thread and keeps only the latest frames."""
+
+    def __init__(
+        self,
+        *,
+        runtime_key: str,
+        source_path: str,
+        source_meta: dict,
+        stop_event: threading.Event,
+        cap: cv2.VideoCapture,
+        capture_allow_hwaccel: bool,
+    ):
+        self.runtime_key = runtime_key
+        self.source_path = source_path
+        self.source_meta = source_meta
+        self.stop_event = stop_event
+        self._cap = cap
+        self._capture_allow_hwaccel = capture_allow_hwaccel
+        self._queue: queue.Queue = queue.Queue(maxsize=ASYNC_CAPTURE_QUEUE_SIZE)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._closed = threading.Event()
+        self._rtsp_read_failures = 0
+        self._recent_rtsp_failure_times: deque[float] = deque()
+        self._last_good_frame_signature: np.ndarray | None = None
+        self._fatal_reason: str | None = None
+        self._reached_eof = False
+
+    def start(self):
+        self._thread.start()
+
+    def read(self, timeout: float) -> dict | None:
+        try:
+            item = self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+        latest = item
+        while True:
+            try:
+                latest = self._queue.get_nowait()
+            except queue.Empty:
+                break
+        return latest
+
+    def close(self, join_timeout: float = 2.0):
+        self._closed.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=join_timeout)
+        if self._thread.is_alive():
+            print(f"[Producer] Async reader still stopping for runtime_key={self.runtime_key}")
+
+    def _enqueue_frame(self, item: dict):
+        while not self.stop_event.is_set() and not self._closed.is_set():
+            try:
+                self._queue.put_nowait(item)
+                return
+            except queue.Full:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    pass
+
+    def _enqueue_control(self, item: dict):
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            self._queue.put_nowait(item)
+        except queue.Full:
+            pass
+
+    def _reopen_capture(self, sleep_seconds: float):
+        cap = self._cap
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+
+        if self.stop_event.is_set() or self._closed.is_set():
+            self._cap = None
+            return
+
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+        self._cap = open_video_capture(
+            self.source_path,
+            is_rtsp=bool(self.source_meta.get("is_rtsp_source")),
+            allow_hwaccel=self._capture_allow_hwaccel,
+        )
+
+    def _handle_rtsp_capture_failure(self, reason: str):
+        self._rtsp_read_failures, self._capture_allow_hwaccel, reset_signature = (
+            _handle_rtsp_capture_failure_common(
+                reason=reason,
+                runtime_key=self.runtime_key,
+                rtsp_read_failures=self._rtsp_read_failures,
+                recent_rtsp_failure_times=self._recent_rtsp_failure_times,
+                capture_allow_hwaccel=self._capture_allow_hwaccel,
+                reopen_capture=self._reopen_capture_with_mode,
+            )
+        )
+        if reset_signature:
+            self._last_good_frame_signature = None
+
+    def _reopen_capture_with_mode(self, sleep_seconds: float, allow_hwaccel: bool):
+        self._capture_allow_hwaccel = allow_hwaccel
+        self._reopen_capture(sleep_seconds)
+
+    def _run(self):
+        try:
+            while not self.stop_event.is_set() and not self._closed.is_set():
+                cap = self._cap
+                if cap is None or not cap.isOpened():
+                    if self.source_meta.get("is_network_stream_source"):
+                        _set_runtime_stream_status(
+                            self.runtime_key,
+                            status="recovering",
+                            reason="capture_not_open",
+                            clear_images=not RTSP_KEEP_LAST_FRAME_ON_RECOVERY,
+                        )
+                        self._reopen_capture(1.0)
+                        continue
+                    self._fatal_reason = "capture_not_open"
+                    break
+
+                read_started_at = time.perf_counter()
+                try:
+                    ret, frame = cap.read()
+                except Exception as e:
+                    ret, frame = False, None
+                    if self.source_meta.get("is_network_stream_source"):
+                        self._handle_rtsp_capture_failure(f"read_exception:{type(e).__name__}")
+                        continue
+                    self._fatal_reason = f"read_exception:{type(e).__name__}"
+                    break
+                decode_ms = (time.perf_counter() - read_started_at) * 1000.0
+
+                if ret:
+                    if self._rtsp_read_failures > 0 and self.source_meta.get("is_network_stream_source"):
+                        print(
+                            f"[Producer] Recovered live stream after {self._rtsp_read_failures} failed frame(s): "
+                            f"runtime_key={self.runtime_key}"
+                        )
+                        self._rtsp_read_failures = 0
+
+                if not ret:
+                    if self.source_meta.get("is_uploaded_source") and self.source_meta.get("is_file_source"):
+                        self._reached_eof = True
+                        break
+
+                    if self.source_meta.get("is_network_stream_source"):
+                        self._handle_rtsp_capture_failure("read_failed")
+                        continue
+
+                    time.sleep(0.1)
+                    continue
+
+                if self.source_meta.get("is_rtsp_source"):
+                    is_bad_frame, bad_frame_reason, frame_signature = _detect_corrupted_rtsp_frame(
+                        frame,
+                        self._last_good_frame_signature,
+                    )
+                    if is_bad_frame:
+                        self._handle_rtsp_capture_failure(bad_frame_reason or "corrupted_frame")
+                        continue
+                    self._last_good_frame_signature = frame_signature
+
+                self._enqueue_frame(
+                    {
+                        "type": "frame",
+                        "frame": frame,
+                        "decode_ms": decode_ms,
+                    }
+                )
+        except Exception as e:
+            self._fatal_reason = f"reader_crash:{type(e).__name__}"
+            print(f"[Producer] Async reader crashed for runtime_key={self.runtime_key}: {e}")
+        finally:
+            cap = self._cap
+            self._cap = None
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+
+            if self._reached_eof:
+                self._enqueue_control({"type": "eof"})
+            elif self._fatal_reason and not self.stop_event.is_set():
+                self._enqueue_control({"type": "fatal", "reason": self._fatal_reason})
 
 
 # ---------------------------------------------------------------------------
@@ -776,25 +1196,54 @@ def video_producer(
     sync_state: dict | None = None,
 ):
     print(f"[Producer] Starting loop for runtime_key={runtime_key}, source={source_path}")
+    _set_runtime_stream_status(runtime_key, status="connecting", reason="initializing", clear_images=True)
 
     if stop_event is None:
         stop_event = threading.Event()
     if source_meta is None:
         source_meta = _build_source_meta(source_path)
 
-    cap = _open_video_capture(source_path, source_meta)
+    capture_allow_hwaccel = bool(source_meta.get("is_rtsp_source")) and RTSP_ENABLE_NVDEC
+    cap = open_video_capture(
+        source_path,
+        is_rtsp=bool(source_meta.get("is_rtsp_source")),
+        allow_hwaccel=capture_allow_hwaccel,
+    )
+    if not cap.isOpened() and source_meta.get("is_rtsp_source") and capture_allow_hwaccel:
+        print(
+            f"[Producer] Initial RTSP open with hardware decode failed; retrying with software decode: "
+            f"runtime_key={runtime_key}"
+        )
+        cap.release()
+        capture_allow_hwaccel = False
+        cap = open_video_capture(
+            source_path,
+            is_rtsp=bool(source_meta.get("is_rtsp_source")),
+            allow_hwaccel=capture_allow_hwaccel,
+        )
     if not cap.isOpened() and source_meta.get("is_rtsp_source"):
         for _ in range(5):
             if stop_event.is_set():
                 break
             time.sleep(1.0)
             cap.release()
-            cap = _open_video_capture(source_path, source_meta)
+            cap = open_video_capture(
+                source_path,
+                is_rtsp=bool(source_meta.get("is_rtsp_source")),
+                allow_hwaccel=capture_allow_hwaccel,
+            )
             if cap.isOpened():
+                _set_runtime_stream_status(
+                    runtime_key,
+                    status="connecting",
+                    reason="reopen_pending_frame",
+                    clear_images=True,
+                )
                 break
 
     if not cap.isOpened():
         print(f"[Producer] Failed to open {source_path} (runtime_key={runtime_key})")
+        _set_runtime_stream_status(runtime_key, status="offline", reason="open_failed", clear_images=True)
         _cleanup_producer_state(runtime_key, clear_frame_buffer=True)
         return
 
@@ -918,14 +1367,7 @@ def video_producer(
             )
 
         if local_model is None:
-            return [], 0, track_state, {
-                "detect_ms": 0.0,
-                "detect_total_ms": 0.0,
-                "batch_size": 1,
-                "classify_ms": 0.0,
-                "classify_candidates": 0,
-                "classified": 0,
-            }
+            return _empty_detection_result(track_state)
 
         try:
             detect_started_at = time.perf_counter()
@@ -946,17 +1388,14 @@ def video_producer(
                 track_kwargs["device"] = YOLO_DEVICE
 
             results = local_model.track(**track_kwargs)
+            infer_predict_ms = (time.perf_counter() - detect_started_at) * 1000.0
 
             if not results:
-                detect_ms = (time.perf_counter() - detect_started_at) * 1000.0
-                return [], 0, track_state, {
-                    "detect_ms": detect_ms,
-                    "detect_total_ms": detect_ms,
-                    "batch_size": 1,
-                    "classify_ms": 0.0,
-                    "classify_candidates": 0,
-                    "classified": 0,
-                }
+                return _empty_detection_result(
+                    track_state,
+                    detect_ms=infer_predict_ms,
+                    infer_wait_ms=infer_predict_ms,
+                )
 
             r = results[0]
             boxes_xyxy = r.boxes.xyxy.cpu().numpy() if r.boxes is not None else np.empty((0, 4))
@@ -972,13 +1411,14 @@ def video_producer(
                     keypoints_xy = r.keypoints.xy.cpu().numpy()
                 if need_fall_detection:
                     keypoints_with_conf = r.keypoints.data.cpu().numpy()
-            detect_ms = (time.perf_counter() - detect_started_at) * 1000.0
+            detect_ms = infer_predict_ms
 
             people_count = len(boxes_xyxy)
             detections = []
             classify_candidates = []
             classified_count = 0
             classify_ms = 0.0
+            post_started_at = time.perf_counter()
 
             for i, box_coords in enumerate(boxes_xyxy):
                 track_id = int(track_ids[i]) if i < len(track_ids) and track_ids[i] is not None else None
@@ -1063,25 +1503,21 @@ def video_producer(
                             "last_classified_frame": frame_count,
                         })
 
-            return detections, people_count, track_state, {
-                "detect_ms": detect_ms,
-                "detect_total_ms": detect_ms,
-                "batch_size": 1,
-                "classify_ms": classify_ms,
-                "classify_candidates": len(classify_candidates),
-                "classified": classified_count,
-            }
+            total_post_ms = (time.perf_counter() - post_started_at) * 1000.0
+            infer_post_ms = max(0.0, total_post_ms - classify_ms)
+            return detections, people_count, track_state, _build_perf_dict(
+                detect_ms=detect_ms,
+                classify_ms=classify_ms,
+                classify_candidates=len(classify_candidates),
+                classified=classified_count,
+                infer_wait_ms=detect_ms + infer_post_ms + classify_ms,
+                infer_predict_ms=detect_ms,
+                infer_post_ms=infer_post_ms,
+            )
 
         except Exception as e:
             print(f"[Detection] Error: {e}")
-            return [], 0, track_state, {
-                "detect_ms": 0.0,
-                "detect_total_ms": 0.0,
-                "batch_size": 1,
-                "classify_ms": 0.0,
-                "classify_candidates": 0,
-                "classified": 0,
-            }
+            return _empty_detection_result(track_state)
 
     # --- Scale detection coordinates to 640x360 for frontend ---
     def scale_detections(detections, orig_h, orig_w, target_w=640, target_h=360):
@@ -1109,7 +1545,7 @@ def video_producer(
     # -----------------------------------------------------------------------
     # Init buffer and state
     # -----------------------------------------------------------------------
-    FRAME_BUFFERS[runtime_key] = {}
+    _set_runtime_stream_status(runtime_key, status="connecting", reason="awaiting_frames", clear_images=True)
 
     # FPS calculation
     fps_start_time = time.time()
@@ -1121,6 +1557,8 @@ def video_producer(
     frame_count = 0
     decoded_frame_index = -1
     rtsp_read_failures = 0
+    recent_rtsp_failure_times: deque[float] = deque()
+    last_good_frame_signature: np.ndarray | None = None
     track_state = {}       # Per-track dress-code and fall-detection state.
     cached_detections = [] # Reused between detection frames
     cached_people_count = 0
@@ -1131,6 +1569,7 @@ def video_producer(
     counting_event_state: dict[str, dict[str, int]] = {}  # view_key -> previous total counts
     nvenc_writers: dict[str, _NvencOutputWriter] = {}
     sync_started_at = None
+    async_reader: _AsyncFrameReader | None = None
 
     if sync_barrier is not None:
         try:
@@ -1146,6 +1585,25 @@ def video_producer(
     sync_timeline_active = bool(
         sync_started_at is not None and source_meta.get("is_uploaded_source") and source_meta.get("is_file_source")
     )
+    use_async_capture = bool(
+        ASYNC_CAPTURE_ENABLED
+        and source_meta.get("is_network_stream_source")
+        and not sync_timeline_active
+    )
+    if use_async_capture:
+        async_reader = _AsyncFrameReader(
+            runtime_key=runtime_key,
+            source_path=source_path,
+            source_meta=source_meta,
+            stop_event=stop_event,
+            cap=cap,
+            capture_allow_hwaccel=capture_allow_hwaccel,
+        )
+        async_reader.start()
+        print(
+            f"[Producer] Async capture enabled: runtime_key={runtime_key}, "
+            f"queue_size={ASYNC_CAPTURE_QUEUE_SIZE}"
+        )
 
     def _write_nvenc_frame(view_key: str, img: np.ndarray) -> float:
         if not NVENC_OUTPUT_ENABLED:
@@ -1160,10 +1618,38 @@ def video_producer(
 
     def _skip_file_frame() -> bool:
         nonlocal decoded_frame_index
+        if use_async_capture:
+            return False
         skipped = cap.grab()
         if skipped:
             decoded_frame_index += 1
         return skipped
+
+    def _handle_rtsp_capture_failure(reason: str):
+        nonlocal cap, rtsp_read_failures, capture_allow_hwaccel, last_good_frame_signature
+        def _reopen_capture(sleep_seconds: float, allow_hwaccel: bool):
+            nonlocal cap, capture_allow_hwaccel
+            capture_allow_hwaccel = allow_hwaccel
+            cap.release()
+            time.sleep(sleep_seconds)
+            cap = open_video_capture(
+                source_path,
+                is_rtsp=bool(source_meta.get("is_rtsp_source")),
+                allow_hwaccel=capture_allow_hwaccel,
+            )
+
+        rtsp_read_failures, capture_allow_hwaccel, reset_signature = (
+            _handle_rtsp_capture_failure_common(
+                reason=reason,
+                runtime_key=runtime_key,
+                rtsp_read_failures=rtsp_read_failures,
+                recent_rtsp_failure_times=recent_rtsp_failure_times,
+                capture_allow_hwaccel=capture_allow_hwaccel,
+                reopen_capture=_reopen_capture,
+            )
+        )
+        if reset_signature:
+            last_good_frame_signature = None
 
     # -----------------------------------------------------------------------
     # Helper: get all views needing detection
@@ -1329,6 +1815,78 @@ def video_producer(
 
         return detections_unscaled
 
+    def _process_view_frame(
+        view_key: str,
+        img: np.ndarray,
+        all_views: set,
+        dresscode_views: set,
+        fall_views: set,
+    ) -> tuple[list[dict], dict | None]:
+        nonlocal track_state
+        nonlocal cached_detections
+        nonlocal cached_people_count
+        nonlocal classify_candidates
+        nonlocal classified_count
+        nonlocal detect_batch_size_sum
+        nonlocal detect_batch_samples
+
+        orig_h, orig_w = img.shape[:2]
+        scaled_detections: list[dict] = []
+        counting_data = None
+
+        if run_detection_this_frame and view_key in all_views:
+            needs_fall_detection = view_key in fall_views
+            skip_classification = view_key not in dresscode_views
+            detections, people_count, track_state, perf = run_detection_and_classify(
+                img,
+                frame_count,
+                track_state,
+                skip_classification=skip_classification,
+                need_fall_detection=needs_fall_detection,
+                view_key=view_key,
+            )
+            stage_ms["infer_wait"] += perf.get("infer_wait_ms", perf.get("detect_ms", 0.0))
+            stage_ms["infer_predict"] += perf.get("infer_predict_ms", perf.get("detect_ms", 0.0))
+            stage_ms["infer_predict_total_batch"] += perf.get(
+                "infer_predict_total_ms",
+                perf.get("detect_total_ms", 0.0),
+            )
+            stage_ms["infer_post"] += perf.get("infer_post_ms", 0.0)
+            stage_ms["classify"] += perf.get("classify_ms", 0.0)
+            classify_candidates += perf.get("classify_candidates", 0)
+            classified_count += perf.get("classified", 0)
+            detect_batch_size_sum += perf.get("batch_size", 1)
+            detect_batch_samples += 1
+
+            policy_started_at = time.perf_counter()
+            detections = _apply_policy_and_save(
+                detections,
+                track_state,
+                img,
+                runtime_key,
+                source_path,
+                view_key=view_key,
+            )
+            stage_ms["policy_queue"] += (time.perf_counter() - policy_started_at) * 1000.0
+
+            if needs_fall_detection:
+                detections = _run_fall_detection_for_view(view_key, detections, img, source_path)
+
+            counting_started_at = time.perf_counter()
+            counting_data = _run_counting_for_view(view_key, detections, (orig_h, orig_w))
+            stage_ms["counting"] += (time.perf_counter() - counting_started_at) * 1000.0
+            if counting_data is not None:
+                cached_counting_data[view_key] = counting_data
+
+            scaled_detections = scale_detections(detections, orig_h, orig_w)
+            cached_detections = scaled_detections
+            cached_people_count = people_count
+        elif view_key in all_views:
+            scaled_detections = cached_detections
+            counting_data = cached_counting_data.get(view_key)
+
+        return scaled_detections, counting_data
+
     # -----------------------------------------------------------------------
     # Main loop
     # -----------------------------------------------------------------------
@@ -1344,49 +1902,64 @@ def video_producer(
                     break
 
         loop_start = time.time()
-        read_started_at = time.perf_counter()
-        ret, frame = cap.read()
-        decode_ms = (time.perf_counter() - read_started_at) * 1000.0
-        if ret:
-            decoded_frame_index += 1
-            if rtsp_read_failures > 0 and source_meta.get("is_rtsp_source"):
-                print(
-                    f"[Producer] Recovered RTSP stream after {rtsp_read_failures} failed read(s): "
-                    f"runtime_key={runtime_key}"
-                )
-                rtsp_read_failures = 0
-
-        if not ret:
-            # Uploaded file source reached EOF: stop producer automatically.
-            if source_meta.get("is_uploaded_source") and source_meta.get("is_file_source"):
-                print(f"[Producer] EOF reached, stopping uploaded source: {source_path}")
-                break
-
-            if source_meta.get("is_rtsp_source"):
-                rtsp_read_failures += 1
-                if rtsp_read_failures < RTSP_MAX_CONSECUTIVE_READ_FAILURES:
-                    if rtsp_read_failures == 1:
-                        print(
-                            f"[Producer] RTSP read failed; tolerating up to "
-                            f"{RTSP_MAX_CONSECUTIVE_READ_FAILURES} consecutive failures before reconnect: "
-                            f"runtime_key={runtime_key}"
-                        )
-                    time.sleep(RTSP_READ_FAILURE_BACKOFF_MS / 1000.0)
-                    continue
-
-                print(
-                    f"[Producer] RTSP read failed {rtsp_read_failures} consecutive times; reconnecting: "
-                    f"runtime_key={runtime_key}"
-                )
-                cap.release()
-                time.sleep(0.5)
-                cap = _open_video_capture(source_path, source_meta)
-                rtsp_read_failures = 0
+        if use_async_capture:
+            packet = async_reader.read(timeout=ASYNC_CAPTURE_READ_TIMEOUT_MS / 1000.0) if async_reader else None
+            if packet is None:
                 continue
 
-            # Non-upload/live source: transient read failure, keep retrying.
-            time.sleep(0.1)
-            continue
+            packet_type = packet.get("type")
+            if packet_type == "fatal":
+                print(
+                    f"[Producer] Async capture failed for runtime_key={runtime_key}, "
+                    f"reason={packet.get('reason')}"
+                )
+                break
+            if packet_type == "eof":
+                print(f"[Producer] EOF reached, stopping uploaded source: {source_path}")
+                break
+            if packet_type != "frame":
+                continue
+
+            frame = packet.get("frame")
+            if frame is None:
+                continue
+            decode_ms = float(packet.get("decode_ms", 0.0))
+        else:
+            read_started_at = time.perf_counter()
+            ret, frame = cap.read()
+            decode_ms = (time.perf_counter() - read_started_at) * 1000.0
+            if ret:
+                decoded_frame_index += 1
+                if rtsp_read_failures > 0 and source_meta.get("is_network_stream_source"):
+                    print(
+                        f"[Producer] Recovered live stream after {rtsp_read_failures} failed frame(s): "
+                        f"runtime_key={runtime_key}"
+                    )
+                    rtsp_read_failures = 0
+
+            if not ret:
+                # Uploaded file source reached EOF: stop producer automatically.
+                if source_meta.get("is_uploaded_source") and source_meta.get("is_file_source"):
+                    print(f"[Producer] EOF reached, stopping uploaded source: {source_path}")
+                    break
+
+                if source_meta.get("is_network_stream_source"):
+                    _handle_rtsp_capture_failure("read_failed")
+                    continue
+
+                # Non-upload/live source: transient read failure, keep retrying.
+                time.sleep(0.1)
+                continue
+
+            if source_meta.get("is_rtsp_source"):
+                is_bad_frame, bad_frame_reason, frame_signature = _detect_corrupted_rtsp_frame(
+                    frame,
+                    last_good_frame_signature,
+                )
+                if is_bad_frame:
+                    _handle_rtsp_capture_failure(bad_frame_reason or "corrupted_frame")
+                    continue
+                last_good_frame_signature = frame_signature
 
         frame_count += 1
 
@@ -1398,12 +1971,15 @@ def video_producer(
             fps_start_time = time.time()
 
         run_detection_this_frame = (frame_count % detection_stride == 0)
+        producer_started_at = time.perf_counter()
 
         stage_ms = {
-            "decode": decode_ms,
+            "capture_decode": decode_ms,
             "fisheye": 0.0,
-            "detect": 0.0,
-            "detect_total_batch": 0.0,
+            "infer_wait": 0.0,
+            "infer_predict": 0.0,
+            "infer_predict_total_batch": 0.0,
+            "infer_post": 0.0,
             "classify": 0.0,
             "policy_queue": 0.0,
             "counting": 0.0,
@@ -1421,7 +1997,11 @@ def video_producer(
             'people_count': cached_people_count,
             'detections': [],
             'counting_data': {},
+            'stream_status': 'live',
         }
+        all_views = _get_all_detection_views(source_path)
+        dresscode_views = _get_detection_views(runtime_key)
+        fall_views = get_fall_detection_views(source_path)
 
         if is_fisheye and processor:
             try:
@@ -1432,62 +2012,20 @@ def video_producer(
 
                 # 2. Process each view
                 view_detections = {}  # key -> scaled detections list
-
                 view_counting_data = {}  # key -> counting_data dict
-                all_views = _get_all_detection_views(source_path)
-                dresscode_views = _get_detection_views(runtime_key)
-                fall_views = get_fall_detection_views(source_path)
 
                 for key, img in processed_frames.items():
                     try:
-                        orig_h, orig_w = img.shape[:2]
-
-                        # Run detection on target views only, respecting stride
-                        if run_detection_this_frame and key in all_views:
-                            needs_fall_detection = key in fall_views
-                            skip_classification = key not in dresscode_views
-                            detections, people_count, track_state, perf = run_detection_and_classify(
-                                img, frame_count, track_state,
-                                skip_classification=skip_classification,
-                                need_fall_detection=needs_fall_detection,
-                                view_key=key,
-                            )
-                            stage_ms["detect"] += perf.get("detect_ms", 0.0)
-                            stage_ms["detect_total_batch"] += perf.get("detect_total_ms", 0.0)
-                            stage_ms["classify"] += perf.get("classify_ms", 0.0)
-                            classify_candidates += perf.get("classify_candidates", 0)
-                            classified_count += perf.get("classified", 0)
-                            detect_batch_size_sum += perf.get("batch_size", 1)
-                            detect_batch_samples += 1
-                            # Check policy for violations & save snapshots
-                            policy_started_at = time.perf_counter()
-                            detections = _apply_policy_and_save(
-                                detections, track_state, img, runtime_key, source_path, view_key=key
-                            )
-                            stage_ms["policy_queue"] += (time.perf_counter() - policy_started_at) * 1000.0
-
-                            if needs_fall_detection:
-                                detections = _run_fall_detection_for_view(key, detections, img, source_path)
-
-                            # Run people counting on unscaled detections
-                            counting_started_at = time.perf_counter()
-                            cd = _run_counting_for_view(key, detections, (orig_h, orig_w))
-                            stage_ms["counting"] += (time.perf_counter() - counting_started_at) * 1000.0
-                            if cd is not None:
-                                view_counting_data[key] = cd
-                                cached_counting_data[key] = cd
-
-                            scaled = scale_detections(detections, orig_h, orig_w)
-                            view_detections[key] = scaled
-                            cached_detections = scaled
-                            cached_people_count = people_count
-                        elif key in all_views:
-                            # Reuse cached detections
-                            view_detections[key] = cached_detections
-                            if key in cached_counting_data:
-                                view_counting_data[key] = cached_counting_data[key]
-                        else:
-                            view_detections[key] = []
+                        scaled, counting_data = _process_view_frame(
+                            key,
+                            img,
+                            all_views,
+                            dresscode_views,
+                            fall_views,
+                        )
+                        view_detections[key] = scaled
+                        if counting_data is not None:
+                            view_counting_data[key] = counting_data
 
                         # Encode clean frame (no plot)
                         encode_started_at = time.perf_counter()
@@ -1509,67 +2047,33 @@ def video_producer(
         else:
             # --- Normal (non-fisheye) video processing ---
             try:
-                orig_h, orig_w = frame.shape[:2]
-                all_views = _get_all_detection_views(source_path)
-                dresscode_views = _get_detection_views(runtime_key)
-                fall_views = get_fall_detection_views(source_path)
-
-                if run_detection_this_frame and "original" in all_views:
-                    needs_fall_detection = "original" in fall_views
-                    skip_classification = "original" not in dresscode_views
-                    detections, people_count, track_state, perf = run_detection_and_classify(
-                        frame, frame_count, track_state,
-                        skip_classification=skip_classification,
-                        need_fall_detection=needs_fall_detection,
-                        view_key="original",
-                    )
-                    stage_ms["detect"] += perf.get("detect_ms", 0.0)
-                    stage_ms["detect_total_batch"] += perf.get("detect_total_ms", 0.0)
-                    stage_ms["classify"] += perf.get("classify_ms", 0.0)
-                    classify_candidates += perf.get("classify_candidates", 0)
-                    classified_count += perf.get("classified", 0)
-                    detect_batch_size_sum += perf.get("batch_size", 1)
-                    detect_batch_samples += 1
-                    policy_started_at = time.perf_counter()
-                    detections = _apply_policy_and_save(
-                        detections, track_state, frame, runtime_key, source_path, view_key="original"
-                    )
-                    stage_ms["policy_queue"] += (time.perf_counter() - policy_started_at) * 1000.0
-
-                    if needs_fall_detection:
-                        detections = _run_fall_detection_for_view("original", detections, frame, source_path)
-
-                    # Run people counting on unscaled detections
-                    counting_started_at = time.perf_counter()
-                    cd = _run_counting_for_view("original", detections, (orig_h, orig_w))
-                    stage_ms["counting"] += (time.perf_counter() - counting_started_at) * 1000.0
-                    if cd is not None:
-                        cached_counting_data["original"] = cd
-
-                    scaled = scale_detections(detections, orig_h, orig_w)
-                    cached_detections = scaled
-                    cached_people_count = people_count
+                scaled, counting_data = _process_view_frame(
+                    "original",
+                    frame,
+                    all_views,
+                    dresscode_views,
+                    fall_views,
+                )
 
                 # Encode clean frame
                 encode_started_at = time.perf_counter()
                 current_buffer['original'] = encode_frame(frame)
                 stage_ms["encode"] += (time.perf_counter() - encode_started_at) * 1000.0
                 stage_ms["nvenc"] += _write_nvenc_frame("original", frame)
-                current_buffer['__meta__']['detections'] = {'original': cached_detections}
+                current_buffer['__meta__']['detections'] = {'original': scaled}
                 current_buffer['__meta__']['people_count'] = cached_people_count
                 current_buffer['__meta__']['counting_data'] = {
-                    'original': cached_counting_data.get('original', {}),
+                    'original': counting_data if counting_data is not None else {},
                 }
 
             except Exception as e:
                 print(f"[Producer] Normal video error: {e}")
 
+        producer_wall_ms = (time.perf_counter() - producer_started_at) * 1000.0
         if PERF_STAGE_LOGS and (frame_count % PERF_LOG_INTERVAL_FRAMES == 0):
-            total_stage_ms = (
-                stage_ms["decode"]
+            producer_stage_sum_ms = (
                 + stage_ms["fisheye"]
-                + stage_ms["detect"]
-                + stage_ms["classify"]
+                + stage_ms["infer_wait"]
                 + stage_ms["policy_queue"]
                 + stage_ms["counting"]
                 + stage_ms["encode"]
@@ -1577,17 +2081,20 @@ def video_producer(
             )
             avg_detect_batch = (detect_batch_size_sum / detect_batch_samples) if detect_batch_samples else 0.0
             print(
-                f"[Perf] decode={stage_ms['decode']:.1f}ms "
+                f"[Perf] capture_decode={stage_ms['capture_decode']:.1f}ms "
+                f"producer_wall={producer_wall_ms:.1f}ms "
+                f"producer_stage_sum={producer_stage_sum_ms:.1f}ms "
                 f"fisheye={stage_ms['fisheye']:.1f}ms "
-                f"detect={stage_ms['detect']:.1f}ms "
-                f"detect_total_batch={stage_ms['detect_total_batch']:.1f}ms "
+                f"infer_wait={stage_ms['infer_wait']:.1f}ms "
+                f"infer_predict={stage_ms['infer_predict']:.1f}ms "
+                f"infer_predict_total_batch={stage_ms['infer_predict_total_batch']:.1f}ms "
+                f"infer_post={stage_ms['infer_post']:.1f}ms "
                 f"avg_detect_batch={avg_detect_batch:.2f} "
                 f"classify={stage_ms['classify']:.1f}ms "
                 f"policy_queue={stage_ms['policy_queue']:.1f}ms "
                 f"counting={stage_ms['counting']:.1f}ms "
                 f"encode={stage_ms['encode']:.1f}ms "
                 f"nvenc={stage_ms['nvenc']:.1f}ms "
-                f"total={total_stage_ms:.1f}ms "
                 f"classify_batch={classified_count}/{classify_candidates} "
                 f"fps={current_real_fps:.1f} "
                 f"runtime_key={runtime_key}"
@@ -1610,7 +2117,11 @@ def video_producer(
 
     for writer in nvenc_writers.values():
         writer.close()
-    cap.release()
+    if async_reader is not None:
+        async_reader.close()
+    else:
+        cap.release()
+    _set_runtime_stream_status(runtime_key, status="offline", reason="stopped", clear_images=True)
     _cleanup_producer_state(runtime_key, clear_frame_buffer=True)
     print(f"[Producer] Stopped loop for runtime_key={runtime_key}, source={source_path}")
 

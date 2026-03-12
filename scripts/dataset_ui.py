@@ -1,10 +1,13 @@
-import streamlit as st
 import os
 import shutil
 import zipfile
 import tempfile
 import time
 import sys
+
+os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
+
+import streamlit as st
 
 # Streamlit defaults to 200MB upload limit. To increase, use:
 # streamlit run scripts/dataset_ui.py --server.maxUploadSize 1024
@@ -19,6 +22,7 @@ from prepare_training_data import process_video
 
 SUPPORTED_VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv")
 UPLOADS_DIR = os.path.abspath(os.path.join(current_dir, "..", "..", "uploads"))
+DATASET_OUTPUTS_DIR = os.path.join(current_dir, "dataset_output")
 
 
 def list_uploaded_videos():
@@ -40,6 +44,16 @@ def format_file_detail(filename: str) -> str:
         return f"{filename} ({size_mb:.1f} MB)"
     except OSError:
         return filename
+
+
+def make_run_output_dir(label: str) -> str:
+    """Create a persistent output directory under scripts/dataset_output."""
+    base_name = os.path.splitext(os.path.basename(label))[0]
+    safe_name = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in base_name).strip("_")
+    safe_name = safe_name or "dataset"
+    run_dir = os.path.join(DATASET_OUTPUTS_DIR, f"{safe_name}_{int(time.time())}")
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
 
 
 st.set_page_config(page_title="Dataset Generator", layout="wide")
@@ -120,9 +134,8 @@ if video_label:
                             f"Selected video not found: {video_path}"
                         )
 
-                # Output directory
-                output_dir = os.path.join(temp_dir, "dataset_output")
-                os.makedirs(output_dir, exist_ok=True)
+                # Output directory persists under scripts/dataset_output
+                output_dir = make_run_output_dir(video_label or "dataset")
 
                 # Run the processing logic
                 status_text.text("Processing video... check terminal for details.")
@@ -133,6 +146,7 @@ if video_label:
 
                 status_text.success("Processing Complete!")
                 progress_bar.progress(100)
+                st.caption(f"Saved dataset to: {output_dir}")
 
                 # Zip the results
                 st.info("Zipping results...")

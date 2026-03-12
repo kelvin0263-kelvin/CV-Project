@@ -1,0 +1,5 @@
+[server]
+# Torch exposes a dynamic torch.classes namespace that Streamlit's watcher
+# can mis-handle when it scans imported modules. Disable file watching for
+# this app to avoid the false-positive runtime error during model loading.
+fileWatcherType = "none"

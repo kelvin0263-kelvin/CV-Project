@@ -488,6 +488,11 @@ const BuildingOccupancyPanel = ({ apiUrl, startDate, endDate, refreshToken, visi
     const [buildingSummary, setBuildingSummary] = useState(EMPTY_BUILDING_SUMMARY);
     const [buildingHistory, setBuildingHistory] = useState([]);
     const [loading, setLoading] = useState(false);
+    const [timeRange, setTimeRange] = useState('24h');
+    const [customStart, setCustomStart] = useState(() => createDefaultCustomRange().start);
+    const [customEnd, setCustomEnd] = useState(() => createDefaultCustomRange().end);
+    const [rangeNowMs, setRangeNowMs] = useState(() => Date.now());
+    const [brushWindow, setBrushWindow] = useState({ key: '', startTs: null, endTs: null });
 
     const fetchBuildingSummary = useCallback(async () => {
         if (!visible) return;
@@ -569,15 +574,40 @@ const BuildingOccupancyPanel = ({ apiUrl, startDate, endDate, refreshToken, visi
         };
     }, [fetchBuildingHistory, visible, refreshToken]);
 
-    const filteredHistory = useMemo(() => (
-        buildingHistory.filter((row) => {
+    useEffect(() => {
+        if (!visible) return undefined;
+        const intervalId = setInterval(() => {
+            setRangeNowMs(Date.now());
+        }, 60000);
+        return () => clearInterval(intervalId);
+    }, [visible]);
+
+    const filteredHistory = useMemo(() => {
+        let rangeStartMs = null;
+        let rangeEndMs = rangeNowMs;
+
+        if (timeRange === 'custom') {
+            const customStartMs = new Date(customStart).getTime();
+            const customEndMs = new Date(customEnd).getTime();
+            if (Number.isNaN(customStartMs) || Number.isNaN(customEndMs) || customStartMs > customEndMs) {
+                return [];
+            }
+            rangeStartMs = customStartMs;
+            rangeEndMs = customEndMs;
+        } else if (timeRange !== 'all') {
+            rangeStartMs = rangeNowMs - OCCUPANCY_RANGE_LOOKBACK_MS[timeRange];
+        }
+
+        return buildingHistory.filter((row) => {
             const dayIso = getTimestampIsoDate(row.timestamp);
             if (!dayIso) return false;
             if (startDate && dayIso < startDate) return false;
             if (endDate && dayIso > endDate) return false;
+            if (rangeStartMs !== null && row.tsMs < rangeStartMs) return false;
+            if (rangeEndMs !== null && row.tsMs > rangeEndMs) return false;
             return true;
-        })
-    ), [buildingHistory, startDate, endDate]);
+        });
+    }, [buildingHistory, startDate, endDate, timeRange, customStart, customEnd, rangeNowMs]);
 
     const historyRangeKey = useMemo(() => {
         if (filteredHistory.length < 2) return '24h';
@@ -586,7 +616,7 @@ const BuildingOccupancyPanel = ({ apiUrl, startDate, endDate, refreshToken, visi
     }, [filteredHistory]);
 
     const chartData = useMemo(() => {
-        const sampledRows = downsampleSeries(filteredHistory);
+        const sampledRows = downsampleSeries(filteredHistory, 2000);
         return sampledRows.map((row) => ({
             time: getOccupancyTickLabel(row.ts, historyRangeKey),
             fullTime: row.ts.toLocaleString(),
@@ -595,6 +625,45 @@ const BuildingOccupancyPanel = ({ apiUrl, startDate, endDate, refreshToken, visi
             rawOccupancy: row.raw_occupancy,
         }));
     }, [filteredHistory, historyRangeKey]);
+    const brushContextKey = `${timeRange}|${customStart}|${customEnd}|${startDate}|${endDate}`;
+    const activeBrushWindow = useMemo(() => (
+        brushWindow.key === brushContextKey
+            ? brushWindow
+            : { key: brushContextKey, startTs: null, endTs: null }
+    ), [brushContextKey, brushWindow]);
+    const brushIndices = useMemo(() => {
+        const maxIndex = Math.max(chartData.length - 1, 0);
+        if (!chartData.length) {
+            return { startIndex: 0, endIndex: 0 };
+        }
+        if (activeBrushWindow.startTs == null || activeBrushWindow.endTs == null) {
+            return { startIndex: 0, endIndex: maxIndex };
+        }
+
+        let startIndex = findNearestIndexByTimestamp(chartData, activeBrushWindow.startTs);
+        let endIndex = findNearestIndexByTimestamp(chartData, activeBrushWindow.endTs);
+        startIndex = clamp(startIndex, 0, maxIndex);
+        endIndex = clamp(endIndex, 0, maxIndex);
+
+        if (startIndex > endIndex) {
+            return { startIndex: endIndex, endIndex: startIndex };
+        }
+        return { startIndex, endIndex };
+    }, [activeBrushWindow, chartData]);
+    const handleBrushChange = useCallback((range) => {
+        if (!range || !chartData.length) return;
+
+        const maxIndex = chartData.length - 1;
+        const startIndex = clamp(Number(range.startIndex ?? 0), 0, maxIndex);
+        const endIndex = clamp(Number(range.endIndex ?? maxIndex), 0, maxIndex);
+        const startTs = chartData[startIndex]?.tsMs ?? null;
+        const endTs = chartData[endIndex]?.tsMs ?? null;
+
+        setBrushWindow((prev) => {
+            if (prev.key === brushContextKey && prev.startTs === startTs && prev.endTs === endTs) return prev;
+            return { key: brushContextKey, startTs, endTs };
+        });
+    }, [brushContextKey, chartData]);
 
     const entranceEntries = useMemo(
         () => Object.entries(buildingSummary.entrance_summaries ?? {}),
@@ -649,21 +718,71 @@ const BuildingOccupancyPanel = ({ apiUrl, startDate, endDate, refreshToken, visi
                     </div>
                 )}
 
+                <div className="flex flex-wrap items-center gap-2">
+                    <select
+                        value={timeRange}
+                        onChange={(e) => setTimeRange(e.target.value)}
+                        className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                    >
+                        <option value="1h">Last 1 hour</option>
+                        <option value="6h">Last 6 hours</option>
+                        <option value="24h">Last 24 hours</option>
+                        <option value="7d">Last 7 days</option>
+                        <option value="30d">Last 30 days</option>
+                        <option value="all">All time</option>
+                        <option value="custom">Custom range</option>
+                    </select>
+                    {timeRange === 'custom' && (
+                        <>
+                            <input
+                                type="datetime-local"
+                                value={customStart}
+                                onChange={(e) => setCustomStart(e.target.value)}
+                                className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                            />
+                            <span className="text-xs text-muted-foreground">to</span>
+                            <input
+                                type="datetime-local"
+                                value={customEnd}
+                                onChange={(e) => setCustomEnd(e.target.value)}
+                                className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                            />
+                        </>
+                    )}
+                </div>
+
                 <div className="h-[260px]">
                     {chartData.length > 0 ? (
                         <ResponsiveContainer width="100%" height="100%">
-                            <LineChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                            <LineChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 20 }}>
                                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
-                                <XAxis dataKey="time" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
+                                <XAxis
+                                    type="number"
+                                    dataKey="tsMs"
+                                    domain={['dataMin', 'dataMax']}
+                                    tickFormatter={(value) => getOccupancyTickLabel(new Date(value), historyRangeKey)}
+                                    className="text-xs text-muted-foreground"
+                                    tickLine={false}
+                                    axisLine={false}
+                                />
                                 <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} allowDecimals={false} />
                                 <RechartsTooltip
                                     cursor={{ strokeDasharray: '3 3' }}
-                                    labelFormatter={(_, payload) => payload?.[0]?.payload?.fullTime || ''}
+                                    labelFormatter={(value, payload) => payload?.[0]?.payload?.fullTime || formatTimestamp(value)}
                                     contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
                                 />
                                 <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
-                                <Line type="monotone" dataKey="occupancy" name="Occupancy" stroke="#2563eb" strokeWidth={2} dot={false} />
-                                <Line type="monotone" dataKey="rawOccupancy" name="Raw Occupancy" stroke="#94a3b8" strokeWidth={2} dot={false} strokeDasharray="6 4" />
+                                <Line type="linear" dataKey="occupancy" name="Occupancy" stroke="#2563eb" strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
+                                <Line type="linear" dataKey="rawOccupancy" name="Raw Occupancy" stroke="#94a3b8" strokeWidth={2} dot={false} activeDot={{ r: 4 }} strokeDasharray="6 4" />
+                                <Brush
+                                    dataKey="time"
+                                    height={22}
+                                    stroke="#2563eb"
+                                    travellerWidth={8}
+                                    startIndex={brushIndices.startIndex}
+                                    endIndex={brushIndices.endIndex}
+                                    onChange={handleBrushChange}
+                                />
                             </LineChart>
                         </ResponsiveContainer>
                     ) : (
@@ -919,6 +1038,7 @@ const Reporting = () => {
         .filter(s => dateFilter(s.timestamp) && cameraFilter(s.camera_id));
     const isPeopleCountingCategory = selectedCategory === 'People Counting';
     const isPeopleCountingBuildingView = isPeopleCountingCategory && selectedPeopleCountingView === 'building';
+    const showOccupancyChart = selectedCategory === 'All' || (isPeopleCountingCategory && !isPeopleCountingBuildingView);
 
     // Build combined display rows for log table
     const displayRows = (() => {
@@ -1208,7 +1328,7 @@ const Reporting = () => {
                 </Card>
 
                 {/* Occupancy Over Time */}
-                <OccupancyChart apiUrl={apiUrl} cameras={cameras} />
+                {showOccupancyChart && <OccupancyChart apiUrl={apiUrl} cameras={cameras} />}
 
                 {/* Log Table */}
                 <Card className="flex flex-col min-h-[350px] overflow-hidden">

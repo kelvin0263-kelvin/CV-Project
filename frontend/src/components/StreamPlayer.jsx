@@ -245,6 +245,11 @@ const StreamPlayer = ({
                 const data = JSON.parse(event.data);
                 if (data.image && imgRef.current) {
                     imgRef.current.src = `data:image/jpeg;base64,${data.image}`;
+                    setStatus('connected');
+                } else if (imgRef.current) {
+                    imgRef.current.removeAttribute('src');
+                    drawDetections([]);
+                    setStatus(data.stream_status === 'offline' ? 'disconnected' : 'recovering');
                 }
                 if (onStats) {
                     onStats({
@@ -304,6 +309,7 @@ const StreamPlayer = ({
             {status !== 'connected' && (
                 <div className="absolute inset-0 flex items-center justify-center bg-black/50 text-white text-xs">
                     {status === 'connecting' && "Connecting..."}
+                    {status === 'recovering' && "Recovering stream..."}
                     {status === 'error' && "Connection Error"}
                     {status === 'disconnected' && "Offline"}
                 </div>

@@ -9,6 +9,7 @@ import StreamPlayer from './StreamPlayer';
 import { getApiBaseUrl, getWSUrl } from '../apiConfig';
 
 const CAMERA_ANALYSIS_TAGS_UPDATED_EVENT = 'camera-analysis-tags-updated';
+const DEFAULT_FISHEYE_VIEW = 0;
 
 const inferOverlayMode = (analysisTags = []) => {
     const normalizedTags = new Set(
@@ -35,6 +36,14 @@ const inferOverlayMode = (analysisTags = []) => {
     return 'auto';
 };
 
+const inferSourceType = (sourcePath = '', enableFisheye = false) => {
+    const normalized = String(sourcePath || '').trim().toLowerCase();
+    if (normalized.startsWith('rtsp://') || normalized.startsWith('rtsps://')) {
+        return enableFisheye ? 'RTSP Fisheye' : 'RTSP';
+    }
+    return enableFisheye ? 'Network Stream Fisheye' : 'Network Stream';
+};
+
 const SystemConfiguration = () => {
     const apiUrl = getApiBaseUrl();
     const [cameras, setCameras] = useState([]);
@@ -54,14 +63,13 @@ const SystemConfiguration = () => {
     const [syncGroups, setSyncGroups] = useState([]);
     const [uploadMessage, setUploadMessage] = useState(null);
     const [startingSyncGroup, setStartingSyncGroup] = useState(false);
-    // Default to all 8 views selected
-    const [selectedViews, setSelectedViews] = useState(new Set([0, 1, 2, 3, 4, 5, 6, 7]));
+    const [selectedViews, setSelectedViews] = useState(new Set([DEFAULT_FISHEYE_VIEW]));
 
     // Form State
     const [formData, setFormData] = useState({
         name: '',
         location: '',
-        rtspUrl: '',
+        streamUrl: '',
         frameRate: '30',
         resolution: '1080p',
         enabled: true,
@@ -109,7 +117,7 @@ const SystemConfiguration = () => {
         setFormData({
             name: '',
             location: '',
-            rtspUrl: '',
+            streamUrl: '',
             frameRate: '30',
             resolution: '1080p',
             enabled: true,
@@ -123,7 +131,7 @@ const SystemConfiguration = () => {
         setSyncStart(false);
         setSyncGroupId('test-group');
         setUploadMessage(null);
-        setSelectedViews(new Set([0, 1, 2, 3, 4, 5, 6, 7]));
+        setSelectedViews(new Set([DEFAULT_FISHEYE_VIEW]));
         setTestResult(null);
     };
 
@@ -136,7 +144,7 @@ const SystemConfiguration = () => {
         setFormData({
             name: cam.name,
             location: cam.location,
-            rtspUrl: cam.source_path || '',
+            streamUrl: cam.source_path || '',
             frameRate: String(cam.fps ?? 30),
             resolution: cam.resolution,
             enabled: cam.enabled,
@@ -145,7 +153,7 @@ const SystemConfiguration = () => {
         setSelectedViews(
             cam.is_fisheye && Number.isInteger(cam.view_index) && cam.view_index >= 0
                 ? new Set([cam.view_index])
-                : new Set([0, 1, 2, 3, 4, 5, 6, 7])
+                : new Set([DEFAULT_FISHEYE_VIEW])
         );
         setSelectedCamera(cam);
         setIsEditMode(true);
@@ -159,7 +167,7 @@ const SystemConfiguration = () => {
     const handleInputChange = (e) => {
         const { name, value, type, checked } = e.target;
         setFormData(prev => ({ ...prev, [name]: type === 'checkbox' ? checked : value }));
-        if (name === 'rtspUrl' && testResult) {
+        if (name === 'streamUrl' && testResult) {
             setTestResult(null);
         }
     };
@@ -168,6 +176,10 @@ const SystemConfiguration = () => {
         if (e.target.files && e.target.files[0]) {
             setSelectedFile(e.target.files[0]);
         }
+    };
+
+    const handleSelectSingleView = (idx) => {
+        setSelectedViews(new Set([idx]));
     };
 
     const handleSave = async (e) => {
@@ -235,10 +247,10 @@ const SystemConfiguration = () => {
             id: selectedCamera ? selectedCamera.id : Date.now().toString(),
             name: formData.name,
             location: formData.location,
-            type: 'RTSP',
+            type: inferSourceType(formData.streamUrl, false),
             status: formData.enabled ? 'Online' : 'Disabled',
             mode: selectedCamera?.mode || 'Unassigned',
-            source_path: formData.rtspUrl.trim(),
+            source_path: formData.streamUrl.trim(),
             resolution: formData.resolution,
             fps: parseInt(formData.frameRate, 10) || 30,
             enabled: formData.enabled,
@@ -249,17 +261,17 @@ const SystemConfiguration = () => {
 
         try {
             if (!payload.source_path) {
-                alert("Please enter a RTSP URL.");
+                alert("Please enter a stream URL.");
                 return;
             }
 
             if (enableFisheye) {
                 if (isEditMode) {
-                    alert("Editing RTSP fisheye sources is not supported yet. Delete and recreate the source.");
+                    alert("Editing fisheye stream sources is not supported yet. Delete and recreate the source.");
                     return;
                 }
 
-                const res = await fetch(`${apiUrl}/api/cameras/rtsp-source`, {
+                const res = await fetch(`${apiUrl}/api/cameras/stream-source`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -276,7 +288,7 @@ const SystemConfiguration = () => {
                 });
                 if (!res.ok) {
                     const err = await res.json().catch(() => ({}));
-                    throw new Error(err.detail || 'Failed to create RTSP fisheye source');
+                    throw new Error(err.detail || 'Failed to create fisheye stream source');
                 }
 
                 await fetchCameras();
@@ -325,8 +337,8 @@ const SystemConfiguration = () => {
     };
 
     const handleTestConnection = async () => {
-        if (!formData.rtspUrl) {
-            setTestResult({ type: 'error', message: 'Please enter a RTSP URL.' });
+        if (!formData.streamUrl) {
+            setTestResult({ type: 'error', message: 'Please enter a stream URL.' });
             return;
         }
 
@@ -334,16 +346,16 @@ const SystemConfiguration = () => {
         try {
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 8000);
-            const res = await fetch(`${apiUrl}/api/cameras/test-rtsp`, {
+            const res = await fetch(`${apiUrl}/api/cameras/test-stream`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ source_path: formData.rtspUrl.trim() }),
+                body: JSON.stringify({ source_path: formData.streamUrl.trim() }),
                 signal: controller.signal,
             });
             clearTimeout(timeoutId);
             const data = await res.json().catch(() => ({}));
             if (!res.ok || !data.ok) {
-                throw new Error(data.detail || 'Unable to reach RTSP stream.');
+                throw new Error(data.detail || 'Unable to reach stream.');
             }
 
             const parts = [];
@@ -366,7 +378,7 @@ const SystemConfiguration = () => {
     };
 
     const isStreamSource = (cam) =>
-        cam.type.includes('RTSP') || cam.type.includes('File') || cam.type.includes('Fisheye');
+        cam.type.includes('RTSP') || cam.type.includes('Network') || cam.type.includes('File') || cam.type.includes('Fisheye');
 
     const handleStartSyncGroup = async () => {
         if (!syncGroupId.trim()) {
@@ -415,7 +427,7 @@ const SystemConfiguration = () => {
                 <div className="flex items-center justify-between mb-4">
                     <div className="flex gap-2">
                         <Button onClick={handleAddClick} className="flex items-center gap-2">
-                            <Plus className="w-4 h-4" /> Add RTSP Camera
+                            <Plus className="w-4 h-4" /> Add Stream Camera
                         </Button>
                         <Button variant="outline" onClick={handleUploadClick} className="flex items-center gap-2">
                             <FolderUp className="w-4 h-4" /> Upload Video Source
@@ -446,7 +458,7 @@ const SystemConfiguration = () => {
                                         ) : (
                                             <div className="flex flex-col items-center">
                                                 <Camera className="w-8 h-8 text-muted-foreground mb-2" />
-                                                <span className="text-xs text-muted-foreground">RTSP Stream</span>
+                                                <span className="text-xs text-muted-foreground">Live Stream</span>
                                             </div>
                                         )}
 
@@ -494,7 +506,7 @@ const SystemConfiguration = () => {
                         <Card className="max-w-2xl mx-auto">
                             <CardHeader className="flex flex-row items-center justify-between">
                                 <CardTitle>
-                                    {showUpload ? "Upload Video Source" : (isEditMode ? "Modify Camera Source" : "Add RTSP Camera")}
+                                    {showUpload ? "Upload Video Source" : (isEditMode ? "Modify Camera Source" : "Add Stream Camera")}
                                 </CardTitle>
                                 <Button variant="ghost" size="icon" onClick={resetForm}>
                                     <X className="w-4 h-4" />
@@ -552,7 +564,7 @@ const SystemConfiguration = () => {
                                                     checked={enableFisheye}
                                                     onCheckedChange={setEnableFisheye}
                                                 />
-                                                <Label htmlFor="fisheye">Enable Fisheye Processing (Generates 8 Views)</Label>
+                                                <Label htmlFor="fisheye">Enable Fisheye Processing (Choose 1 of 8 Views)</Label>
                                             </div>
 
                                             <div className="space-y-3 rounded-lg border p-3 bg-background/60">
@@ -601,7 +613,7 @@ const SystemConfiguration = () => {
 
                                             {enableFisheye && (
                                                 <div className="space-y-4">
-                                                    <Label>Select Enabled Views</Label>
+                                                    <Label>Select One View</Label>
                                                     <div className="grid grid-cols-4 gap-2">
                                                         {[0, 1, 2, 3, 4, 5, 6, 7].map((idx) => {
                                                             const angle = idx * 45;
@@ -610,12 +622,7 @@ const SystemConfiguration = () => {
                                                                     <Checkbox
                                                                         id={`view-${idx}`}
                                                                         checked={selectedViews.has(idx)}
-                                                                        onCheckedChange={(checked) => {
-                                                                            const newSet = new Set(selectedViews);
-                                                                            if (checked) newSet.add(idx);
-                                                                            else newSet.delete(idx);
-                                                                            setSelectedViews(newSet);
-                                                                        }}
+                                                                        onCheckedChange={() => handleSelectSingleView(idx)}
                                                                     />
                                                                     <Label htmlFor={`view-${idx}`} className="cursor-pointer text-xs">
                                                                         View {idx + 1} ({angle}°)
@@ -625,7 +632,7 @@ const SystemConfiguration = () => {
                                                         })}
                                                     </div>
                                                     <p className="text-xs text-muted-foreground">
-                                                        Only selected views will be processed and displayed.
+                                                        Only one fisheye view can be processed and displayed at a time.
                                                     </p>
                                                 </div>
                                             )}
@@ -642,18 +649,18 @@ const SystemConfiguration = () => {
                                             )}
                                         </div>
                                     ) : (
-                                        // RTSP Specific UI
+                                        // Live stream specific UI
                                         <>
                                             <div className="space-y-2">
-                                                <Label>RTSP URL</Label>
+                                                <Label>Stream URL</Label>
                                             <div className="flex gap-2">
                                                 <input
                                                     type="text"
-                                                    name="rtspUrl"
-                                                        value={formData.rtspUrl}
+                                                    name="streamUrl"
+                                                        value={formData.streamUrl}
                                                         onChange={handleInputChange}
                                                         className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                                                        placeholder="rtsp://admin:password@192.168.1.1:554/stream"
+                                                        placeholder="rtsp://camera/stream"
                                                     />
                                                     <Button type="button" variant="secondary" onClick={handleTestConnection} disabled={isTestingConnection}>
                                                     {isTestingConnection ? 'Testing...' : 'Test'}
@@ -672,32 +679,27 @@ const SystemConfiguration = () => {
                                             </div>
                                             <div className="flex items-center space-x-2">
                                                 <Checkbox
-                                                    id="rtsp-fisheye"
+                                                    id="stream-fisheye"
                                                     checked={enableFisheye}
                                                     disabled={isEditMode}
                                                     onCheckedChange={setEnableFisheye}
                                                 />
-                                                <Label htmlFor="rtsp-fisheye">Enable Fisheye Processing (Creates multiple RTSP views)</Label>
+                                                <Label htmlFor="stream-fisheye">Enable Fisheye Processing (Choose 1 Stream View)</Label>
                                             </div>
                                             {enableFisheye && (
                                                 <div className="space-y-4 border rounded-lg p-4 bg-muted/30">
-                                                    <Label>Select Enabled Views</Label>
+                                                    <Label>Select One View</Label>
                                                     <div className="grid grid-cols-4 gap-2">
                                                         {[0, 1, 2, 3, 4, 5, 6, 7].map((idx) => {
                                                             const angle = idx * 45;
                                                             return (
                                                                 <div key={idx} className="flex items-center space-x-2 border p-2 rounded hover:bg-muted/50">
                                                                     <Checkbox
-                                                                        id={`rtsp-view-${idx}`}
+                                                                        id={`stream-view-${idx}`}
                                                                         checked={selectedViews.has(idx)}
-                                                                        onCheckedChange={(checked) => {
-                                                                            const newSet = new Set(selectedViews);
-                                                                            if (checked) newSet.add(idx);
-                                                                            else newSet.delete(idx);
-                                                                            setSelectedViews(newSet);
-                                                                        }}
+                                                                        onCheckedChange={() => handleSelectSingleView(idx)}
                                                                     />
-                                                                    <Label htmlFor={`rtsp-view-${idx}`} className="cursor-pointer text-xs">
+                                                                    <Label htmlFor={`stream-view-${idx}`} className="cursor-pointer text-xs">
                                                                         View {idx + 1} ({angle}°)
                                                                     </Label>
                                                                 </div>
@@ -705,7 +707,7 @@ const SystemConfiguration = () => {
                                                         })}
                                                     </div>
                                                     <p className="text-xs text-muted-foreground">
-                                                        This creates one camera card per selected fisheye view.
+                                                        This creates one camera card for the selected fisheye view.
                                                     </p>
                                                 </div>
                                             )}

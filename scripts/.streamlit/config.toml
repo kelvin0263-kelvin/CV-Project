@@ -1,0 +1,4 @@
+[server]
+# Support launching from the scripts/ directory:
+#   streamlit run dataset_ui.py
+fileWatcherType = "none"

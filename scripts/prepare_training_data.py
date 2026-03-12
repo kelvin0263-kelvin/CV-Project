@@ -2,6 +2,7 @@ import cv2
 import sys
 import os
 import numpy as np
+import torch
 from ultralytics import YOLO
 import argparse
 
@@ -10,12 +11,15 @@ import argparse
 current_dir = os.path.dirname(os.path.abspath(__file__))
 backend_path = os.path.join(os.path.dirname(current_dir), 'backend')
 sys.path.append(backend_path)
+POSE_MODEL_PATH = os.path.join(backend_path, "yolo26s-pose.pt")
 
 try:
     from DefishVideoCV import FisheyeMultiView
 except ImportError:
     print("Error: Could not import DefishVideoCV. Make sure the script is in d:\\CV-UI\\scripts and backend is in d:\\CV-UI\\backend")
     sys.exit(1)
+
+MIN_SLIPPER_CROP_SIZE = 96
 
 def ensure_dir(path):
     if not os.path.exists(path):
@@ -60,6 +64,11 @@ def crop_with_padding(image, bbox, padding_percent=0.1):
     
     return image[ny1:ny2, nx1:nx2], (nx1, ny1, nx2, ny2)
 
+
+def is_min_size(image, min_size):
+    """Return True when image height and width both meet min_size."""
+    return image is not None and image.size > 0 and image.shape[0] >= min_size and image.shape[1] >= min_size
+
 def process_video(video_path, output_base_dir, tracker_cfg="bytetrack.yaml", defish=True):
     # Sampling / tracking controls
     frame_stride = 3          # process every Nth frame to cut volume (~25fps -> ~8fps)
@@ -80,8 +89,8 @@ def process_video(video_path, output_base_dir, tracker_cfg="bytetrack.yaml", def
         ensure_dir(d)
 
     # Load Model (YOLO-Pose for keypoints)
-    print("Loading yolo26n-Pose model...")
-    model = YOLO("D:/FinalYearProjectTCK/CV-Project/backend/yolo26m-pose.pt")  # Load an official Pose model
+    print(f"Loading pose model from {POSE_MODEL_PATH}...")
+    model = YOLO(POSE_MODEL_PATH)
 
 
     # Open Video
@@ -100,6 +109,8 @@ def process_video(video_path, output_base_dir, tracker_cfg="bytetrack.yaml", def
         print("[System] CUDA detected: enabling GPU processing")
     else:
         print("[System] CUDA not available, using CPU pipeline")
+    yolo_device = 0 if torch.cuda.is_available() else "cpu"
+    print(f"[System] YOLO inference device: {yolo_device}")
 
     processor = None
     if defish:
@@ -177,7 +188,7 @@ def process_video(video_path, output_base_dir, tracker_cfg="bytetrack.yaml", def
             conf=track_conf,
             iou=track_iou,
             imgsz=1280,
-            device='0'  # use GPU if available, else CPU
+            device=yolo_device,
         )
 
         if not results:
@@ -273,7 +284,7 @@ def process_video(video_path, output_base_dir, tracker_cfg="bytetrack.yaml", def
                     legs_bbox = (px1, int(knee_y), px2, py2)
                     # Often allow 'legs' to be wider? No, keep box width.
                     legs_img, _ = crop_with_padding(target_view, legs_bbox, 0)
-                    if legs_img is not None and legs_img.size > 0:
+                    if is_min_size(legs_img, MIN_SLIPPER_CROP_SIZE):
                         cv2.imwrite(os.path.join(dirs['legs'], fname), legs_img)
 
             # only count already on successful save above

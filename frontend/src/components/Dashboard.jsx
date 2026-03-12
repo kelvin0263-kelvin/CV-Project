@@ -36,11 +36,16 @@ const inferOverlayMode = (analysisTags = []) => {
     return 'auto';
 };
 
+const isStreamSource = (camera) =>
+    camera.type.includes("RTSP")
+    || camera.type.includes("Network")
+    || camera.type.includes("File")
+    || camera.type.includes("Fisheye");
+
 const CameraFeedCard = ({ camera }) => {
     const [stats, setStats] = useState({ fps: 0, people_count: 0 });
     const [countingData, setCountingData] = useState({});
     const wsUrl = getWSUrl(`/ws/${camera.id}`);
-    const isStreamSource = camera.type.includes("RTSP") || camera.type.includes("File") || camera.type.includes("Fisheye");
     const overlayMode = inferOverlayMode(camera.analysis_tags);
 
     const hasCountingData = countingData && (countingData.total_in > 0 || countingData.total_out > 0);
@@ -48,7 +53,7 @@ const CameraFeedCard = ({ camera }) => {
     return (
         <div className="relative group overflow-hidden bg-black rounded-sm border border-border/50 h-full w-full flex items-center justify-center">
             {/* Live Feed or Image */}
-            {isStreamSource ? (
+            {isStreamSource(camera) ? (
                 <StreamPlayer
                     wsUrl={wsUrl}
                     className="w-full h-full"
@@ -61,7 +66,7 @@ const CameraFeedCard = ({ camera }) => {
             ) : (
                 <div className="absolute inset-0 bg-muted/20 flex items-center justify-center text-muted-foreground">
                     <img src={camera.image} className="w-full h-full object-cover opacity-80" alt={camera.name} onError={(e) => { e.target.style.display = 'none' }} />
-                    <span className="absolute">RTSP Feed Placeholder</span>
+                    <span className="absolute">Stream Placeholder</span>
                 </div>
             )}
 

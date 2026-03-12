@@ -9,7 +9,7 @@ import cv2
 
 from pydantic import BaseModel
 
-from app.core.video_capture import open_video_capture
+from app.core.video_capture import is_rtsp_source, open_video_capture
 from app.models.camera_model import Camera
 from app.models.dresscode_policy import DressCodePolicy
 from app.models.fall_detection_config import FallDetectionConfig
@@ -46,11 +46,11 @@ except ValueError:
 WS_SEND_INTERVAL = 0.0 if WS_MAX_FPS <= 0 else 1.0 / WS_MAX_FPS
 
 
-class RTSPConnectionTestRequest(BaseModel):
+class StreamConnectionTestRequest(BaseModel):
     source_path: str
 
 
-class RTSPSourceCreateRequest(BaseModel):
+class StreamSourceCreateRequest(BaseModel):
     name: str
     location: str = ""
     source_path: str
@@ -60,6 +60,12 @@ class RTSPSourceCreateRequest(BaseModel):
     enabled: bool = True
     enable_fisheye: bool = False
     selected_views: list[int] = []
+
+
+def _infer_stream_camera_type(source_path: str, *, is_fisheye: bool = False) -> str:
+    if is_rtsp_source(source_path):
+        return "RTSP Fisheye" if is_fisheye else "RTSP"
+    return "Network Stream Fisheye" if is_fisheye else "Network Stream"
 
 
 def _default_ws_url(camera_id: str) -> str:
@@ -253,14 +259,14 @@ async def _create_camera_with_stream(
 
 
 def _open_probe_capture(source_path: str) -> cv2.VideoCapture:
-    return open_video_capture(source_path, is_rtsp=True)
+    return open_video_capture(source_path)
 
 
-def _probe_rtsp_stream(source_path: str) -> dict:
+def _probe_stream(source_path: str) -> dict:
     cap = _open_probe_capture(source_path)
     try:
         if not cap.isOpened():
-            return {"ok": False, "detail": "Unable to open RTSP stream."}
+            return {"ok": False, "detail": "Unable to open stream."}
 
         ok, frame = cap.read()
         if not ok or frame is None:
@@ -270,9 +276,10 @@ def _probe_rtsp_stream(source_path: str) -> dict:
         fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
         return {
             "ok": True,
-            "detail": "RTSP connection successful.",
+            "detail": "Stream connection successful.",
             "resolution": f"{width}x{height}",
             "fps": round(float(fps), 1),
+            "stream_kind": "rtsp" if is_rtsp_source(source_path) else "network",
         }
     finally:
         cap.release()
@@ -313,29 +320,30 @@ async def websocket_endpoint(websocket: WebSocket, camera_id: str):
             # Fetch latest frame + metadata from global buffer
             if runtime_key in FRAME_BUFFERS:
                 frames = FRAME_BUFFERS[runtime_key]
-                if target_key in frames:
-                    b64_data = frames[target_key]
+                b64_data = frames.get(target_key)
 
-                    # Extract metadata
-                    meta = frames.get("__meta__", {})
-                    fps = meta.get("fps", 0)
-                    people_count = meta.get("people_count", 0)
+                # Extract metadata
+                meta = frames.get("__meta__", {})
+                fps = meta.get("fps", 0)
+                people_count = meta.get("people_count", 0)
 
-                    # Get detections for this specific view
-                    all_detections = meta.get("detections", {})
-                    view_detections = all_detections.get(target_key, [])
+                # Get detections for this specific view
+                all_detections = meta.get("detections", {})
+                view_detections = all_detections.get(target_key, [])
 
-                    # Get counting data for this specific view
-                    all_counting = meta.get("counting_data", {})
-                    view_counting = all_counting.get(target_key, {})
+                # Get counting data for this specific view
+                all_counting = meta.get("counting_data", {})
+                view_counting = all_counting.get(target_key, {})
 
-                    await websocket.send_json({
-                        "image": b64_data,
-                        "fps": fps,
-                        "people_count": people_count,
-                        "detections": view_detections,
-                        "counting_data": view_counting,
-                    })
+                await websocket.send_json({
+                    "image": b64_data,
+                    "fps": fps,
+                    "people_count": people_count,
+                    "detections": view_detections,
+                    "counting_data": view_counting,
+                    "stream_status": meta.get("stream_status", "live" if b64_data else "recovering"),
+                    "stream_reason": meta.get("stream_reason"),
+                })
 
             if WS_SEND_INTERVAL > 0:
                 await asyncio.sleep(WS_SEND_INTERVAL)
@@ -369,8 +377,8 @@ async def get_cameras(db: AsyncSession = Depends(get_db)):
 @router.post("/api/cameras", response_model=CameraRead)
 async def add_camera(camera: CameraCreate, db: AsyncSession = Depends(get_db)):
     source_path = (camera.source_path or "").strip() or None
-    if camera.type.upper().startswith("RTSP") and not source_path:
-        raise HTTPException(status_code=400, detail="RTSP camera requires a source_path.")
+    if camera.type.upper().startswith(("RTSP", "NETWORK")) and not source_path:
+        raise HTTPException(status_code=400, detail="Stream camera requires a source_path.")
 
     camera_id = camera.id or str(uuid.uuid4())
     db_camera = Camera(
@@ -423,8 +431,8 @@ async def update_camera(camera_id: str, camera: CameraCreate, db: AsyncSession =
     old_runtime_key = _get_runtime_key(stream_config) if stream_config is not None else None
 
     source_path = (camera.source_path or "").strip() or None
-    if camera.type.upper().startswith("RTSP") and not source_path:
-        raise HTTPException(status_code=400, detail="RTSP camera requires a source_path.")
+    if camera.type.upper().startswith(("RTSP", "NETWORK")) and not source_path:
+        raise HTTPException(status_code=400, detail="Stream camera requires a source_path.")
 
     db_camera.name = camera.name
     db_camera.location = camera.location
@@ -472,11 +480,12 @@ async def update_camera(camera_id: str, camera: CameraCreate, db: AsyncSession =
     return _build_camera_read(db_camera, stream_config)
 
 
+@router.post("/api/cameras/stream-source")
 @router.post("/api/cameras/rtsp-source")
-async def create_rtsp_source(payload: RTSPSourceCreateRequest, db: AsyncSession = Depends(get_db)):
+async def create_stream_source(payload: StreamSourceCreateRequest, db: AsyncSession = Depends(get_db)):
     source_path = payload.source_path.strip()
     if not source_path:
-        raise HTTPException(status_code=400, detail="RTSP source_path is required.")
+        raise HTTPException(status_code=400, detail="Stream source_path is required.")
 
     status = "Online" if payload.enabled else "Disabled"
     new_cameras: list[CameraRead] = []
@@ -500,7 +509,7 @@ async def create_rtsp_source(payload: RTSPSourceCreateRequest, db: AsyncSession 
                 db,
                 name=f"{payload.name} - View {idx + 1} ({angles[idx]}°)",
                 location=payload.location,
-                camera_type="RTSP Fisheye",
+                camera_type=_infer_stream_camera_type(source_path, is_fisheye=True),
                 status=status,
                 mode=payload.mode,
                 resolution=payload.resolution,
@@ -520,7 +529,7 @@ async def create_rtsp_source(payload: RTSPSourceCreateRequest, db: AsyncSession 
             db,
             name=payload.name,
             location=payload.location,
-            camera_type="RTSP",
+            camera_type=_infer_stream_camera_type(source_path, is_fisheye=False),
             status=status,
             mode=payload.mode,
             resolution=payload.resolution,
@@ -543,20 +552,25 @@ async def create_rtsp_source(payload: RTSPSourceCreateRequest, db: AsyncSession 
     }
 
 
-@router.post("/api/cameras/test-rtsp")
-async def test_rtsp_connection(payload: RTSPConnectionTestRequest):
+@router.post("/api/cameras/test-stream")
+async def test_stream_connection(payload: StreamConnectionTestRequest):
     source_path = payload.source_path.strip()
     if not source_path:
         raise HTTPException(status_code=400, detail="source_path is required.")
 
     loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(None, _probe_rtsp_stream, source_path)
+        return await loop.run_in_executor(None, _probe_stream, source_path)
     except Exception as exc:
         return {
             "ok": False,
-            "detail": f"RTSP probe failed: {exc}",
+            "detail": f"Stream probe failed: {exc}",
         }
+
+
+@router.post("/api/cameras/test-rtsp")
+async def test_rtsp_connection(payload: StreamConnectionTestRequest):
+    return await test_stream_connection(payload)
 
 
 @router.delete("/api/cameras/{camera_id}")
