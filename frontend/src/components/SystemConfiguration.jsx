@@ -253,70 +253,7 @@ const SystemConfiguration = () => {
         setUploadPreviewImage('');
         setUploadPreviewSize({ width: 640, height: 360 });
 
-        const video = document.createElement('video');
-        video.preload = 'auto';
-        video.muted = true;
-        video.playsInline = true;
-
-        let captured = false;
         let cancelled = false;
-        let backendPreviewResolved = false;
-
-        const captureFrame = () => {
-            if (cancelled || captured || backendPreviewResolved) {
-                return;
-            }
-            const width = video.videoWidth || 640;
-            const height = video.videoHeight || 360;
-            setUploadPreviewSize({ width, height });
-
-            try {
-                const canvas = document.createElement('canvas');
-                canvas.width = width;
-                canvas.height = height;
-                const ctx = canvas.getContext('2d');
-                if (!ctx) {
-                    return;
-                }
-                ctx.drawImage(video, 0, 0, width, height);
-                setUploadPreviewImage(canvas.toDataURL('image/jpeg', 0.85));
-                captured = true;
-            } catch (error) {
-                console.error('Failed to capture upload preview frame:', error);
-            }
-        };
-
-        video.onloadedmetadata = () => {
-            if (cancelled) {
-                return;
-            }
-            const width = video.videoWidth || 640;
-            const height = video.videoHeight || 360;
-            setUploadPreviewSize({ width, height });
-
-            if (!Number.isFinite(video.duration) || video.duration <= 0) {
-                captureFrame();
-                return;
-            }
-
-            const targetTime = Math.min(0.1, Math.max(video.duration / 20, 0.02));
-            try {
-                video.currentTime = targetTime;
-            } catch (_) {
-                captureFrame();
-            }
-        };
-
-        video.onloadeddata = captureFrame;
-        video.oncanplay = captureFrame;
-        video.onseeked = captureFrame;
-        video.onerror = () => {
-            if (!cancelled) {
-                console.error('Failed to load upload preview video.');
-            }
-        };
-        video.src = objectUrl;
-        video.load();
 
         const loadBackendPreview = async () => {
             try {
@@ -333,8 +270,6 @@ const SystemConfiguration = () => {
                 if (cancelled || !data?.preview_image) {
                     return;
                 }
-                backendPreviewResolved = true;
-                captured = true;
                 setUploadPreviewImage(`data:image/jpeg;base64,${data.preview_image}`);
                 setUploadPreviewSize({
                     width: parseInt(data.frame_width, 10) || 640,
@@ -348,19 +283,8 @@ const SystemConfiguration = () => {
         };
         loadBackendPreview();
 
-        const fallbackTimer = window.setTimeout(() => {
-            captureFrame();
-        }, 2000);
-
         return () => {
             cancelled = true;
-            window.clearTimeout(fallbackTimer);
-            video.onloadedmetadata = null;
-            video.onloadeddata = null;
-            video.oncanplay = null;
-            video.onseeked = null;
-            video.onerror = null;
-            video.src = '';
             URL.revokeObjectURL(objectUrl);
         };
     }, [selectedFile]);

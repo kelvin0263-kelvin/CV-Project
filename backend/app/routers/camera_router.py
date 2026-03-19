@@ -12,6 +12,9 @@ import tempfile
 import time
 import threading
 import re
+import subprocess
+
+import numpy as np
 
 from pydantic import BaseModel
 
@@ -24,7 +27,12 @@ from app.models.stream_config import StreamConfig
 from app.schemas.camera import CameraCreate, CameraRead
 from app.core.database import get_db, AsyncSessionLocal
 from app.core.globals import FRAME_BUFFERS, PRODUCER_META, PRODUCER_LOCK
-from app.services.video_processor import start_producer_thread, stop_producer_thread, is_producer_running
+from app.services.video_processor import (
+    FFMPEG_BIN,
+    start_producer_thread,
+    stop_producer_thread,
+    is_producer_running,
+)
 from app.services.source_roi_registry import replace_source_detection_rois
 from app.services.upload_sync import (
     discard_pending_runtime_key,
@@ -79,6 +87,7 @@ class UploadRuntimeActionRequest(BaseModel):
 
 class UploadPreviewRequest(BaseModel):
     runtime_key: str
+    camera_id: str | None = None
 
 
 FISHEYE_VIEW_CONFIGS = [
@@ -445,6 +454,22 @@ async def _get_uploaded_runtime_stream(
     return rows[0][1]
 
 
+async def _get_uploaded_camera_stream(
+    session: AsyncSession,
+    camera_id: str,
+    runtime_key: str | None = None,
+) -> StreamConfig | None:
+    result = await session.execute(
+        select(StreamConfig).where(StreamConfig.camera_id == camera_id).limit(1)
+    )
+    stream_config = result.scalars().first()
+    if stream_config is None:
+        return None
+    if runtime_key and _get_runtime_key(stream_config) != runtime_key:
+        return None
+    return stream_config
+
+
 def _start_uploaded_runtime_members(members: list[dict]) -> int:
     if not members:
         return 0
@@ -636,46 +661,56 @@ def _probe_uploaded_video_file(
     enable_fisheye: bool = False,
     selected_view: int | None = None,
 ) -> dict:
-    cap = cv2.VideoCapture(file_path)
+    cap = _open_probe_capture(file_path)
     try:
-        if not cap.isOpened():
-            return {"ok": False, "detail": "Unable to open uploaded video."}
+        duration_hint = None
+        if cap.isOpened():
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if fps > 0.0 and frame_count > 0:
+                duration_hint = frame_count / fps
 
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        seek_positions: list[int] = []
-        if frame_count > 0:
-            ratios = [0.02, 0.08, 0.15, 0.25, 0.4, 0.55, 0.7]
-            seek_positions = sorted({
-                max(0, min(frame_count - 1, int(frame_count * ratio)))
-                for ratio in ratios
-            })
+        frame = _extract_preview_frame_with_ffmpeg(
+            file_path,
+            duration_hint=duration_hint,
+        )
 
-        frame = None
-        best_frame = None
+        if frame is None and cap.isOpened():
+            seek_positions: list[int] = []
+            if frame_count > 0:
+                ratios = [0.02, 0.08, 0.15, 0.25, 0.4, 0.55, 0.7]
+                seek_positions = sorted({
+                    max(0, min(frame_count - 1, int(frame_count * ratio)))
+                    for ratio in ratios
+                })
 
-        def _try_read_candidate() -> bool:
-            nonlocal frame, best_frame
-            for _ in range(20):
-                ok, next_frame = cap.read()
-                if not ok or next_frame is None:
-                    continue
-                frame = next_frame
-                if _is_usable_preview_frame(next_frame):
-                    best_frame = next_frame
-                    return True
-                if best_frame is None:
-                    best_frame = next_frame
-            return False
+            frame = None
+            best_frame = None
 
-        if seek_positions:
-            for frame_index in seek_positions:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-                if _try_read_candidate():
-                    break
-        else:
-            _try_read_candidate()
+            def _try_read_candidate() -> bool:
+                nonlocal frame, best_frame
+                for _ in range(20):
+                    ok, next_frame = cap.read()
+                    if not ok or next_frame is None:
+                        continue
+                    frame = next_frame
+                    if _is_usable_preview_frame(next_frame):
+                        best_frame = next_frame
+                        return True
+                    if best_frame is None:
+                        best_frame = next_frame
+                return False
 
-        frame = best_frame if best_frame is not None else frame
+            if seek_positions:
+                for frame_index in seek_positions:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                    if _try_read_candidate():
+                        break
+            else:
+                _try_read_candidate()
+
+            frame = best_frame if best_frame is not None else frame
+
         if frame is None:
             return {"ok": False, "detail": "Uploaded video did not yield a readable preview frame."}
 
@@ -702,6 +737,92 @@ def _probe_uploaded_video_file(
         }
     finally:
         cap.release()
+
+
+def _decode_image_buffer(image_bytes: bytes):
+    if not image_bytes:
+        return None
+
+    encoded = np.frombuffer(image_bytes, dtype=np.uint8)
+    if encoded.size == 0:
+        return None
+
+    try:
+        return cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    except cv2.error:
+        return None
+
+
+def _extract_preview_frame_with_ffmpeg(
+    file_path: str,
+    *,
+    duration_hint: float | None = None,
+):
+    seek_points = [0.5, 1.0, 1.8, 3.0]
+    if duration_hint and duration_hint > 0.0:
+        seek_points.extend(
+            max(0.0, min(duration_hint - 0.05, duration_hint * ratio))
+            for ratio in (0.08, 0.15, 0.25, 0.4, 0.55, 0.7)
+        )
+
+    ordered_seek_points: list[float] = []
+    seen_seek_points: set[float] = set()
+    for point in seek_points:
+        normalized = round(max(0.0, float(point)), 3)
+        if normalized in seen_seek_points:
+            continue
+        ordered_seek_points.append(normalized)
+        seen_seek_points.add(normalized)
+
+    best_frame = None
+    for seek_seconds in ordered_seek_points:
+        command = [
+            FFMPEG_BIN,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            file_path,
+        ]
+        if seek_seconds > 0.0:
+            command.extend(["-ss", f"{seek_seconds:.3f}"])
+        command.extend([
+            "-frames:v",
+            "1",
+            "-an",
+            "-sn",
+            "-dn",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "-",
+        ])
+
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return best_frame
+
+        if completed.returncode != 0 or not completed.stdout:
+            continue
+
+        decoded = _decode_image_buffer(completed.stdout)
+        if decoded is None:
+            continue
+        if _is_usable_preview_frame(decoded):
+            return decoded
+        if best_frame is None:
+            best_frame = decoded
+
+    return best_frame
 
 
 # --- WebSocket Endpoint ---
@@ -1269,7 +1390,11 @@ async def preview_uploaded_runtime(
     if not runtime_key:
         raise HTTPException(status_code=400, detail="runtime_key is required.")
 
-    stream_config = await _get_uploaded_runtime_stream(db, runtime_key)
+    camera_id = (payload.camera_id or "").strip()
+    if camera_id:
+        stream_config = await _get_uploaded_camera_stream(db, camera_id, runtime_key)
+    else:
+        stream_config = await _get_uploaded_runtime_stream(db, runtime_key)
     if stream_config is None:
         raise HTTPException(status_code=404, detail="Uploaded video source not found.")
 

@@ -46,6 +46,7 @@ from app.services.cross_camera_verifier import (
     get_verifier_camera_status,
     observe_verifier_tracks,
     register_primary_in_events,
+    register_primary_out_events,
     reset_cross_camera_state,
 )
 from app.services.people_counter import PeopleCounter
@@ -1912,12 +1913,19 @@ def video_producer(
                 "foot_traffic_total": 0,
                 "foot_traffic_lines": [],
                 "raw_total_in": 0,
+                "raw_total_out": 0,
                 "verification_confirmed_in": 0,
                 "verification_correction_in": 0,
+                "verification_confirmed_out": 0,
+                "verification_correction_out": 0,
                 "verification_camera_id": None,
                 "cross_camera_pair_id": config.get("cross_camera_pair_id"),
                 "cross_camera_active_event": None,
                 "cross_camera_last_event": None,
+                "cross_camera_active_in_event": None,
+                "cross_camera_last_in_event": None,
+                "cross_camera_active_out_event": None,
+                "cross_camera_last_out_event": None,
                 "lines": config.get("lines", []),
                 "active_zones": config.get("active_zones", config.get("frame_exclude_areas", [])),
                 "frame_exclude_areas": config.get("frame_exclude_areas", []),
@@ -1959,8 +1967,10 @@ def video_producer(
         raw_total_in = int(raw_counting_data.get("total_in", 0) or 0)
         raw_total_out = int(raw_counting_data.get("total_out", 0) or 0)
         raw_delta_in = max(0, raw_total_in - int(prev_state.get("raw_total_in", 0) or 0))
+        raw_delta_out = max(0, raw_total_out - int(prev_state.get("raw_total_out", 0) or 0))
 
         register_primary_in_events(camera_id, raw_delta_in, now_ts)
+        register_primary_out_events(camera_id, raw_delta_out, now_ts)
         observe_verifier_tracks(camera_id, detections_unscaled, config, frame_shape, now_ts)
         counting_data, _ = apply_primary_camera_correction(camera_id, raw_counting_data, now_ts)
 

@@ -64,6 +64,7 @@ const CountingCanvas = ({
     onLineDrawn,
     onFrameExcludeAreaDrawn,
     containerRef,
+    mediaSize = null,
 }) => {
     const svgRef = useRef(null);
     const [svgSize, setSvgSize] = useState({ width: 640, height: 360 });
@@ -84,7 +85,9 @@ const CountingCanvas = ({
                 const containerH = rect.height;
                 setSvgSize({ width: containerW, height: containerH });
 
-                const imgAspect = 640 / 360;
+                const mediaWidth = Number(mediaSize?.width) > 0 ? Number(mediaSize.width) : 640;
+                const mediaHeight = Number(mediaSize?.height) > 0 ? Number(mediaSize.height) : 360;
+                const imgAspect = mediaWidth / mediaHeight;
                 const containerAspect = containerW / containerH;
 
                 let displayW, displayH, offsetX, offsetY;
@@ -109,7 +112,7 @@ const CountingCanvas = ({
             window.removeEventListener('resize', updateSize);
             clearInterval(interval);
         };
-    }, [containerRef]);
+    }, [containerRef, mediaSize]);
 
     const toNorm = useCallback((px, py) => {
         const { displayW, displayH, offsetX, offsetY } = videoArea;

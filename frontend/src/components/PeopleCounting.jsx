@@ -149,6 +149,7 @@ const PeopleCounting = () => {
     const [saving, setSaving] = useState(false);
     const [saveMessage, setSaveMessage] = useState('');
     const [runtimePreviewImage, setRuntimePreviewImage] = useState('');
+    const [runtimePreviewFrameSize, setRuntimePreviewFrameSize] = useState(null);
     const [loadingRuntimePreview, setLoadingRuntimePreview] = useState(false);
     const [buildingEnabled, setBuildingEnabled] = useState(true);
     const [buildingMaxCapacity, setBuildingMaxCapacity] = useState('');
@@ -500,8 +501,10 @@ const PeopleCounting = () => {
     const footTrafficLabels = getFootTrafficSummaryLabels((Array.isArray(countingData.lines) && countingData.lines.length) ? countingData.lines : lines);
     const isVerifierMode = crossCameraEnabled && crossCameraRole === 'verifier';
     const verifierObservedTracks = countingData.verifier_observed_tracks ?? 0;
-    const verifierActiveEvent = countingData.verifier_active_event ?? null;
-    const verifierLastEvent = countingData.verifier_last_event ?? null;
+    const verifierActiveInEvent = countingData.verifier_active_in_event ?? null;
+    const verifierActiveOutEvent = countingData.verifier_active_out_event ?? null;
+    const verifierLastInEvent = countingData.verifier_last_in_event ?? null;
+    const verifierLastOutEvent = countingData.verifier_last_out_event ?? null;
     const verifierPrimaryCameraIds = Array.isArray(countingData.verifier_primary_camera_ids) ? countingData.verifier_primary_camera_ids : [];
     const linkedPrimaryNames = verifierPrimaryCameraIds
         .map((cameraId) => cameras.find((camera) => camera.id === cameraId)?.name || cameraId)
@@ -518,6 +521,7 @@ const PeopleCounting = () => {
         const loadRuntimePreview = async () => {
             if (!selectedCam?.runtime_key || !showStoppedUploadPreview) {
                 setRuntimePreviewImage('');
+                setRuntimePreviewFrameSize(null);
                 setLoadingRuntimePreview(false);
                 return;
             }
@@ -527,7 +531,10 @@ const PeopleCounting = () => {
                 const res = await fetch(`${apiUrl}/api/upload-videos/preview`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ runtime_key: selectedCam.runtime_key }),
+                    body: JSON.stringify({
+                        runtime_key: selectedCam.runtime_key,
+                        camera_id: selectedCam.id,
+                    }),
                 });
                 const data = await res.json().catch(() => ({}));
                 if (cancelled) {
@@ -537,10 +544,16 @@ const PeopleCounting = () => {
                     throw new Error(data.detail || 'Preview unavailable.');
                 }
                 setRuntimePreviewImage(`data:image/jpeg;base64,${data.preview_image}`);
+                setRuntimePreviewFrameSize(
+                    Number(data.frame_width) > 0 && Number(data.frame_height) > 0
+                        ? { width: Number(data.frame_width), height: Number(data.frame_height) }
+                        : null
+                );
             } catch (err) {
                 if (!cancelled) {
                     console.error('Failed to load people counting preview:', err);
                     setRuntimePreviewImage('');
+                    setRuntimePreviewFrameSize(null);
                 }
             } finally {
                 if (!cancelled) {
@@ -556,10 +569,36 @@ const PeopleCounting = () => {
     }, [apiUrl, selectedCam, showStoppedUploadPreview]);
 
     const topSummary = isVerifierMode ? (
-        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
             <StatTile label="Verifier Tracks" value={verifierObservedTracks} icon={Users} tone="cyan" subtitle="Tracks currently observed by verifier" />
-            <StatTile label="Active Event" value={verifierActiveEvent?.verifier_in_count ?? 0} icon={ArrowDownToLine} tone="green" subtitle={verifierActiveEvent ? `Primary ${verifierActiveEvent.primary_in_count ?? 0}` : 'No active primary event'} />
-            <StatTile label="Last Verified" value={verifierLastEvent?.verifier_in_count ?? 0} icon={ArrowRightLeft} tone="default" subtitle={verifierLastEvent ? `Correction ${verifierLastEvent.correction_in ?? 0}` : 'No completed event yet'} />
+            <StatTile
+                label="Active IN"
+                value={verifierActiveInEvent?.verifier_count ?? 0}
+                icon={ArrowDownToLine}
+                tone="green"
+                subtitle={verifierActiveInEvent ? `Primary ${verifierActiveInEvent.primary_count ?? 0}` : 'No active IN event'}
+            />
+            <StatTile
+                label="Active OUT"
+                value={verifierActiveOutEvent?.verifier_count ?? 0}
+                icon={ArrowUpFromLine}
+                tone="red"
+                subtitle={verifierActiveOutEvent ? `Primary ${verifierActiveOutEvent.primary_count ?? 0}` : 'No active OUT event'}
+            />
+            <StatTile
+                label="Last IN"
+                value={verifierLastInEvent?.verifier_count ?? 0}
+                icon={ArrowDownToLine}
+                tone="green"
+                subtitle={verifierLastInEvent ? `Primary ${verifierLastInEvent.primary_count ?? 0}` : 'No completed IN event'}
+            />
+            <StatTile
+                label="Last OUT"
+                value={verifierLastOutEvent?.verifier_count ?? 0}
+                icon={ArrowUpFromLine}
+                tone="red"
+                subtitle={verifierLastOutEvent ? `Primary ${verifierLastOutEvent.primary_count ?? 0}` : 'No completed OUT event'}
+            />
             <StatTile label="Pair" value={countingData.cross_camera_pair_id || '-'} icon={Building2} tone="amber" subtitle={linkedPrimaryNames ? `Primary ${linkedPrimaryNames}` : 'No linked primary camera'} />
         </div>
     ) : (
@@ -940,6 +979,7 @@ const PeopleCounting = () => {
                                 onLineDrawn={handleLineDrawn}
                                 onFrameExcludeAreaDrawn={handleFrameExcludeAreaDrawn}
                                 containerRef={videoContainerRef}
+                                mediaSize={showStoppedUploadPreview ? runtimePreviewFrameSize : null}
                             />
                         </>
                     ) : (

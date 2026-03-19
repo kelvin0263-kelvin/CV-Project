@@ -1,4 +1,3 @@
-import os
 import threading
 import time
 import uuid
@@ -8,7 +7,6 @@ DEFAULT_INWARD_THRESHOLD = 0.02
 DEFAULT_PRIMARY_EVENT_IDLE_TIMEOUT_SEC =  7.0
 TRACK_STALE_TIMEOUT_SEC = 5.0
 LINE_SIDE_EPS = 0.002
-DEBUG_CROSS_CAMERA = os.getenv("DEBUG_CROSS_CAMERA", "").strip().lower() in {"1", "true", "yes", "on"}
 
 _runtime_lock = threading.Lock()
 _primary_pairs: dict[str, dict] = {}
@@ -17,9 +15,17 @@ _pair_states: dict[str, dict] = {}
 _verifier_tracks: dict[str, dict[int, dict]] = {}
 
 
-def _log_cross_camera(message: str) -> None:
-    if DEBUG_CROSS_CAMERA:
-        print(message)
+def _new_pair_state() -> dict:
+    return {
+        "last_raw_total_in": 0,
+        "last_raw_total_out": 0,
+        "correction_offset_in": 0,
+        "correction_offset_out": 0,
+        "active_in_event": None,
+        "last_completed_in_event": None,
+        "active_out_event": None,
+        "last_completed_out_event": None,
+    }
 
 
 def sync_cross_camera_runtime(counting_configs: dict[str, dict]) -> None:
@@ -68,15 +74,7 @@ def sync_cross_camera_runtime(counting_configs: dict[str, dict]) -> None:
         _primary_pairs = new_primary_pairs
         _verifier_to_primary = new_verifier_to_primary
         _pair_states = {
-            camera_id: old_pair_states.get(
-                camera_id,
-                {
-                    "last_raw_total_in": 0,
-                    "correction_offset_in": 0,
-                    "active_event": None,
-                    "last_completed_event": None,
-                },
-            )
+            camera_id: old_pair_states.get(camera_id, _new_pair_state())
             for camera_id in new_primary_pairs
         }
         _verifier_tracks = {
@@ -84,56 +82,29 @@ def sync_cross_camera_runtime(counting_configs: dict[str, dict]) -> None:
             for camera_id in new_verifier_to_primary
         }
 
-    if not new_primary_pairs:
-        _log_cross_camera("[CrossCameraSync] no active primary/verifier pairs")
-        return
-
-    for primary_camera_id, pair_cfg in new_primary_pairs.items():
-        _log_cross_camera(
-            " ".join(
-                [
-                    "[CrossCameraSync]",
-                    f"pair_id={pair_cfg.get('pair_id')}",
-                    f"primary_camera={primary_camera_id}",
-                    f"verifier_camera={pair_cfg.get('verifier_camera_id')}",
-                    f"idle_timeout={pair_cfg.get('primary_event_idle_timeout_sec')}",
-                    f"inward_threshold={pair_cfg.get('verification_inward_threshold')}",
-                ]
-            )
-        )
+    return
 
 
 def reset_cross_camera_state(camera_id: str) -> None:
     with _runtime_lock:
         if camera_id in _pair_states:
-            _pair_states[camera_id] = {
-                "last_raw_total_in": 0,
-                "correction_offset_in": 0,
-                "active_event": None,
-                "last_completed_event": None,
-            }
+            _pair_states[camera_id] = _new_pair_state()
 
         if camera_id in _verifier_tracks:
             _verifier_tracks[camera_id] = {}
 
         for primary_camera_id, pair_cfg in _primary_pairs.items():
             if pair_cfg.get("verifier_camera_id") == camera_id:
-                _pair_states[primary_camera_id] = {
-                    "last_raw_total_in": 0,
-                    "correction_offset_in": 0,
-                    "active_event": None,
-                    "last_completed_event": None,
-                }
-
-    _log_cross_camera(f"[CrossCameraReset] camera={camera_id}")
-
+                _pair_states[primary_camera_id] = _new_pair_state()
 
 def get_verifier_camera_status(camera_id: str) -> dict:
     with _runtime_lock:
         primary_ids = sorted(_verifier_to_primary.get(camera_id, set()))
         track_states = _verifier_tracks.get(camera_id, {})
-        active_events: list[dict] = []
-        last_events: list[dict] = []
+        active_in_events: list[dict] = []
+        active_out_events: list[dict] = []
+        last_in_events: list[dict] = []
+        last_out_events: list[dict] = []
 
         for primary_camera_id in primary_ids:
             pair_cfg = _primary_pairs.get(primary_camera_id)
@@ -141,47 +112,92 @@ def get_verifier_camera_status(camera_id: str) -> dict:
             if not pair_cfg or not pair_state:
                 continue
 
-            active_event = _serialize_event(pair_state.get("active_event"))
-            if active_event is not None:
-                active_events.append(
+            active_in_event = _serialize_event(pair_state.get("active_in_event"))
+            if active_in_event is not None:
+                active_in_events.append(
                     {
                         "primary_camera_id": primary_camera_id,
                         "pair_id": pair_cfg.get("pair_id"),
-                        **active_event,
+                        **active_in_event,
                     }
                 )
 
-            last_event = _serialize_event(pair_state.get("last_completed_event"))
-            if last_event is not None:
-                last_events.append(
+            active_out_event = _serialize_event(pair_state.get("active_out_event"))
+            if active_out_event is not None:
+                active_out_events.append(
                     {
                         "primary_camera_id": primary_camera_id,
                         "pair_id": pair_cfg.get("pair_id"),
-                        **last_event,
+                        **active_out_event,
                     }
                 )
 
-        latest_last_event = None
-        if last_events:
-            latest_last_event = max(last_events, key=lambda event: float(event.get("end_time") or 0.0))
+            last_in_event = _serialize_event(pair_state.get("last_completed_in_event"))
+            if last_in_event is not None:
+                last_in_events.append(
+                    {
+                        "primary_camera_id": primary_camera_id,
+                        "pair_id": pair_cfg.get("pair_id"),
+                        **last_in_event,
+                    }
+                )
+
+            last_out_event = _serialize_event(pair_state.get("last_completed_out_event"))
+            if last_out_event is not None:
+                last_out_events.append(
+                    {
+                        "primary_camera_id": primary_camera_id,
+                        "pair_id": pair_cfg.get("pair_id"),
+                        **last_out_event,
+                    }
+                )
+
+        latest_last_in_event = _latest_event(last_in_events)
+        latest_last_out_event = _latest_event(last_out_events)
+        latest_last_event = _latest_event(
+            [event for event in [latest_last_in_event, latest_last_out_event] if event is not None]
+        )
+        active_in_event = active_in_events[0] if active_in_events else None
+        active_out_event = active_out_events[0] if active_out_events else None
 
         return {
             "cross_camera_role": "verifier",
             "cross_camera_pair_id": primary_ids and str((_primary_pairs.get(primary_ids[0]) or {}).get("pair_id") or "") or None,
             "verifier_primary_camera_ids": primary_ids,
             "verifier_observed_tracks": len(track_states),
-            "verifier_active_events": active_events,
-            "verifier_active_event": active_events[0] if active_events else None,
-            "verifier_last_events": last_events,
+            "verifier_active_in_events": active_in_events,
+            "verifier_active_in_event": active_in_event,
+            "verifier_active_out_events": active_out_events,
+            "verifier_active_out_event": active_out_event,
+            "verifier_last_in_events": last_in_events,
+            "verifier_last_in_event": latest_last_in_event,
+            "verifier_last_out_events": last_out_events,
+            "verifier_last_out_event": latest_last_out_event,
+            "verifier_active_event": active_in_event or active_out_event,
             "verifier_last_event": latest_last_event,
         }
 
 
 def register_primary_in_events(camera_id: str, delta_in: int, now: float | None = None) -> None:
-    if delta_in <= 0:
+    _register_primary_events(camera_id, delta_in, "in", now)
+
+
+def register_primary_out_events(camera_id: str, delta_out: int, now: float | None = None) -> None:
+    _register_primary_events(camera_id, delta_out, "out", now)
+
+
+def _register_primary_events(
+    camera_id: str,
+    delta_count: int,
+    direction: str,
+    now: float | None = None,
+) -> None:
+    if delta_count <= 0:
         return
     if now is None:
         now = time.time()
+
+    active_key, _, primary_count_key, verifier_count_key = _event_state_keys(direction)
 
     with _runtime_lock:
         pair_cfg = _primary_pairs.get(camera_id)
@@ -189,48 +205,24 @@ def register_primary_in_events(camera_id: str, delta_in: int, now: float | None 
         if not pair_cfg or not pair_state:
             return
 
-        active_event = pair_state.get("active_event")
+        active_event = pair_state.get(active_key)
         if active_event is None:
             active_event = {
                 "event_id": str(uuid.uuid4()),
+                "direction": direction,
                 "start_time": now,
-                "last_primary_in_time": now,
-                "primary_in_count": int(delta_in),
-                "verifier_in_count": 0,
+                "last_primary_time": now,
+                "last_activity_time": now,
+                primary_count_key: int(delta_count),
+                verifier_count_key: 0,
                 "accepted_track_ids": set(),
             }
-            pair_state["active_event"] = active_event
-            _log_cross_camera(
-                " ".join(
-                    [
-                        "[CrossCameraPrimaryEventStarted]",
-                        f"pair_id={pair_cfg.get('pair_id')}",
-                        f"event_id={active_event['event_id']}",
-                        f"primary_camera={camera_id}",
-                        f"verifier_camera={pair_cfg.get('verifier_camera_id')}",
-                        f"delta_in={delta_in}",
-                        f"primary_in_count={active_event['primary_in_count']}",
-                        f"start_time={now:.3f}",
-                    ]
-                )
-            )
+            pair_state[active_key] = active_event
             return
 
-        active_event["last_primary_in_time"] = now
-        active_event["primary_in_count"] = int(active_event.get("primary_in_count", 0) or 0) + int(delta_in)
-        _log_cross_camera(
-            " ".join(
-                [
-                    "[CrossCameraPrimaryEventUpdated]",
-                    f"pair_id={pair_cfg.get('pair_id')}",
-                    f"event_id={active_event['event_id']}",
-                    f"primary_camera={camera_id}",
-                    f"delta_in={delta_in}",
-                    f"primary_in_count={active_event['primary_in_count']}",
-                    f"last_primary_in_time={now:.3f}",
-                ]
-            )
-        )
+        active_event["last_primary_time"] = now
+        active_event["last_activity_time"] = now
+        active_event[primary_count_key] = int(active_event.get(primary_count_key, 0) or 0) + int(delta_count)
 
 
 def observe_verifier_tracks(
@@ -251,80 +243,63 @@ def observe_verifier_tracks(
         track_states = _verifier_tracks.setdefault(camera_id, {})
         active_track_ids: set[int] = set()
         active_zones = config.get("frame_exclude_areas") or []
-        inward_line = _get_inward_line(config.get("lines") or [])
+        lines = config.get("lines") or []
+        inward_line = _get_inward_line(lines)
+        outward_line = _get_outward_line(lines)
 
         for det in detections:
             track_id = det.get("track_id")
-            person_bbox = det.get("person_bbox")
-            point = _extract_verifier_cross_point(det, inward_line, frame_shape)
-            if track_id is None or point is None:
+            in_point = _extract_verifier_cross_point(det, inward_line, frame_shape)
+            out_point = _extract_verifier_cross_point(det, outward_line, frame_shape)
+            if track_id is None or (in_point is None and out_point is None):
                 continue
 
             tid = int(track_id)
             active_track_ids.add(tid)
-            curr_side = _line_target_side_value(inward_line, point) if inward_line else 0.0
-
             ts = track_states.get(tid)
             if ts is None:
                 ts = {
                     "birth_time": now,
-                    "birth_point": point,
-                    "last_point": point,
+                    "birth_point": in_point or out_point,
+                    "last_in_point": in_point,
+                    "last_out_point": out_point,
                     "last_seen": now,
-                    "last_side_value": curr_side,
                 }
                 track_states[tid] = ts
-                prev_point = None
-                prev_side = curr_side
             else:
-                prev_point = ts["last_point"]
-                prev_side = float(ts.get("last_side_value", 0.0) or 0.0)
-                ts["last_point"] = point
                 ts["last_seen"] = now
-                ts["last_side_value"] = curr_side
+                prev_in_point = ts.get("last_in_point")
+                prev_out_point = ts.get("last_out_point")
 
-            if prev_point is None or inward_line is None:
-                continue
-
-            cross_point = _line_crossing_point(prev_point, point, prev_side, curr_side)
-            if cross_point is None:
-                continue
-            if prev_side > LINE_SIDE_EPS or curr_side <= LINE_SIDE_EPS:
-                continue
-            if not _is_inside_active_zone(cross_point, active_zones):
-                continue
-
-            for primary_camera_id in primary_ids:
-                pair_cfg = _primary_pairs.get(primary_camera_id)
-                pair_state = _pair_states.get(primary_camera_id)
-                if not pair_cfg or not pair_state:
-                    continue
-
-                active_event = pair_state.get("active_event")
-                if not active_event:
-                    continue
-                if ts["birth_time"] < float(active_event.get("start_time", 0.0) or 0.0):
-                    continue
-                if tid in active_event["accepted_track_ids"]:
-                    continue
-
-                active_event["accepted_track_ids"].add(tid)
-                active_event["verifier_in_count"] = int(active_event.get("verifier_in_count", 0) or 0) + 1
-                _log_cross_camera(
-                    " ".join(
-                        [
-                            "[CrossCameraVerifierCounted]",
-                            f"pair_id={pair_cfg.get('pair_id')}",
-                            f"event_id={active_event['event_id']}",
-                            f"primary_camera={primary_camera_id}",
-                            f"verifier_camera={camera_id}",
-                            f"track_id={tid}",
-                            f"cross_point=({cross_point[0]:.3f},{cross_point[1]:.3f})",
-                            f"verifier_in_count={active_event['verifier_in_count']}",
-                            f"primary_in_count={active_event['primary_in_count']}",
-                        ]
+                if prev_in_point is not None and in_point is not None:
+                    _observe_verifier_crossing(
+                        camera_id=camera_id,
+                        primary_ids=primary_ids,
+                        track_id=tid,
+                        track_state=ts,
+                        prev_point=prev_in_point,
+                        curr_point=in_point,
+                        active_zones=active_zones,
+                        line_cfg=inward_line,
+                        direction="in",
+                        now=now,
                     )
-                )
+                if prev_out_point is not None and out_point is not None:
+                    _observe_verifier_crossing(
+                        camera_id=camera_id,
+                        primary_ids=primary_ids,
+                        track_id=tid,
+                        track_state=ts,
+                        prev_point=prev_out_point,
+                        curr_point=out_point,
+                        active_zones=active_zones,
+                        line_cfg=outward_line,
+                        direction="out",
+                        now=now,
+                    )
+
+            ts["last_in_point"] = in_point
+            ts["last_out_point"] = out_point
 
         stale_before = now - TRACK_STALE_TIMEOUT_SEC
         for track_id in list(track_states.keys()):
@@ -347,117 +322,258 @@ def apply_primary_camera_correction(camera_id: str, counting_data: dict, now: fl
         raw_total_in = int(counting_data.get("total_in", 0) or 0)
         raw_total_out = int(counting_data.get("total_out", 0) or 0)
         last_raw_total_in = int(pair_state.get("last_raw_total_in", 0) or 0)
+        last_raw_total_out = int(pair_state.get("last_raw_total_out", 0) or 0)
 
-        if raw_total_in < last_raw_total_in:
+        if raw_total_in < last_raw_total_in or raw_total_out < last_raw_total_out:
             pair_state["last_raw_total_in"] = raw_total_in
+            pair_state["last_raw_total_out"] = raw_total_out
             pair_state["correction_offset_in"] = 0
-            pair_state["active_event"] = None
-            pair_state["last_completed_event"] = None
+            pair_state["correction_offset_out"] = 0
+            pair_state["active_in_event"] = None
+            pair_state["last_completed_in_event"] = None
+            pair_state["active_out_event"] = None
+            pair_state["last_completed_out_event"] = None
             verifier_camera_id = pair_cfg.get("verifier_camera_id")
             if verifier_camera_id in _verifier_tracks:
                 _verifier_tracks[verifier_camera_id] = {}
-            _log_cross_camera(
-                " ".join(
-                    [
-                        "[CrossCameraPrimaryReset]",
-                        f"pair_id={pair_cfg.get('pair_id')}",
-                        f"primary_camera={camera_id}",
-                        f"verifier_camera={verifier_camera_id}",
-                        f"raw_total_in={raw_total_in}",
-                    ]
-                )
-            )
             corrected = dict(counting_data)
             corrected["raw_total_in"] = raw_total_in
+            corrected["raw_total_out"] = raw_total_out
+            corrected["verification_confirmed_in"] = 0
             corrected["verification_correction_in"] = 0
+            corrected["verification_confirmed_out"] = 0
+            corrected["verification_correction_out"] = 0
             corrected["verification_camera_id"] = pair_cfg.get("verifier_camera_id")
             corrected["cross_camera_pair_id"] = pair_cfg.get("pair_id")
+            corrected["cross_camera_active_event"] = None
+            corrected["cross_camera_last_event"] = None
+            corrected["cross_camera_active_in_event"] = None
+            corrected["cross_camera_last_in_event"] = None
+            corrected["cross_camera_active_out_event"] = None
+            corrected["cross_camera_last_out_event"] = None
             return corrected, 0
 
         pair_state["last_raw_total_in"] = raw_total_in
+        pair_state["last_raw_total_out"] = raw_total_out
 
-        correction_delta = 0
-        active_event = pair_state.get("active_event")
-        if active_event is not None:
-            idle_timeout = float(pair_cfg.get("primary_event_idle_timeout_sec", DEFAULT_PRIMARY_EVENT_IDLE_TIMEOUT_SEC) or DEFAULT_PRIMARY_EVENT_IDLE_TIMEOUT_SEC)
-            last_primary_in_time = float(active_event.get("last_primary_in_time", 0.0) or 0.0)
-            if (now - last_primary_in_time) >= idle_timeout:
-                primary_in_count = int(active_event.get("primary_in_count", 0) or 0)
-                verifier_in_count = int(active_event.get("verifier_in_count", 0) or 0)
-                correction_delta = max(0, verifier_in_count - primary_in_count)
-                if correction_delta > 0:
-                    pair_state["correction_offset_in"] = int(pair_state.get("correction_offset_in", 0) or 0) + correction_delta
-                completed_event = {
-                    "event_id": active_event.get("event_id"),
-                    "start_time": active_event.get("start_time"),
-                    "end_time": now,
-                    "primary_in_count": primary_in_count,
-                    "verifier_in_count": verifier_in_count,
-                    "correction_in": correction_delta,
-                }
-                pair_state["last_completed_event"] = completed_event
-                pair_state["active_event"] = None
-                _log_cross_camera(
-                    " ".join(
-                        [
-                            "[CrossCameraPrimaryEventClosed]",
-                            f"pair_id={pair_cfg.get('pair_id')}",
-                            f"event_id={completed_event['event_id']}",
-                            f"primary_camera={camera_id}",
-                            f"verifier_camera={pair_cfg.get('verifier_camera_id')}",
-                            f"primary_in_count={primary_in_count}",
-                            f"verifier_in_count={verifier_in_count}",
-                            f"correction_in={correction_delta}",
-                            f"end_time={now:.3f}",
-                        ]
-                    )
-                )
+        correction_delta_in = _close_expired_primary_event(pair_cfg, pair_state, camera_id, "in", now)
+        correction_delta_out = _close_expired_primary_event(pair_cfg, pair_state, camera_id, "out", now)
 
+        active_in_event = pair_state.get("active_in_event")
+        active_out_event = pair_state.get("active_out_event")
+        last_completed_in_event = pair_state.get("last_completed_in_event")
+        last_completed_out_event = pair_state.get("last_completed_out_event")
         corrected_total_in = raw_total_in + int(pair_state.get("correction_offset_in", 0) or 0)
+        corrected_total_out = raw_total_out + int(pair_state.get("correction_offset_out", 0) or 0)
         corrected = dict(counting_data)
         corrected["raw_total_in"] = raw_total_in
-        corrected["verification_confirmed_in"] = (
-            int(active_event.get("verifier_in_count", 0) or 0)
-            if active_event is not None
-            else int((pair_state.get("last_completed_event") or {}).get("verifier_in_count", 0) or 0)
-        )
+        corrected["raw_total_out"] = raw_total_out
+        corrected["verification_confirmed_in"] = _verified_count_for_event(active_in_event, last_completed_in_event, "in")
         corrected["verification_correction_in"] = int(pair_state.get("correction_offset_in", 0) or 0)
+        corrected["verification_confirmed_out"] = _verified_count_for_event(active_out_event, last_completed_out_event, "out")
+        corrected["verification_correction_out"] = int(pair_state.get("correction_offset_out", 0) or 0)
         corrected["verification_camera_id"] = pair_cfg.get("verifier_camera_id")
         corrected["cross_camera_pair_id"] = pair_cfg.get("pair_id")
-        corrected["cross_camera_active_event"] = _serialize_event(active_event)
-        corrected["cross_camera_last_event"] = _serialize_event(pair_state.get("last_completed_event"))
+        corrected["cross_camera_active_in_event"] = _serialize_event(active_in_event)
+        corrected["cross_camera_last_in_event"] = _serialize_event(last_completed_in_event)
+        corrected["cross_camera_active_out_event"] = _serialize_event(active_out_event)
+        corrected["cross_camera_last_out_event"] = _serialize_event(last_completed_out_event)
+        corrected["cross_camera_active_event"] = corrected["cross_camera_active_in_event"] or corrected["cross_camera_active_out_event"]
+        corrected["cross_camera_last_event"] = _latest_event(
+            [
+                corrected["cross_camera_last_in_event"],
+                corrected["cross_camera_last_out_event"],
+            ]
+        )
         corrected["total_in"] = corrected_total_in
-        corrected["occupancy"] = max(0, corrected_total_in - raw_total_out)
+        corrected["total_out"] = corrected_total_out
+        corrected["occupancy"] = max(0, corrected_total_in - corrected_total_out)
 
-        if correction_delta > 0:
-            _log_cross_camera(
-                " ".join(
-                    [
-                        "[CrossCameraCorrection]",
-                        f"pair_id={pair_cfg.get('pair_id')}",
-                        f"primary_camera={camera_id}",
-                        f"verifier_camera={pair_cfg.get('verifier_camera_id')}",
-                        f"extra_in={correction_delta}",
-                        f"raw_total_in={raw_total_in}",
-                        f"corrected_total_in={corrected_total_in}",
-                    ]
-                )
-            )
+        return corrected, correction_delta_in + correction_delta_out
 
-        return corrected, correction_delta
+
+def _observe_verifier_crossing(
+    *,
+    camera_id: str,
+    primary_ids: set[str],
+    track_id: int,
+    track_state: dict,
+    prev_point: tuple[float, float],
+    curr_point: tuple[float, float],
+    active_zones: list[dict],
+    line_cfg: dict | None,
+    direction: str,
+    now: float,
+) -> None:
+    if line_cfg is None:
+        return
+
+    active_key, _, primary_count_key, verifier_count_key = _event_state_keys(direction)
+    prev_side = _line_target_side_value(line_cfg, prev_point)
+    curr_side = _line_target_side_value(line_cfg, curr_point)
+    cross_point = _line_crossing_point(prev_point, curr_point, prev_side, curr_side)
+    if cross_point is None:
+        return
+    if prev_side > LINE_SIDE_EPS or curr_side <= LINE_SIDE_EPS:
+        return
+    if not _is_inside_active_zone(cross_point, active_zones):
+        return
+
+    for primary_camera_id in primary_ids:
+        pair_cfg = _primary_pairs.get(primary_camera_id)
+        pair_state = _pair_states.get(primary_camera_id)
+        if not pair_cfg or not pair_state:
+            continue
+
+        active_event = pair_state.get(active_key)
+
+        if active_event is None and direction == "out":
+            event_start_time = float(track_state.get("birth_time", now) or now)
+            active_event = {
+                "event_id": str(uuid.uuid4()),
+                "direction": "out",
+                "start_time": event_start_time,
+                "last_primary_time": None,
+                "last_activity_time": now,
+                primary_count_key: 0,
+                verifier_count_key: 0,
+                "accepted_track_ids": set(),
+            }
+            pair_state[active_key] = active_event
+        if not active_event:
+            continue
+        if direction != "out" and track_state["birth_time"] < float(active_event.get("start_time", 0.0) or 0.0):
+            continue
+        if track_id in active_event["accepted_track_ids"]:
+            continue
+
+        _accept_verifier_track_for_event(
+            pair_cfg=pair_cfg,
+            active_event=active_event,
+            primary_count_key=primary_count_key,
+            verifier_count_key=verifier_count_key,
+            primary_camera_id=primary_camera_id,
+            verifier_camera_id=camera_id,
+            track_id=track_id,
+            point=cross_point,
+            direction=direction,
+            now=now,
+        )
+
+
+def _close_expired_primary_event(
+    pair_cfg: dict,
+    pair_state: dict,
+    camera_id: str,
+    direction: str,
+    now: float,
+) -> int:
+    active_key, last_key, primary_count_key, verifier_count_key = _event_state_keys(direction)
+    active_event = pair_state.get(active_key)
+    if active_event is None:
+        return 0
+
+    idle_timeout = float(
+        pair_cfg.get("primary_event_idle_timeout_sec", DEFAULT_PRIMARY_EVENT_IDLE_TIMEOUT_SEC)
+        or DEFAULT_PRIMARY_EVENT_IDLE_TIMEOUT_SEC
+    )
+    last_activity_time = float(
+        active_event.get("last_activity_time")
+        or active_event.get("last_primary_time")
+        or active_event.get("start_time")
+        or 0.0
+    )
+    if (now - last_activity_time) < idle_timeout:
+        return 0
+
+    primary_count = int(active_event.get(primary_count_key, 0) or 0)
+    verifier_count = int(active_event.get(verifier_count_key, 0) or 0)
+    correction_delta = max(0, verifier_count - primary_count)
+    correction_offset_key = f"correction_offset_{direction}"
+    if correction_delta > 0:
+        pair_state[correction_offset_key] = int(pair_state.get(correction_offset_key, 0) or 0) + correction_delta
+
+    completed_event = {
+        "event_id": active_event.get("event_id"),
+        "direction": direction,
+        "start_time": active_event.get("start_time"),
+        "end_time": now,
+        "last_primary_time": None,
+        primary_count_key: primary_count,
+        verifier_count_key: verifier_count,
+        f"correction_{direction}": correction_delta,
+    }
+    pair_state[last_key] = completed_event
+    pair_state[active_key] = None
+    return correction_delta
+
+
+def _accept_verifier_track_for_event(
+    *,
+    pair_cfg: dict,
+    active_event: dict,
+    primary_count_key: str,
+    verifier_count_key: str,
+    primary_camera_id: str,
+    verifier_camera_id: str,
+    track_id: int,
+    point: tuple[float, float],
+    direction: str,
+    now: float,
+) -> None:
+    active_event["accepted_track_ids"].add(track_id)
+    active_event["last_activity_time"] = now
+    active_event[verifier_count_key] = int(active_event.get(verifier_count_key, 0) or 0) + 1
+
+
+def _event_state_keys(direction: str) -> tuple[str, str, str, str]:
+    normalized = "out" if str(direction).lower() == "out" else "in"
+    return (
+        f"active_{normalized}_event",
+        f"last_completed_{normalized}_event",
+        f"primary_{normalized}_count",
+        f"verifier_{normalized}_count",
+    )
+
+
+def _verified_count_for_event(active_event: dict | None, last_event: dict | None, direction: str) -> int:
+    _, _, _, verifier_count_key = _event_state_keys(direction)
+    if active_event is not None:
+        return int(active_event.get(verifier_count_key, 0) or 0)
+    return int((last_event or {}).get(verifier_count_key, 0) or 0)
+
+
+def _latest_event(events: list[dict | None]) -> dict | None:
+    normalized_events = [event for event in events if event is not None]
+    if not normalized_events:
+        return None
+    return max(
+        normalized_events,
+        key=lambda event: float(event.get("end_time") or event.get("start_time") or 0.0),
+    )
 
 
 def _serialize_event(event: dict | None) -> dict | None:
     if not event:
         return None
+    direction = "out" if str(event.get("direction") or "").lower() == "out" else "in"
+    _, _, primary_count_key, verifier_count_key = _event_state_keys(direction)
     return {
         "event_id": event.get("event_id"),
+        "direction": direction,
         "start_time": event.get("start_time"),
         "end_time": event.get("end_time"),
-        "last_primary_in_time": event.get("last_primary_in_time"),
+        "last_primary_time": event.get("last_primary_time"),
+        "last_activity_time": event.get("last_activity_time"),
+        "primary_count": int(event.get(primary_count_key, 0) or 0),
+        "verifier_count": int(event.get(verifier_count_key, 0) or 0),
+        "correction": int(event.get(f"correction_{direction}", 0) or 0),
         "primary_in_count": int(event.get("primary_in_count", 0) or 0),
         "verifier_in_count": int(event.get("verifier_in_count", 0) or 0),
         "correction_in": int(event.get("correction_in", 0) or 0),
+        "primary_out_count": int(event.get("primary_out_count", 0) or 0),
+        "verifier_out_count": int(event.get("verifier_out_count", 0) or 0),
+        "correction_out": int(event.get("correction_out", 0) or 0),
     }
 
 
@@ -496,9 +612,9 @@ def _bbox_line_target_point_norm(
 
     count_event = str(line_cfg.get("count_event") or "in")
     if count_event == "out":
-        right_x = x2 / frame_w
-        midlower_y = (y1 + ((y2 - y1) * 0.75)) / frame_h
-        return (right_x, midlower_y)
+        center_x = ((x1 + x2) / 2.0) / frame_w
+        bottom_y = y2 / frame_h
+        return (center_x, bottom_y)
 
     right_x = x2 / frame_w
     bottom_y = y2 / frame_h
@@ -506,12 +622,27 @@ def _bbox_line_target_point_norm(
 
 
 def _get_inward_line(lines: list[dict]) -> dict | None:
+    return _get_line_for_event(lines, "in", fallback_to_any=True)
+
+
+def _get_outward_line(lines: list[dict]) -> dict | None:
+    return _get_line_for_event(lines, "out", fallback_to_any=False)
+
+
+def _get_line_for_event(
+    lines: list[dict],
+    count_event: str,
+    *,
+    fallback_to_any: bool,
+) -> dict | None:
+    normalized_event = "out" if str(count_event).lower() == "out" else "in"
     for line_cfg in lines:
-        if str(line_cfg.get("count_event") or "in") == "in" and len(line_cfg.get("points", [])) >= 2:
+        if str(line_cfg.get("count_event") or "in") == normalized_event and len(line_cfg.get("points", [])) >= 2:
             return line_cfg
-    for line_cfg in lines:
-        if len(line_cfg.get("points", [])) >= 2:
-            return line_cfg
+    if fallback_to_any:
+        for line_cfg in lines:
+            if len(line_cfg.get("points", [])) >= 2:
+                return line_cfg
     return None
 
 
