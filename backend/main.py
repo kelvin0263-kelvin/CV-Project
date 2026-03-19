@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import sqlalchemy as sa
 
 from app.core.database import engine, AsyncSessionLocal
 from app.models.base import Base
@@ -22,6 +23,42 @@ async def lifespan(app: FastAPI):
     """Create tables if they don't exist (dev convenience). In production use Alembic."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(
+            sa.text(
+                "ALTER TABLE stream_configs "
+                "ADD COLUMN IF NOT EXISTS detection_roi JSON"
+            )
+        )
+        await conn.execute(
+            sa.text(
+                "ALTER TABLE people_counting_configs "
+                "ADD COLUMN IF NOT EXISTS cross_camera_enabled BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+        )
+        await conn.execute(
+            sa.text(
+                "ALTER TABLE people_counting_configs "
+                "ADD COLUMN IF NOT EXISTS cross_camera_pair_id VARCHAR(100)"
+            )
+        )
+        await conn.execute(
+            sa.text(
+                "ALTER TABLE people_counting_configs "
+                "ADD COLUMN IF NOT EXISTS cross_camera_role VARCHAR(20) NOT NULL DEFAULT 'none'"
+            )
+        )
+        await conn.execute(
+            sa.text(
+                "ALTER TABLE people_counting_configs "
+                "ADD COLUMN IF NOT EXISTS verification_camera_id VARCHAR"
+            )
+        )
+        await conn.execute(
+            sa.text(
+                "ALTER TABLE people_counting_configs "
+                "ADD COLUMN IF NOT EXISTS verification_inward_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.02"
+            )
+        )
 
     # Ensure the default admin account exists when the database is reachable.
     try:
@@ -36,12 +73,13 @@ async def lifespan(app: FastAPI):
     # Sync dress code policy to runtime on startup
     try:
         async with AsyncSessionLocal() as db:
+            await camera_router.sync_stream_roi_runtime_from_db(db)
             policy = await policy_router._get_or_create_policy(db)
             await policy_router._sync_policy_to_runtime(db, policy)
             await db.commit()
-            print("[Startup] Dress code policy synced to runtime")
+            print("[Startup] Source ROI and dress code policy synced to runtime")
     except Exception as e:
-        print(f"[Startup] Warning: Could not sync policy: {e}")
+        print(f"[Startup] Warning: Could not sync source ROI/policy: {e}")
 
     # Load people counting configs from DB into in-memory cache
     try:

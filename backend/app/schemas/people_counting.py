@@ -28,6 +28,11 @@ class PeopleCountingConfigRead(BaseModel):
     enabled: bool
     participate_in_building_count: bool = False
     entrance_id: Optional[str] = None
+    cross_camera_enabled: bool = False
+    cross_camera_pair_id: Optional[str] = None
+    cross_camera_role: Literal["none", "primary", "verifier"] = "none"
+    verification_camera_id: Optional[str] = None
+    verification_inward_threshold: float = 0.02
     lines: list[dict[str, Any]] = Field(default_factory=list)
     frame_exclude_areas: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -39,6 +44,11 @@ class PeopleCountingConfigUpdate(BaseModel):
     enabled: Optional[bool] = True
     participate_in_building_count: Optional[bool] = None
     entrance_id: Optional[str] = None
+    cross_camera_enabled: Optional[bool] = None
+    cross_camera_pair_id: Optional[str] = None
+    cross_camera_role: Optional[Literal["none", "primary", "verifier"]] = None
+    verification_camera_id: Optional[str] = None
+    verification_inward_threshold: Optional[float] = None
     lines: Optional[list[dict[str, Any]]] = None
     frame_exclude_areas: Optional[list[dict[str, Any]]] = None
 

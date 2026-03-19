@@ -34,13 +34,21 @@ from app.core.globals import (
     PRODUCER_LOCK,
 )
 from ultralytics import YOLO
+from ultralytics.engine.results import Boxes
 from ultralytics.trackers.track import TRACKER_MAP
 from turbojpeg import TurboJPEG
 from ultralytics.utils import IterableSimpleNamespace, YAML
 from app.services.dresscode_detector import classify_lower_body_batch, crop_full_person
 from app.services.fall_detector import is_person_in_fall_pose
 from app.services.building_counter import ingest_sensor_events
+from app.services.cross_camera_verifier import (
+    apply_primary_camera_correction,
+    observe_verifier_tracks,
+    register_primary_in_events,
+    reset_cross_camera_state,
+)
 from app.services.people_counter import PeopleCounter
+from app.services.source_roi_registry import get_source_detection_roi
 from app.routers.counting_router import (
     consume_counting_reset,
     get_counting_views,
@@ -66,11 +74,12 @@ os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
 
 # Fixed runtime tuning for the current project.
-POSE_MODEL_PATH = os.path.join(BACKEND_ROOT, "yolo26n-pose.pt")
+POSE_MODEL_PT_PATH = os.path.join(BACKEND_ROOT, "yolo26m-pose.pt")
+POSE_MODEL_ENGINE_PATH = os.path.join(BACKEND_ROOT, "yolo26m-pose.engine")
 TRACKER_CONFIG_PATH = os.path.join(BACKEND_ROOT, "botsort_custom.yaml")
 YOLO_DEVICE = None
 POSE_TRACK_IMGSZ = 736
-DETECTION_STRIDE = 3
+DETECTION_STRIDE = 1
 COUNTING_SNAPSHOT_HEARTBEAT_SEC = 300
 DRESSCODE_RECLASSIFY_FRAMES = 30
 PERF_LOG_INTERVAL_FRAMES = 30
@@ -95,7 +104,7 @@ RTSP_CORRUPT_FRAME_DIFF_MIN = 18.0
 RTSP_CORRUPT_FRAME_EDGE_VAR_MAX = 0.0
 RTSP_HW_FALLBACK_FAILURE_WINDOW_SEC = 10.0
 RTSP_HW_FALLBACK_FAILURE_THRESHOLD = 3
-NVENC_OUTPUT_ENABLED = True
+NVENC_OUTPUT_ENABLED = False
 NVENC_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "temp_video_uploads", "nvenc_outputs")
 NVENC_OUTPUT_CONTAINER = "mp4"
 NVENC_CODEC = "h264_nvenc"
@@ -106,6 +115,37 @@ NVENC_BITRATE_K = 2500
 NVENC_MAXRATE_K = 3500
 NVENC_BUFSIZE_K = 7000
 FFMPEG_BIN = "ffmpeg"
+
+
+def _resolve_pose_model_path() -> str:
+    if os.path.exists(POSE_MODEL_ENGINE_PATH):
+        return POSE_MODEL_ENGINE_PATH
+    return POSE_MODEL_PT_PATH
+
+
+POSE_MODEL_PATH = _resolve_pose_model_path()
+
+
+def _pose_model_uses_engine() -> bool:
+    return _resolve_pose_model_path().lower().endswith(".engine")
+
+
+def _load_pose_model() -> YOLO:
+    model_path = _resolve_pose_model_path()
+    try:
+        model = YOLO(model_path)
+        print(f"[Model] Loaded pose model: {model_path}")
+        return model
+    except Exception as e:
+        if model_path != POSE_MODEL_PT_PATH and os.path.exists(POSE_MODEL_PT_PATH):
+            print(
+                f"[Model] Failed to load pose engine '{model_path}', "
+                f"falling back to '{POSE_MODEL_PT_PATH}': {e}"
+            )
+            model = YOLO(POSE_MODEL_PT_PATH)
+            print(f"[Model] Loaded pose model: {POSE_MODEL_PT_PATH}")
+            return model
+        raise
 
 # ---------------------------------------------------------------------------
 # Initialize TurboJPEG
@@ -306,13 +346,132 @@ def _empty_detection_result(
     detect_ms: float = 0.0,
     detect_total_ms: float | None = None,
     infer_wait_ms: float = 0.0,
-) -> tuple[list[dict], int, dict, dict]:
+    ) -> tuple[list[dict], int, dict, dict]:
     return [], 0, track_state, _build_perf_dict(
         detect_ms=detect_ms,
         detect_total_ms=detect_total_ms,
         batch_size=batch_size,
         infer_wait_ms=infer_wait_ms,
     )
+
+
+def _prepare_detection_roi_image(
+    img: np.ndarray,
+    roi_areas: list[dict] | None,
+) -> tuple[np.ndarray, dict | None]:
+    if img is None or img.size == 0:
+        return img, None
+
+    areas = [area for area in (roi_areas or []) if len(area.get("points", [])) >= 3]
+    if not areas:
+        return img, None
+
+    frame_h, frame_w = img.shape[:2]
+    if frame_h <= 1 or frame_w <= 1:
+        return img, None
+
+    polygons_px: list[np.ndarray] = []
+    min_x = frame_w - 1
+    min_y = frame_h - 1
+    max_x = 0
+    max_y = 0
+
+    for area in areas:
+        polygon = []
+        for point in area.get("points", []):
+            try:
+                px = int(round(float(point[0]) * frame_w))
+                py = int(round(float(point[1]) * frame_h))
+            except (TypeError, ValueError, IndexError):
+                polygon = []
+                break
+            px = max(0, min(frame_w - 1, px))
+            py = max(0, min(frame_h - 1, py))
+            polygon.append([px, py])
+        if len(polygon) < 3:
+            continue
+        polygon_np = np.asarray(polygon, dtype=np.int32)
+        polygons_px.append(polygon_np)
+        min_x = min(min_x, int(polygon_np[:, 0].min()))
+        min_y = min(min_y, int(polygon_np[:, 1].min()))
+        max_x = max(max_x, int(polygon_np[:, 0].max()))
+        max_y = max(max_y, int(polygon_np[:, 1].max()))
+
+    if not polygons_px:
+        return img, None
+
+    if min_x >= max_x or min_y >= max_y:
+        return img, None
+
+    crop = img[min_y:max_y + 1, min_x:max_x + 1].copy()
+    if crop.size == 0:
+        return img, None
+
+    mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+    shifted_polygons: list[np.ndarray] = []
+    for polygon in polygons_px:
+        shifted = polygon.copy()
+        shifted[:, 0] -= min_x
+        shifted[:, 1] -= min_y
+        shifted_polygons.append(shifted)
+    cv2.fillPoly(mask, shifted_polygons, 255)
+    masked_crop = cv2.bitwise_and(crop, crop, mask=mask)
+
+    return masked_crop, {
+        "offset_x": float(min_x),
+        "offset_y": float(min_y),
+        "crop_w": float(masked_crop.shape[1]),
+        "crop_h": float(masked_crop.shape[0]),
+    }
+
+
+def _remap_boxes_from_roi(boxes_xyxy: np.ndarray, roi_meta: dict | None) -> np.ndarray:
+    if roi_meta is None or boxes_xyxy.size == 0:
+        return boxes_xyxy
+    remapped = boxes_xyxy.copy()
+    remapped[:, [0, 2]] += float(roi_meta.get("offset_x", 0.0))
+    remapped[:, [1, 3]] += float(roi_meta.get("offset_y", 0.0))
+    return remapped
+
+
+def _remap_boxes_with_scores_from_roi(boxes, roi_meta: dict | None) -> np.ndarray:
+    if boxes is None:
+        return boxes
+    if roi_meta is None:
+        return boxes
+
+    if isinstance(boxes, Boxes):
+        box_data = boxes.data
+        if hasattr(box_data, "detach"):
+            box_data = box_data.detach().cpu().numpy()
+        else:
+            box_data = np.array(box_data, copy=True)
+        box_data[..., [0, 2]] += float(roi_meta.get("offset_x", 0.0))
+        box_data[..., [1, 3]] += float(roi_meta.get("offset_y", 0.0))
+        return Boxes(box_data, boxes.orig_shape)
+
+    if hasattr(boxes, "data"):
+        boxes = boxes.data
+    if hasattr(boxes, "cpu"):
+        boxes = boxes.cpu()
+    if hasattr(boxes, "numpy"):
+        boxes = boxes.numpy()
+    boxes = np.asarray(boxes)
+    if boxes.size == 0:
+        return boxes
+    remapped = boxes.copy()
+    remapped[:, [0, 2]] += float(roi_meta.get("offset_x", 0.0))
+    remapped[:, [1, 3]] += float(roi_meta.get("offset_y", 0.0))
+    return remapped
+
+
+def _remap_keypoints_from_roi(keypoints: np.ndarray | None, roi_meta: dict | None) -> np.ndarray | None:
+    if keypoints is None or roi_meta is None or keypoints.size == 0:
+        return keypoints
+    remapped = keypoints.copy()
+    remapped[..., 0] += float(roi_meta.get("offset_x", 0.0))
+    remapped[..., 1] += float(roi_meta.get("offset_y", 0.0))
+    return remapped
 
 
 def _handle_rtsp_capture_failure_common(
@@ -624,7 +783,7 @@ class _BatchInferenceEngine:
         self._tracker_cls = TRACKER_MAP[tracker_type]
 
         print("[BatchInfer] Loading shared YOLO model...")
-        self._model = YOLO(POSE_MODEL_PATH)
+        self._model = _load_pose_model()
         self._worker.start()
         print(
             f"[BatchInfer] Ready: tracker={tracker_type}, window={BATCH_INFER_WINDOW_MS}ms, "
@@ -644,6 +803,8 @@ class _BatchInferenceEngine:
         *,
         stream_id: str,
         img: np.ndarray,
+        infer_img: np.ndarray,
+        roi_meta: dict | None,
         frame_count: int,
         track_state: dict,
         skip_classification: bool,
@@ -653,6 +814,8 @@ class _BatchInferenceEngine:
         req = {
             "stream_id": stream_id,
             "img": img,
+            "infer_img": infer_img,
+            "roi_meta": roi_meta,
             "frame_count": frame_count,
             "track_state": track_state,
             "skip_classification": skip_classification,
@@ -704,14 +867,14 @@ class _BatchInferenceEngine:
 
     def _process_batch(self, batch: list[dict]):
         detect_started_at = time.perf_counter()
-        images = [item["img"] for item in batch]
+        images = [item.get("infer_img") if item.get("infer_img") is not None else item["img"] for item in batch]
 
         predict_kwargs = {
             "source": images,
             "verbose": False,
             "classes": [0],
             "conf": 0.30,
-            "iou": 0.5,
+            "iou": 0.4,
             "imgsz": POSE_TRACK_IMGSZ,
         }
         if YOLO_DEVICE:
@@ -746,7 +909,10 @@ class _BatchInferenceEngine:
             if boxes is None:
                 tracked = np.empty((0, 8), dtype=np.float32)
             else:
-                tracked = tracker.update(boxes.cpu().numpy(), img=req["img"])
+                tracked = tracker.update(
+                    _remap_boxes_with_scores_from_roi(boxes, req.get("roi_meta")),
+                    img=req["img"],
+                )
 
             keypoints_xy = None
             keypoints_with_conf = None
@@ -755,6 +921,8 @@ class _BatchInferenceEngine:
                     keypoints_xy = result.keypoints.xy.cpu().numpy()
                 if req.get("need_fall_detection"):
                     keypoints_with_conf = result.keypoints.data.cpu().numpy()
+            keypoints_xy = _remap_keypoints_from_roi(keypoints_xy, req.get("roi_meta"))
+            keypoints_with_conf = _remap_keypoints_from_roi(keypoints_with_conf, req.get("roi_meta"))
 
             track_state = req["track_state"]
             for row in tracked:
@@ -1248,8 +1416,11 @@ def video_producer(
         return
 
     local_model = None
+    use_batch_infer = MULTI_STREAM_BATCH_INFER and not _pose_model_uses_engine()
+    if MULTI_STREAM_BATCH_INFER and not use_batch_infer:
+        print("[Producer] TensorRT engine detected; disabling shared multi-stream batching.")
     # Ensure shared batch inference engine is ready once.
-    if MULTI_STREAM_BATCH_INFER:
+    if use_batch_infer:
         try:
             _get_batch_infer_engine()
         except Exception as e:
@@ -1261,7 +1432,7 @@ def video_producer(
         # Legacy per-stream detector path.
         print(f"[Producer] Loading YOLO model for runtime_key={runtime_key}, source={source_path}")
         try:
-            local_model = YOLO(POSE_MODEL_PATH)
+            local_model = _load_pose_model()
         except Exception as e:
             print(f"[Producer] Failed to load YOLO model for {source_path}: {e}")
             cap.release()
@@ -1343,6 +1514,7 @@ def video_producer(
         skip_classification=False,
         need_fall_detection=False,
         view_key: str = "original",
+        detection_roi_areas=None,
     ):
         """
         Run YOLO-Pose tracking on a full-res image.
@@ -1354,12 +1526,16 @@ def video_producer(
         Each detection dict:
             {track_id, person_bbox, count_anchor, label, confidence, lower_bbox, violation, fall_pose, fall_detected}
         """
-        if MULTI_STREAM_BATCH_INFER:
+        infer_img, roi_meta = _prepare_detection_roi_image(img, detection_roi_areas)
+
+        if use_batch_infer:
             engine = _get_batch_infer_engine()
             stream_id = f"{runtime_key}||{view_key}"
             return engine.infer(
                 stream_id=stream_id,
                 img=img,
+                infer_img=infer_img,
+                roi_meta=roi_meta,
                 frame_count=frame_count,
                 track_state=track_state,
                 skip_classification=skip_classification,
@@ -1375,13 +1551,13 @@ def video_producer(
             # BoT-SORT adds ReID appearance features + improved Kalman filter,
             # so tracks survive brief occlusions (e.g. door frame) much better.
             track_kwargs = {
-                "source": img,
+                "source": infer_img,
                 "tracker": TRACKER_CONFIG_PATH,
                 "persist": True,
                 "verbose": False,
                 "classes": [0],     # person only
                 "conf": 0.30,       # lower threshold: keep detections during partial occlusion
-                "iou": 0.5,         # more lenient matching: easier to re-associate after occlusion
+                "iou": 0.4,         # more lenient matching: easier to re-associate after occlusion
                 "imgsz": POSE_TRACK_IMGSZ,
             }
             if YOLO_DEVICE:
@@ -1399,6 +1575,7 @@ def video_producer(
 
             r = results[0]
             boxes_xyxy = r.boxes.xyxy.cpu().numpy() if r.boxes is not None else np.empty((0, 4))
+            boxes_xyxy = _remap_boxes_from_roi(boxes_xyxy, roi_meta)
             track_ids = (
                 r.boxes.id.int().cpu().tolist()
                 if r.boxes is not None and r.boxes.id is not None
@@ -1411,6 +1588,8 @@ def video_producer(
                     keypoints_xy = r.keypoints.xy.cpu().numpy()
                 if need_fall_detection:
                     keypoints_with_conf = r.keypoints.data.cpu().numpy()
+            keypoints_xy = _remap_keypoints_from_roi(keypoints_xy, roi_meta)
+            keypoints_with_conf = _remap_keypoints_from_roi(keypoints_with_conf, roi_meta)
             detect_ms = infer_predict_ms
 
             people_count = len(boxes_xyxy)
@@ -1554,6 +1733,8 @@ def video_producer(
 
     # Detection state
     detection_stride = DETECTION_STRIDE
+    if source_meta.get("is_uploaded_source") and source_meta.get("is_file_source"):
+        detection_stride = max(DETECTION_STRIDE, 1)
     frame_count = 0
     decoded_frame_index = -1
     rtsp_read_failures = 0
@@ -1661,6 +1842,12 @@ def video_producer(
         fall_views = get_fall_detection_views(source_path)
         return dresscode_views | counting_views | fall_views
 
+    def _get_source_detection_roi_areas(view_key: str) -> list[dict]:
+        roi = get_source_detection_roi(runtime_key, view_key)
+        if roi is None:
+            return []
+        return [roi]
+
     def _run_counting_for_view(view_key, detections_unscaled, frame_shape):
         """Run people counting on unscaled detections for a specific view."""
         camera_id = get_counting_camera_id(runtime_key, view_key)
@@ -1670,6 +1857,41 @@ def video_producer(
         config = get_counting_config(camera_id)
         if config is None or not config.get("enabled", True):
             return None
+
+        is_verifier_only = (
+            bool(config.get("cross_camera_enabled", False))
+            and str(config.get("cross_camera_role") or "none") == "verifier"
+        )
+
+        if is_verifier_only:
+            people_counters.pop(view_key, None)
+            if consume_counting_reset(camera_id):
+                reset_cross_camera_state(camera_id)
+            now_ts = time.time()
+            observe_verifier_tracks(camera_id, detections_unscaled, config, frame_shape, now_ts)
+            counting_event_state[view_key] = {
+                "total_in": 0,
+                "total_out": 0,
+                "raw_total_in": 0,
+                "raw_total_out": 0,
+            }
+            counting_data = {
+                "total_in": 0,
+                "total_out": 0,
+                "occupancy": 0,
+                "raw_total_in": 0,
+                "verification_confirmed_in": 0,
+                "verification_correction_in": 0,
+                "verification_camera_id": None,
+                "cross_camera_pair_id": config.get("cross_camera_pair_id"),
+                "cross_camera_active_event": None,
+                "cross_camera_last_event": None,
+                "lines": config.get("lines", []),
+                "active_zones": config.get("active_zones", config.get("frame_exclude_areas", [])),
+                "frame_exclude_areas": config.get("frame_exclude_areas", []),
+            }
+            update_live_counts(camera_id, counting_data)
+            return counting_data
 
         # Get or create PeopleCounter for this view
         if view_key not in people_counters:
@@ -1684,17 +1906,31 @@ def video_producer(
         counter = people_counters[view_key]
         if consume_counting_reset(camera_id):
             counter.reset()
+            reset_cross_camera_state(camera_id)
             counting_event_state[view_key] = {
                 "total_in": 0,
                 "total_out": 0,
+                "raw_total_in": 0,
+                "raw_total_out": 0,
             }
             counting_data = counter._empty_result()
             update_live_counts(camera_id, counting_data)
             return counting_data
 
-        counting_data = counter.update(detections_unscaled, frame_shape)
+        now_ts = time.time()
+        raw_counting_data = counter.update(detections_unscaled, frame_shape)
+        prev_state = counting_event_state.get(
+            view_key,
+            {"total_in": 0, "total_out": 0, "raw_total_in": 0, "raw_total_out": 0},
+        )
+        raw_total_in = int(raw_counting_data.get("total_in", 0) or 0)
+        raw_total_out = int(raw_counting_data.get("total_out", 0) or 0)
+        raw_delta_in = max(0, raw_total_in - int(prev_state.get("raw_total_in", 0) or 0))
 
-        prev_state = counting_event_state.get(view_key, {"total_in": 0, "total_out": 0})
+        register_primary_in_events(camera_id, raw_delta_in, now_ts)
+        observe_verifier_tracks(camera_id, detections_unscaled, config, frame_shape, now_ts)
+        counting_data, _ = apply_primary_camera_correction(camera_id, raw_counting_data, now_ts)
+
         total_in = int(counting_data.get("total_in", 0) or 0)
         total_out = int(counting_data.get("total_out", 0) or 0)
         delta_in = max(0, total_in - int(prev_state.get("total_in", 0) or 0))
@@ -1702,6 +1938,8 @@ def video_producer(
         counting_event_state[view_key] = {
             "total_in": total_in,
             "total_out": total_out,
+            "raw_total_in": raw_total_in,
+            "raw_total_out": raw_total_out,
         }
 
         # Publish live counts
@@ -1837,6 +2075,7 @@ def video_producer(
         if run_detection_this_frame and view_key in all_views:
             needs_fall_detection = view_key in fall_views
             skip_classification = view_key not in dresscode_views
+            detection_roi_areas = _get_source_detection_roi_areas(view_key)
             detections, people_count, track_state, perf = run_detection_and_classify(
                 img,
                 frame_count,
@@ -1844,6 +2083,7 @@ def video_producer(
                 skip_classification=skip_classification,
                 need_fall_detection=needs_fall_detection,
                 view_key=view_key,
+                detection_roi_areas=detection_roi_areas,
             )
             stage_ms["infer_wait"] += perf.get("infer_wait_ms", perf.get("detect_ms", 0.0))
             stage_ms["infer_predict"] += perf.get("infer_predict_ms", perf.get("detect_ms", 0.0))
@@ -2080,25 +2320,25 @@ def video_producer(
                 + stage_ms["nvenc"]
             )
             avg_detect_batch = (detect_batch_size_sum / detect_batch_samples) if detect_batch_samples else 0.0
-            print(
-                f"[Perf] capture_decode={stage_ms['capture_decode']:.1f}ms "
-                f"producer_wall={producer_wall_ms:.1f}ms "
-                f"producer_stage_sum={producer_stage_sum_ms:.1f}ms "
-                f"fisheye={stage_ms['fisheye']:.1f}ms "
-                f"infer_wait={stage_ms['infer_wait']:.1f}ms "
-                f"infer_predict={stage_ms['infer_predict']:.1f}ms "
-                f"infer_predict_total_batch={stage_ms['infer_predict_total_batch']:.1f}ms "
-                f"infer_post={stage_ms['infer_post']:.1f}ms "
-                f"avg_detect_batch={avg_detect_batch:.2f} "
-                f"classify={stage_ms['classify']:.1f}ms "
-                f"policy_queue={stage_ms['policy_queue']:.1f}ms "
-                f"counting={stage_ms['counting']:.1f}ms "
-                f"encode={stage_ms['encode']:.1f}ms "
-                f"nvenc={stage_ms['nvenc']:.1f}ms "
-                f"classify_batch={classified_count}/{classify_candidates} "
-                f"fps={current_real_fps:.1f} "
-                f"runtime_key={runtime_key}"
-            )
+            # print(
+            #     f"[Perf] capture_decode={stage_ms['capture_decode']:.1f}ms "
+            #     f"producer_wall={producer_wall_ms:.1f}ms "
+            #     f"producer_stage_sum={producer_stage_sum_ms:.1f}ms "
+            #     f"fisheye={stage_ms['fisheye']:.1f}ms "
+            #     f"infer_wait={stage_ms['infer_wait']:.1f}ms "
+            #     f"infer_predict={stage_ms['infer_predict']:.1f}ms "
+            #     f"infer_predict_total_batch={stage_ms['infer_predict_total_batch']:.1f}ms "
+            #     f"infer_post={stage_ms['infer_post']:.1f}ms "
+            #     f"avg_detect_batch={avg_detect_batch:.2f} "
+            #     f"classify={stage_ms['classify']:.1f}ms "
+            #     f"policy_queue={stage_ms['policy_queue']:.1f}ms "
+            #     f"counting={stage_ms['counting']:.1f}ms "
+            #     f"encode={stage_ms['encode']:.1f}ms "
+            #     f"nvenc={stage_ms['nvenc']:.1f}ms "
+            #     f"classify_batch={classified_count}/{classify_candidates} "
+            #     f"fps={current_real_fps:.1f} "
+            #     f"runtime_key={runtime_key}"
+            # )
 
         # Update global buffer (atomic assignment)
         FRAME_BUFFERS[runtime_key] = current_buffer

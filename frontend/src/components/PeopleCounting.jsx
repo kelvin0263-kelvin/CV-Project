@@ -34,6 +34,11 @@ const PeopleCounting = () => {
     const [enabled, setEnabled] = useState(true);
     const [participateInBuildingCount, setParticipateInBuildingCount] = useState(false);
     const [entranceId, setEntranceId] = useState('');
+    const [crossCameraEnabled, setCrossCameraEnabled] = useState(false);
+    const [crossCameraPairId, setCrossCameraPairId] = useState('');
+    const [crossCameraRole, setCrossCameraRole] = useState('none');
+    const [verificationCameraId, setVerificationCameraId] = useState('');
+    const [verificationInwardThreshold, setVerificationInwardThreshold] = useState('0.02');
     const [drawingMode, setDrawingMode] = useState(null);
     const [countingData, setCountingData] = useState({});
     const [stats, setStats] = useState({ fps: 0, people_count: 0 });
@@ -53,6 +58,11 @@ const PeopleCounting = () => {
         setEnabled(true);
         setParticipateInBuildingCount(false);
         setEntranceId('');
+        setCrossCameraEnabled(false);
+        setCrossCameraPairId('');
+        setCrossCameraRole('none');
+        setVerificationCameraId('');
+        setVerificationInwardThreshold('0.02');
         setDrawingMode(null);
     }, []);
 
@@ -95,6 +105,11 @@ const PeopleCounting = () => {
                 setEnabled(data.enabled ?? true);
                 setParticipateInBuildingCount(data.participate_in_building_count ?? false);
                 setEntranceId(data.entrance_id || '');
+                setCrossCameraEnabled(data.cross_camera_enabled ?? false);
+                setCrossCameraPairId(data.cross_camera_pair_id || '');
+                setCrossCameraRole(data.cross_camera_role || 'none');
+                setVerificationCameraId(data.verification_camera_id || '');
+                setVerificationInwardThreshold(String(data.verification_inward_threshold ?? 0.02));
             } catch (err) {
                 console.error('Failed to fetch counting config:', err);
                 if (!cancelled) resetCountingConfig();
@@ -142,8 +157,21 @@ const PeopleCounting = () => {
 
     const handleSave = async () => {
         if (!selectedCamera) return;
+        const effectiveCrossCameraRole = crossCameraEnabled
+            ? (crossCameraRole === 'none' ? 'primary' : crossCameraRole)
+            : 'none';
         if (participateInBuildingCount && !entranceId.trim()) {
             setSaveMessage('Error: entrance ID is required for building counting.');
+            setTimeout(() => setSaveMessage(''), 3000);
+            return;
+        }
+        if (crossCameraEnabled && effectiveCrossCameraRole === 'primary' && !verificationCameraId) {
+            setSaveMessage('Error: verification camera is required for a primary cross-camera setup.');
+            setTimeout(() => setSaveMessage(''), 3000);
+            return;
+        }
+        if (crossCameraEnabled && !crossCameraPairId.trim()) {
+            setSaveMessage('Error: pair ID is required for cross-camera verification.');
             setTimeout(() => setSaveMessage(''), 3000);
             return;
         }
@@ -154,6 +182,11 @@ const PeopleCounting = () => {
                 enabled,
                 participate_in_building_count: participateInBuildingCount,
                 entrance_id: participateInBuildingCount ? entranceId.trim() : null,
+                cross_camera_enabled: crossCameraEnabled,
+                cross_camera_pair_id: crossCameraEnabled ? crossCameraPairId.trim() : null,
+                cross_camera_role: effectiveCrossCameraRole,
+                verification_camera_id: crossCameraEnabled && effectiveCrossCameraRole === 'primary' ? verificationCameraId : null,
+                verification_inward_threshold: parseFloat(verificationInwardThreshold || '0.02') || 0.02,
                 lines,
                 frame_exclude_areas: validFrameExcludeAreas,
             };
@@ -172,6 +205,11 @@ const PeopleCounting = () => {
             setEnabled(savedConfig.enabled ?? true);
             setParticipateInBuildingCount(savedConfig.participate_in_building_count ?? false);
             setEntranceId(savedConfig.entrance_id || '');
+            setCrossCameraEnabled(savedConfig.cross_camera_enabled ?? false);
+            setCrossCameraPairId(savedConfig.cross_camera_pair_id || '');
+            setCrossCameraRole(savedConfig.cross_camera_role || 'none');
+            setVerificationCameraId(savedConfig.verification_camera_id || '');
+            setVerificationInwardThreshold(String(savedConfig.verification_inward_threshold ?? 0.02));
 
             const buildingRes = await fetch(`${apiUrl}/api/building-counting-config`, {
                 method: 'PUT',
@@ -252,7 +290,7 @@ const PeopleCounting = () => {
         setDrawingMode(null);
     }, []);
     const handleFrameExcludeAreaDrawn = useCallback(({ points }) => {
-        setFrameExcludeAreas((prevAreas) => [...prevAreas, { id: `frame_exclude_${Date.now()}`, name: `No Frame Count ${prevAreas.length + 1}`, points }]);
+        setFrameExcludeAreas((prevAreas) => [...prevAreas, { id: `frame_exclude_${Date.now()}`, name: `Active Zone ${prevAreas.length + 1}`, points }]);
         setDrawingMode(null);
     }, []);
     const deleteLine = (lineId) => setLines((prevLines) => prevLines.filter((line) => line.id !== lineId));
@@ -265,6 +303,7 @@ const PeopleCounting = () => {
 
     const wsUrl = selectedCamera ? getWSUrl(`/ws/${selectedCamera}`) : null;
     const selectedCam = cameras.find((camera) => camera.id === selectedCamera);
+    const verificationCameraOptions = cameras.filter((camera) => camera.id !== selectedCamera);
     const occupancy = countingData.occupancy ?? 0;
     const buildingCapacityExceeded = buildingSummary.capacity_exceeded ?? false;
     const buildingEntranceSummaries = buildingSummary.entrance_summaries ?? {};
@@ -330,24 +369,24 @@ const PeopleCounting = () => {
                     <div className="flex items-center justify-between">
                         <div className="text-sm font-medium flex items-center gap-1.5">
                             <PenTool className="w-4 h-4" />
-                            Frame Accumulation Exclusion
+                            Active Counting Zone
                         </div>
                         <Button variant={drawingMode === 'frame_exclude' ? 'default' : 'outline'} size="sm" className="h-7 text-xs" onClick={() => setDrawingMode(drawingMode === 'frame_exclude' ? null : 'frame_exclude')}>
                             <PenTool className="w-3 h-3 mr-1" />
                             {drawingMode === 'frame_exclude' ? 'Cancel' : 'Draw Area'}
                         </Button>
                     </div>
-                    <p className="text-xs text-muted-foreground">Tracks inside this polygon do not gain accumulated line frames.</p>
+                    <p className="text-xs text-muted-foreground">A line-cross or disappear count only triggers when the counting probe point is inside this polygon.</p>
                     {validFrameExcludeAreas.map((area, index) => (
                         <div key={area.id} className="flex items-center gap-2 p-1.5 rounded-md border bg-muted/30 text-xs">
                             <div className="w-2.5 h-2.5 rounded-full shrink-0 bg-sky-500" />
-                            <span className="flex-1 truncate">{area.name || `No Frame Count ${index + 1}`}</span>
+                            <span className="flex-1 truncate">{area.name || `Active Zone ${index + 1}`}</span>
                             <Button variant="ghost" size="icon" className="h-6 w-6 text-destructive" onClick={() => deleteFrameExcludeArea(area.id)}>
                                 <Trash2 className="w-3 h-3" />
                             </Button>
                         </div>
                     ))}
-                    {drawingMode === 'frame_exclude' && <p className="text-xs text-muted-foreground">Click around the video to draw the polygon, then double-click to close it.</p>}
+                    {drawingMode === 'frame_exclude' && <p className="text-xs text-muted-foreground">Click around the video to draw the active zone, then double-click to close it.</p>}
                 </div>
 
                 <div className="space-y-3 border rounded-lg p-3 bg-muted/20">
@@ -365,6 +404,62 @@ const PeopleCounting = () => {
                         </div>
                     )}
                     <p className="text-xs text-muted-foreground">Cameras with the same entrance ID are combined into one entrance-level total for the building count.</p>
+                </div>
+
+                <div className="space-y-3 border rounded-lg p-3 bg-muted/20">
+                    <div className="text-sm font-medium flex items-center gap-1.5"><Link2 className="w-4 h-4" />Cross-Camera Verification</div>
+                    <div className="flex items-center justify-between">
+                        <label className="text-sm">Enabled</label>
+                        <button onClick={() => {
+                            const nextEnabled = !crossCameraEnabled;
+                            setCrossCameraEnabled(nextEnabled);
+                            if (nextEnabled && crossCameraRole === 'none') {
+                                setCrossCameraRole('primary');
+                            }
+                            if (!nextEnabled) {
+                                setCrossCameraPairId('');
+                                setCrossCameraRole('none');
+                                setVerificationCameraId('');
+                            }
+                        }} className={cn('relative inline-flex h-6 w-11 items-center rounded-full transition-colors', crossCameraEnabled ? 'bg-primary' : 'bg-muted')}>
+                            <span className={cn('inline-block h-4 w-4 transform rounded-full bg-white transition-transform', crossCameraEnabled ? 'translate-x-6' : 'translate-x-1')} />
+                        </button>
+                    </div>
+                    {crossCameraEnabled && (
+                        <div className="space-y-3">
+                            <div className="space-y-2">
+                                <label className="text-xs font-medium">Pair ID</label>
+                                <input
+                                    type="text"
+                                    className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                    value={crossCameraPairId}
+                                    onChange={(e) => setCrossCameraPairId(e.target.value)}
+                                    placeholder="entrance_pair_1"
+                                />
+                            </div>
+                            <div className="space-y-2">
+                                <label className="text-xs font-medium">Role</label>
+                                <select className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" value={crossCameraRole} onChange={(e) => setCrossCameraRole(e.target.value)}>
+                                    <option value="primary">Primary Camera</option>
+                                    <option value="verifier">Verifier Camera</option>
+                                </select>
+                            </div>
+                            {crossCameraRole === 'primary' && (
+                                <div className="space-y-2">
+                                    <label className="text-xs font-medium">Verification Camera</label>
+                                    <select className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" value={verificationCameraId} onChange={(e) => setVerificationCameraId(e.target.value)}>
+                                        <option value="">Select verifier camera</option>
+                                        {verificationCameraOptions.map((camera) => <option key={camera.id} value={camera.id}>{camera.name}</option>)}
+                                    </select>
+                                </div>
+                            )}
+                            <div className="space-y-2">
+                                <label className="text-xs font-medium">Inward Motion Threshold</label>
+                                <input type="number" step="0.005" min="0" className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" value={verificationInwardThreshold} onChange={(e) => setVerificationInwardThreshold(e.target.value)} />
+                            </div>
+                            <p className="text-xs text-muted-foreground">Primary cameras only get corrected upward. Verifier tracks must be newborn inside the active zone and move inward before they can add a missed IN count.</p>
+                        </div>
+                    )}
                 </div>
 
                 <div className="space-y-3">

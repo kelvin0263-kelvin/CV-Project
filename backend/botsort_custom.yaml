@@ -8,20 +8,14 @@
 tracker_type: botsort
 track_high_thresh: 0.30
 track_low_thresh: 0.10
-new_track_thresh: 0.40
-track_buffer: 75
-match_thresh: 0.85
+new_track_thresh: 0.50
+track_buffer: 80
+match_thresh: 0.90
 fuse_score: True
 
 # Most counting cameras in this project are fixed-position. Disabling GMC saves
 # CPU time; enable it again only if the camera itself moves or shakes.
 gmc_method: none
-
-# Leave ReID thresholds in place for future tuning, but keep ReID off by default.
-proximity_thresh: 0.5
-appearance_thresh: 0.8
-
-# This backend uses a pose model and already performs per-track classification.
-# Disabling ReID avoids extra latency and model/download mismatches on startup.
-with_reid: False
-model: auto
+proximity_thresh: 0.3
+appearance_thresh: 0.7
+with_reid: false

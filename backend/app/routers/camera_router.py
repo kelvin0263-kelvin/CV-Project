@@ -1,11 +1,14 @@
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete as sa_delete
-from typing import List
+from typing import List, Any
 import uuid
 import os
 import asyncio
 import cv2
+import base64
+import json
+import tempfile
 
 from pydantic import BaseModel
 
@@ -19,6 +22,7 @@ from app.schemas.camera import CameraCreate, CameraRead
 from app.core.database import get_db, AsyncSessionLocal
 from app.core.globals import FRAME_BUFFERS
 from app.services.video_processor import start_producer_thread, stop_producer_thread
+from app.services.source_roi_registry import replace_source_detection_rois
 from app.services.upload_sync import (
     discard_pending_runtime_key,
     is_pending_runtime_key,
@@ -60,6 +64,33 @@ class StreamSourceCreateRequest(BaseModel):
     enabled: bool = True
     enable_fisheye: bool = False
     selected_views: list[int] = []
+    detection_roi: dict[str, Any] | None = None
+
+
+def _normalize_detection_roi(raw_roi: dict | None) -> dict | None:
+    if not isinstance(raw_roi, dict):
+        return None
+
+    points = raw_roi.get("points", [])
+    normalized_points: list[list[float]] = []
+    for point in points:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            continue
+        try:
+            x = max(0.0, min(1.0, float(point[0])))
+            y = max(0.0, min(1.0, float(point[1])))
+        except (TypeError, ValueError):
+            continue
+        normalized_points.append([x, y])
+
+    if len(normalized_points) < 3:
+        return None
+
+    return {
+        "id": str(raw_roi.get("id") or "detection_roi"),
+        "name": str(raw_roi.get("name") or "Detection ROI"),
+        "points": normalized_points,
+    }
 
 
 def _infer_stream_camera_type(source_path: str, *, is_fisheye: bool = False) -> str:
@@ -86,6 +117,7 @@ def _get_runtime_key(stream_config: StreamConfig) -> str:
 
 
 async def _sync_runtime_state(db: AsyncSession):
+    await sync_stream_roi_runtime_from_db(db)
     await sync_policy_runtime_from_db(db)
     await sync_counting_runtime_from_db(db)
 
@@ -110,8 +142,33 @@ def _build_camera_read(
         source_path=stream_config.source_path if stream_config is not None else None,
         view_index=stream_config.view_index if stream_config is not None else -1,
         is_fisheye=bool(stream_config.is_fisheye) if stream_config is not None else False,
+        detection_roi=_normalize_detection_roi(stream_config.detection_roi) if stream_config is not None else None,
         analysis_tags=analysis_tags or [],
     )
+
+
+async def sync_stream_roi_runtime_from_db(session: AsyncSession):
+    result = await session.execute(select(StreamConfig))
+    rows = result.scalars().all()
+
+    next_map: dict[str, dict] = {}
+    for row in rows:
+        runtime_key = _get_runtime_key(row)
+        view_key = "original" if row.view_index == -1 else f"partition_{row.view_index}"
+        normalized_roi = _normalize_detection_roi(row.detection_roi)
+        if normalized_roi is not None:
+            next_map[f"{runtime_key}||{view_key}"] = normalized_roi
+
+    replace_source_detection_rois(next_map)
+
+
+async def load_stream_roi_runtime_from_db():
+    try:
+        async with AsyncSessionLocal() as session:
+            await sync_stream_roi_runtime_from_db(session)
+            print("[Startup] Loaded source detection ROI config(s)")
+    except Exception as e:
+        print(f"[Startup] Warning: Could not load source detection ROIs: {e}")
 
 
 async def _derive_analysis_tags_by_camera(
@@ -225,6 +282,7 @@ async def _create_camera_with_stream(
     runtime_key: str | None = None,
     view_index: int = -1,
     is_fisheye: bool = False,
+    detection_roi: dict | None = None,
     image: str = "",
 ) -> tuple[Camera, StreamConfig]:
     camera_id = str(uuid.uuid4())
@@ -250,6 +308,7 @@ async def _create_camera_with_stream(
         runtime_key=_normalize_runtime_key(source_path, runtime_key),
         view_index=view_index,
         is_fisheye=is_fisheye,
+        detection_roi=_normalize_detection_roi(detection_roi),
     )
     session.add(stream_config)
 
@@ -259,7 +318,27 @@ async def _create_camera_with_stream(
 
 
 def _open_probe_capture(source_path: str) -> cv2.VideoCapture:
-    return open_video_capture(source_path)
+    return open_video_capture(
+        source_path,
+        is_rtsp=is_rtsp_source(source_path),
+        allow_hwaccel=False,
+    )
+
+
+def _is_usable_preview_frame(frame) -> bool:
+    if frame is None or not hasattr(frame, "size") or frame.size == 0:
+        return False
+    if len(frame.shape) < 2 or frame.shape[0] < 2 or frame.shape[1] < 2:
+        return False
+
+    try:
+        preview = cv2.resize(frame, (64, 36), interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(preview, cv2.COLOR_BGR2GRAY) if len(preview.shape) == 3 else preview
+        stddev = float(gray.std())
+        dynamic_range = float(gray.max() - gray.min())
+        return stddev >= 6.0 and dynamic_range >= 24.0
+    except cv2.error:
+        return False
 
 
 def _probe_stream(source_path: str) -> dict:
@@ -268,18 +347,94 @@ def _probe_stream(source_path: str) -> dict:
         if not cap.isOpened():
             return {"ok": False, "detail": "Unable to open stream."}
 
-        ok, frame = cap.read()
-        if not ok or frame is None:
+        frame = None
+        best_frame = None
+        for attempt in range(30):
+            ok, next_frame = cap.read()
+            if not ok or next_frame is None:
+                if attempt < 5:
+                    continue
+                break
+            frame = next_frame
+            if _is_usable_preview_frame(next_frame):
+                best_frame = next_frame
+                break
+            if best_frame is None:
+                best_frame = next_frame
+
+        frame = best_frame if best_frame is not None else frame
+        if frame is None:
             return {"ok": False, "detail": "Connected, but no frame was received."}
 
         height, width = frame.shape[:2]
         fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        preview = frame
+        max_preview_w = 960
+        if width > max_preview_w:
+            scale = max_preview_w / float(width)
+            preview = cv2.resize(
+                frame,
+                (max_preview_w, max(1, int(round(height * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+        ok_jpg, preview_buf = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 75])
         return {
             "ok": True,
             "detail": "Stream connection successful.",
             "resolution": f"{width}x{height}",
             "fps": round(float(fps), 1),
             "stream_kind": "rtsp" if is_rtsp_source(source_path) else "network",
+            "preview_image": base64.b64encode(preview_buf).decode("utf-8") if ok_jpg else None,
+            "frame_width": int(width),
+            "frame_height": int(height),
+        }
+    finally:
+        cap.release()
+
+
+def _probe_uploaded_video_file(file_path: str) -> dict:
+    cap = cv2.VideoCapture(file_path)
+    try:
+        if not cap.isOpened():
+            return {"ok": False, "detail": "Unable to open uploaded video."}
+
+        frame = None
+        best_frame = None
+        for attempt in range(60):
+            ok, next_frame = cap.read()
+            if not ok or next_frame is None:
+                if attempt < 10:
+                    continue
+                break
+            frame = next_frame
+            if _is_usable_preview_frame(next_frame):
+                best_frame = next_frame
+                break
+            if best_frame is None:
+                best_frame = next_frame
+
+        frame = best_frame if best_frame is not None else frame
+        if frame is None:
+            return {"ok": False, "detail": "Uploaded video did not yield a readable preview frame."}
+
+        height, width = frame.shape[:2]
+        preview = frame
+        max_preview_w = 960
+        if width > max_preview_w:
+            scale = max_preview_w / float(width)
+            preview = cv2.resize(
+                frame,
+                (max_preview_w, max(1, int(round(height * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        ok_jpg, preview_buf = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        return {
+            "ok": True,
+            "detail": "Upload preview generated successfully.",
+            "preview_image": base64.b64encode(preview_buf).decode("utf-8") if ok_jpg else None,
+            "frame_width": int(width),
+            "frame_height": int(height),
         }
     finally:
         cap.release()
@@ -406,6 +561,7 @@ async def add_camera(camera: CameraCreate, db: AsyncSession = Depends(get_db)):
             runtime_key=_normalize_runtime_key(source_path),
             view_index=camera.view_index,
             is_fisheye=camera.is_fisheye,
+            detection_roi=_normalize_detection_roi(camera.detection_roi),
         )
         db.add(stream_config)
         await db.flush()
@@ -454,6 +610,7 @@ async def update_camera(camera_id: str, camera: CameraCreate, db: AsyncSession =
                 runtime_key=_normalize_runtime_key(source_path),
                 view_index=camera.view_index,
                 is_fisheye=camera.is_fisheye,
+                detection_roi=_normalize_detection_roi(camera.detection_roi),
             )
             db.add(stream_config)
         else:
@@ -462,6 +619,7 @@ async def update_camera(camera_id: str, camera: CameraCreate, db: AsyncSession =
                 stream_config.runtime_key = _normalize_runtime_key(source_path)
             stream_config.view_index = camera.view_index
             stream_config.is_fisheye = camera.is_fisheye
+            stream_config.detection_roi = _normalize_detection_roi(camera.detection_roi)
     elif stream_config is not None:
         await db.delete(stream_config)
         stream_config = None
@@ -519,6 +677,7 @@ async def create_stream_source(payload: StreamSourceCreateRequest, db: AsyncSess
                 runtime_key=runtime_key,
                 view_index=idx,
                 is_fisheye=True,
+                detection_roi=payload.detection_roi,
             )
             new_cameras.append(_build_camera_read(camera, stream_config))
 
@@ -538,6 +697,7 @@ async def create_stream_source(payload: StreamSourceCreateRequest, db: AsyncSess
             source_path=source_path,
             view_index=-1,
             is_fisheye=False,
+            detection_roi=payload.detection_roi,
         )
         new_cameras.append(_build_camera_read(camera, stream_config))
 
@@ -571,6 +731,36 @@ async def test_stream_connection(payload: StreamConnectionTestRequest):
 @router.post("/api/cameras/test-rtsp")
 async def test_rtsp_connection(payload: StreamConnectionTestRequest):
     return await test_stream_connection(payload)
+
+
+@router.post("/api/cameras/upload-preview")
+async def preview_uploaded_video(file: UploadFile = File(...)):
+    suffix = os.path.splitext(file.filename or "")[1] or ".mp4"
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_path = temp_file.name
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                temp_file.write(chunk)
+
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, _probe_uploaded_video_file, temp_path)
+        if not result.get("ok"):
+            raise HTTPException(status_code=400, detail=result.get("detail") or "Unable to preview uploaded video.")
+        return result
+    finally:
+        try:
+            await file.close()
+        except Exception:
+            pass
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 
 @router.delete("/api/cameras/{camera_id}")
@@ -631,6 +821,7 @@ async def upload_video(
     enable_fisheye: bool = Form(False),
     camera_name_prefix: str = Form("Camera"),
     selected_views: str = Form(""),  # Comma separated indices, e.g. "0,2,4"
+    detection_roi: str = Form(""),
     sync_start: bool = Form(False),
     sync_group_id: str = Form(""),
     db: AsyncSession = Depends(get_db),
@@ -654,6 +845,12 @@ async def upload_video(
         print(f"[Upload] Saved {filename} ({os.path.getsize(input_path) / 1024 / 1024:.1f} MB)")
 
         new_cameras: list[CameraRead] = []
+        upload_detection_roi = None
+        if detection_roi.strip():
+            try:
+                upload_detection_roi = _normalize_detection_roi(json.loads(detection_roi))
+            except json.JSONDecodeError as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid detection_roi JSON: {exc.msg}")
 
         active_view_indices = None
         if enable_fisheye and selected_views:
@@ -708,6 +905,7 @@ async def upload_video(
                 runtime_key=runtime_key,
                 view_index=view_idx,
                 is_fisheye=enable_fisheye,
+                detection_roi=upload_detection_roi,
             )
             db.add(db_stream_config)
 
@@ -725,6 +923,8 @@ async def upload_video(
                 new_cameras.append(await create_cam(f"View {i + 1} ({angle}°)", i))
         else:
             new_cameras.append(await create_cam("", -1))
+
+        await _sync_runtime_state(db)
 
         return {
             "status": "success",

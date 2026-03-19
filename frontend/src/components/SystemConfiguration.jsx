@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Camera, FolderUp, Plus, Edit2, Trash2, Save, X, Loader2 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardContent } from './ui/card';
 import { Button } from './ui/button';
@@ -6,6 +6,7 @@ import { cn } from '../lib/utils';
 import { Checkbox } from './ui/checkbox';
 import { Label } from './ui/label';
 import StreamPlayer from './StreamPlayer';
+import RoiEditorCanvas from './RoiEditorCanvas';
 import { getApiBaseUrl, getWSUrl } from '../apiConfig';
 
 const CAMERA_ANALYSIS_TAGS_UPDATED_EVENT = 'camera-analysis-tags-updated';
@@ -44,8 +45,21 @@ const inferSourceType = (sourcePath = '', enableFisheye = false) => {
     return enableFisheye ? 'Network Stream Fisheye' : 'Network Stream';
 };
 
+const parseResolutionString = (resolution) => {
+    const text = String(resolution || '').trim().toLowerCase();
+    const match = text.match(/^(\d+)\s*x\s*(\d+)$/);
+    if (match) {
+        return {
+            width: parseInt(match[1], 10),
+            height: parseInt(match[2], 10),
+        };
+    }
+    return { width: 640, height: 360 };
+};
+
 const SystemConfiguration = () => {
     const apiUrl = getApiBaseUrl();
+    const previewContainerRef = useRef(null);
     const [cameras, setCameras] = useState([]);
     const [isAddMode, setIsAddMode] = useState(false);
     const [isEditMode, setIsEditMode] = useState(false);
@@ -64,6 +78,12 @@ const SystemConfiguration = () => {
     const [uploadMessage, setUploadMessage] = useState(null);
     const [startingSyncGroup, setStartingSyncGroup] = useState(false);
     const [selectedViews, setSelectedViews] = useState(new Set([DEFAULT_FISHEYE_VIEW]));
+    const [sourceRoi, setSourceRoi] = useState(null);
+    const [isDrawingSourceRoi, setIsDrawingSourceRoi] = useState(false);
+    const [uploadPreviewUrl, setUploadPreviewUrl] = useState('');
+    const [uploadPreviewImage, setUploadPreviewImage] = useState('');
+    const [uploadPreviewSize, setUploadPreviewSize] = useState({ width: 640, height: 360 });
+    const [streamPreview, setStreamPreview] = useState(null);
 
     // Form State
     const [formData, setFormData] = useState({
@@ -133,6 +153,10 @@ const SystemConfiguration = () => {
         setUploadMessage(null);
         setSelectedViews(new Set([DEFAULT_FISHEYE_VIEW]));
         setTestResult(null);
+        setSourceRoi(null);
+        setIsDrawingSourceRoi(false);
+        setStreamPreview(null);
+        setUploadPreviewImage('');
     };
 
     const handleAddClick = () => {
@@ -155,6 +179,9 @@ const SystemConfiguration = () => {
                 ? new Set([cam.view_index])
                 : new Set([DEFAULT_FISHEYE_VIEW])
         );
+        setSourceRoi(cam.detection_roi || null);
+        setIsDrawingSourceRoi(false);
+        setStreamPreview(null);
         setSelectedCamera(cam);
         setIsEditMode(true);
     };
@@ -169,13 +196,145 @@ const SystemConfiguration = () => {
         setFormData(prev => ({ ...prev, [name]: type === 'checkbox' ? checked : value }));
         if (name === 'streamUrl' && testResult) {
             setTestResult(null);
+            setStreamPreview(null);
         }
     };
 
     const handleFileChange = (e) => {
         if (e.target.files && e.target.files[0]) {
             setSelectedFile(e.target.files[0]);
+            setSourceRoi(null);
+            setIsDrawingSourceRoi(false);
         }
+    };
+
+    useEffect(() => {
+        if (!selectedFile) {
+            setUploadPreviewUrl('');
+            setUploadPreviewImage('');
+            setUploadPreviewSize({ width: 640, height: 360 });
+            return undefined;
+        }
+        const objectUrl = URL.createObjectURL(selectedFile);
+        setUploadPreviewUrl(objectUrl);
+        setUploadPreviewImage('');
+        setUploadPreviewSize({ width: 640, height: 360 });
+
+        const video = document.createElement('video');
+        video.preload = 'auto';
+        video.muted = true;
+        video.playsInline = true;
+
+        let captured = false;
+        let cancelled = false;
+        let backendPreviewResolved = false;
+
+        const captureFrame = () => {
+            if (cancelled || captured || backendPreviewResolved) {
+                return;
+            }
+            const width = video.videoWidth || 640;
+            const height = video.videoHeight || 360;
+            setUploadPreviewSize({ width, height });
+
+            try {
+                const canvas = document.createElement('canvas');
+                canvas.width = width;
+                canvas.height = height;
+                const ctx = canvas.getContext('2d');
+                if (!ctx) {
+                    return;
+                }
+                ctx.drawImage(video, 0, 0, width, height);
+                setUploadPreviewImage(canvas.toDataURL('image/jpeg', 0.85));
+                captured = true;
+            } catch (error) {
+                console.error('Failed to capture upload preview frame:', error);
+            }
+        };
+
+        video.onloadedmetadata = () => {
+            if (cancelled) {
+                return;
+            }
+            const width = video.videoWidth || 640;
+            const height = video.videoHeight || 360;
+            setUploadPreviewSize({ width, height });
+
+            if (!Number.isFinite(video.duration) || video.duration <= 0) {
+                captureFrame();
+                return;
+            }
+
+            const targetTime = Math.min(0.1, Math.max(video.duration / 20, 0.02));
+            try {
+                video.currentTime = targetTime;
+            } catch (_) {
+                captureFrame();
+            }
+        };
+
+        video.onloadeddata = captureFrame;
+        video.oncanplay = captureFrame;
+        video.onseeked = captureFrame;
+        video.onerror = () => {
+            if (!cancelled) {
+                console.error('Failed to load upload preview video.');
+            }
+        };
+        video.src = objectUrl;
+        video.load();
+
+        const loadBackendPreview = async () => {
+            try {
+                const formData = new FormData();
+                formData.append('file', selectedFile);
+                const res = await fetch(`${apiUrl}/api/cameras/upload-preview`, {
+                    method: 'POST',
+                    body: formData,
+                });
+                if (!res.ok) {
+                    return;
+                }
+                const data = await res.json();
+                if (cancelled || !data?.preview_image) {
+                    return;
+                }
+                backendPreviewResolved = true;
+                captured = true;
+                setUploadPreviewImage(`data:image/jpeg;base64,${data.preview_image}`);
+                setUploadPreviewSize({
+                    width: parseInt(data.frame_width, 10) || 640,
+                    height: parseInt(data.frame_height, 10) || 360,
+                });
+            } catch (error) {
+                if (!cancelled) {
+                    console.error('Failed to load backend upload preview:', error);
+                }
+            }
+        };
+        loadBackendPreview();
+
+        const fallbackTimer = window.setTimeout(() => {
+            captureFrame();
+        }, 2000);
+
+        return () => {
+            cancelled = true;
+            window.clearTimeout(fallbackTimer);
+            video.onloadedmetadata = null;
+            video.onloadeddata = null;
+            video.oncanplay = null;
+            video.onseeked = null;
+            video.onerror = null;
+            video.src = '';
+            URL.revokeObjectURL(objectUrl);
+        };
+    }, [selectedFile]);
+
+    const handleClearSourceRoi = () => {
+        setSourceRoi(null);
+        setIsDrawingSourceRoi(false);
     };
 
     const handleSelectSingleView = (idx) => {
@@ -197,6 +356,9 @@ const SystemConfiguration = () => {
                 // Convert Set to comma separated string "0,3,5"
                 const views = Array.from(selectedViews).join(',');
                 uploadData.append('selected_views', views);
+            }
+            if (sourceRoi?.points?.length >= 3) {
+                uploadData.append('detection_roi', JSON.stringify(sourceRoi));
             }
             uploadData.append('camera_name_prefix', formData.name || 'Uploaded Camera');
             uploadData.append('sync_start', syncStart);
@@ -257,6 +419,7 @@ const SystemConfiguration = () => {
             image: '',
             view_index: -1,
             is_fisheye: false,
+            detection_roi: sourceRoi?.points?.length >= 3 ? sourceRoi : null,
         };
 
         try {
@@ -284,6 +447,7 @@ const SystemConfiguration = () => {
                         enabled: formData.enabled,
                         enable_fisheye: true,
                         selected_views: Array.from(selectedViews),
+                        detection_roi: payload.detection_roi,
                     }),
                 });
                 if (!res.ok) {
@@ -364,14 +528,24 @@ const SystemConfiguration = () => {
             setTestResult({
                 type: 'success',
                 message: parts.length > 0
-                    ? `Connection successful. ${parts.join(' | ')}`
+                    ? `Connection successful. ${parts.join(' | ')}` 
                     : 'Connection successful.',
             });
+            setStreamPreview(
+                data.preview_image
+                    ? {
+                        image: `data:image/jpeg;base64,${data.preview_image}`,
+                        width: parseInt(data.frame_width, 10) || parseResolutionString(data.resolution).width,
+                        height: parseInt(data.frame_height, 10) || parseResolutionString(data.resolution).height,
+                    }
+                    : null
+            );
         } catch (error) {
             const message = error?.name === 'AbortError'
                 ? 'Connection test timed out.'
                 : (error?.message || 'Connection test failed.');
             setTestResult({ type: 'error', message });
+            setStreamPreview(null);
         } finally {
             setIsTestingConnection(false);
         }
@@ -644,7 +818,51 @@ const SystemConfiguration = () => {
                                                         ? "border-green-500/30 bg-green-500/10 text-green-600"
                                                         : "border-red-500/30 bg-red-500/10 text-red-600"
                                                 )}>
-                                                    {uploadMessage.text}
+                                                {uploadMessage.text}
+                                            </div>
+                                            )}
+
+                                            {uploadPreviewUrl && (
+                                                <div className="space-y-3 rounded-lg border p-3 bg-background/60">
+                                                    <div className="flex items-center justify-between">
+                                                        <Label>Detection ROI</Label>
+                                                        <div className="flex gap-2">
+                                                            <Button type="button" variant={isDrawingSourceRoi ? 'default' : 'outline'} size="sm" onClick={() => setIsDrawingSourceRoi((prev) => !prev)}>
+                                                                {isDrawingSourceRoi ? 'Stop Drawing' : 'Draw ROI'}
+                                                            </Button>
+                                                            <Button type="button" variant="outline" size="sm" onClick={handleClearSourceRoi} disabled={!sourceRoi}>
+                                                                Clear ROI
+                                                            </Button>
+                                                        </div>
+                                                    </div>
+                                                    <div ref={previewContainerRef} className="relative aspect-video overflow-hidden rounded-md bg-black">
+                                                        {uploadPreviewImage ? (
+                                                            <img
+                                                                src={uploadPreviewImage}
+                                                                alt="Upload preview"
+                                                                className="h-full w-full object-contain"
+                                                            />
+                                                        ) : (
+                                                            <div className="flex h-full w-full items-center justify-center text-sm text-muted-foreground">
+                                                                Extracting preview frame...
+                                                            </div>
+                                                        )}
+                                                        <RoiEditorCanvas
+                                                            roi={sourceRoi}
+                                                            drawingEnabled={isDrawingSourceRoi}
+                                                            onChange={(nextRoi) => {
+                                                                setSourceRoi(nextRoi);
+                                                                setIsDrawingSourceRoi(false);
+                                                            }}
+                                                            containerRef={previewContainerRef}
+                                                            mediaWidth={uploadPreviewSize.width}
+                                                            mediaHeight={uploadPreviewSize.height}
+                                                            label="Detection ROI"
+                                                        />
+                                                    </div>
+                                                    <p className="text-xs text-muted-foreground">
+                                                        If ROI is not set, the full original frame is sent to YOLO. When ROI is set, only that cropped region is used for detection.
+                                                    </p>
                                                 </div>
                                             )}
                                         </div>
@@ -711,6 +929,45 @@ const SystemConfiguration = () => {
                                                     </p>
                                                 </div>
                                             )}
+                                            <div className="space-y-3 rounded-lg border p-3 bg-muted/20">
+                                                <div className="flex items-center justify-between">
+                                                    <Label>Detection ROI</Label>
+                                                    <div className="flex gap-2">
+                                                        <Button type="button" variant={isDrawingSourceRoi ? 'default' : 'outline'} size="sm" onClick={() => setIsDrawingSourceRoi((prev) => !prev)} disabled={!streamPreview}>
+                                                            {isDrawingSourceRoi ? 'Stop Drawing' : 'Draw ROI'}
+                                                        </Button>
+                                                        <Button type="button" variant="outline" size="sm" onClick={handleClearSourceRoi} disabled={!sourceRoi}>
+                                                            Clear ROI
+                                                        </Button>
+                                                    </div>
+                                                </div>
+                                                {!streamPreview && (
+                                                    <p className="text-xs text-muted-foreground">
+                                                        Test the stream first to load a preview frame, then draw the detector ROI. If ROI is not set, YOLO uses the full frame.
+                                                    </p>
+                                                )}
+                                                {streamPreview && (
+                                                    <div ref={previewContainerRef} className="relative aspect-video overflow-hidden rounded-md bg-black">
+                                                        <img
+                                                            src={streamPreview.image}
+                                                            alt="Stream preview"
+                                                            className="h-full w-full object-contain"
+                                                        />
+                                                        <RoiEditorCanvas
+                                                            roi={sourceRoi}
+                                                            drawingEnabled={isDrawingSourceRoi}
+                                                            onChange={(nextRoi) => {
+                                                                setSourceRoi(nextRoi);
+                                                                setIsDrawingSourceRoi(false);
+                                                            }}
+                                                            containerRef={previewContainerRef}
+                                                            mediaWidth={streamPreview.width}
+                                                            mediaHeight={streamPreview.height}
+                                                            label="Detection ROI"
+                                                        />
+                                                    </div>
+                                                )}
+                                            </div>
                                         </>
                                     )}
 

@@ -2,14 +2,14 @@ import React, { useRef, useEffect, useState, useCallback } from 'react';
 
 /**
  * CountingCanvas - Interactive SVG overlay for drawing counting lines,
- * frame exclusion areas, and displaying live counting data.
+ * active counting zones, and displaying live counting data.
  *
  * All coordinates are normalised to the ACTUAL VIDEO AREA (0-1),
  * compensating for object-contain letterboxing/pillarboxing.
  *
  * Props:
  *   lines            - array of line configs [{id, name, points, direction}]
- *   frameExcludeAreas - array of exclusion areas [{id, name, points}]
+ *   frameExcludeAreas - array of active zones [{id, name, points}]
  *   countingData     - live counting data from WebSocket
  *   drawingMode      - 'line' | 'frame_exclude' | null
  *   onLineDrawn      - callback({points, direction})
@@ -224,7 +224,7 @@ const CountingCanvas = ({
         const cx = pixelPts.reduce((s, p) => s + p.x, 0) / pixelPts.length;
         const cy = pixelPts.reduce((s, p) => s + p.y, 0) / pixelPts.length;
 
-        const displayLabel = area.name || `No Frame Count ${index + 1}`;
+        const displayLabel = area.name || `Active Zone ${index + 1}`;
 
         return (
             <g key={`frame-exclude-${area.id || index}`}>
@@ -300,7 +300,7 @@ const CountingCanvas = ({
                     <text key="poly-hint" x={svgSize.width / 2} y={hintY}
                         textAnchor="middle" fill={drawColor.stroke} fontSize="12" fontWeight="bold"
                         style={{ textShadow: '1px 1px 2px rgba(0,0,0,0.8)' }}>
-                        Double-click to close No Frame Count ({polygonPoints.length} points)
+                        Double-click to close Active Zone ({polygonPoints.length} points)
                     </text>
                 );
             }

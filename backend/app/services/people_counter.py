@@ -1,14 +1,14 @@
 """
 People Counting Service
 
-Line-only people counting with optional frame exclusion areas.
+Line-only people counting with optional active counting zones.
 
 Supports:
 1. OUT line counting on crossing into the configured target side.
 2. IN line counting when a tracked person disappears after reaching the
    configured target side.
-3. Frame exclusion areas that prevent line-frame accumulation while a track's
-   line probe point is inside the excluded polygon.
+3. Optional polygons that gate count events. A crossing/disappear event only
+   counts when its probe point is inside the configured active zone.
 
 All coordinates are stored in normalized (0-1) form.
 """
@@ -20,7 +20,9 @@ import uuid
 from datetime import datetime, timezone
 
 
-DEBUG_COUNTING = os.getenv("DEBUG_COUNTING", "").strip().lower() in {"1", "true", "yes", "on"}
+# DEBUG_COUNTING = os.getenv("DEBUG_COUNTING", "").strip().lower() in {"1", "true", "yes", "on"}
+DEBUG_COUNTING = False
+DEBUG_COUNTING_VERBOSE = os.getenv("DEBUG_COUNTING_VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"}
 _DEBUG_COUNTING_TRACK_ID_RAW = os.getenv("DEBUG_COUNTING_TRACK_ID", "").strip()
 try:
     DEBUG_COUNTING_TRACK_ID = int(_DEBUG_COUNTING_TRACK_ID_RAW) if _DEBUG_COUNTING_TRACK_ID_RAW else None
@@ -31,25 +33,41 @@ except ValueError:
 LINE_EVENT_IN = "in"
 LINE_EVENT_OUT = "out"
 
-DEFAULT_DISAPPEAR_TIMEOUT = 1.0
+
+DEFAULT_DISAPPEAR_TIMEOUT = 0
+#time cooldown for a track id to trigger again the in count
 DEFAULT_COUNT_COOLDOWN = 4.0
-DEFAULT_LINE_SIDE_EPS = 0.002
-DEFAULT_LINE_IN_MIN_TRACK_FRAMES = 15
+DEFAULT_LINE_SIDE_EPS = 0.002 #line tolerance
+DEFAULT_LINE_IN_MIN_TRACK_FRAMES = 10
+
+# frame_count >= DEFAULT_LINE_OUT_MIN_TRACK_FRAMES and frame_count <= DEFAULT_LINE_OUT_MAX_TRACK_FRAMES
 DEFAULT_LINE_OUT_MIN_TRACK_FRAMES = 0
-DEFAULT_LINE_OUT_MAX_TRACK_FRAMES = 75
-DEFAULT_UNCOUNT_IN_REAPPEAR_FRAMES = 20
+DEFAULT_LINE_OUT_MAX_TRACK_FRAMES = 10
+DEFAULT_OUT_ZONE_ARM_MIN_FRAMES = 5
+DEFAULT_UNCOUNT_IN_REAPPEAR_FRAMES = 20 # reverse count frames
 
 
 class _LineTrackState:
     """Tracks lifetime and final line side for line counting."""
 
-    __slots__ = ("last_seen_time", "frame_count", "last_right_point", "last_in_side_value")
+    __slots__ = (
+        "last_seen_time",
+        "frame_count",
+        "last_right_point",
+        "last_in_side_value",
+        "last_in_active_zone",
+        "active_zone_streak",
+        "out_zone_armed",
+    )
 
     def __init__(self):
         self.last_seen_time: float = time.time()
         self.frame_count: int = 0
         self.last_right_point: tuple[float, float] = (0.0, 0.0)
         self.last_in_side_value: float = 0.0
+        self.last_in_active_zone: bool = False
+        self.active_zone_streak: int = 0
+        self.out_zone_armed: bool = False
 
 
 class _CountedTrackRecord:
@@ -65,15 +83,18 @@ class _CountedTrackRecord:
         self.uncounted = False
 
 
-def _extract_frame_exclude_areas(config: dict) -> list[dict]:
+def _extract_active_zones(config: dict) -> list[dict]:
     normalized: list[dict] = []
-    for index, area in enumerate(config.get("frame_exclude_areas") or []):
+    raw_areas = config.get("active_zones")
+    if raw_areas is None:
+        raw_areas = config.get("frame_exclude_areas") or []
+    for index, area in enumerate(raw_areas):
         points = area.get("points", [])
         if len(points) < 3:
             continue
         normalized.append(
             {
-                "id": str(area.get("id") or f"frame_exclude_{index}"),
+                "id": str(area.get("id") or f"active_zone_{index}"),
                 "name": str(area.get("name") or ""),
                 "points": points,
             }
@@ -81,14 +102,19 @@ def _extract_frame_exclude_areas(config: dict) -> list[dict]:
     return normalized
 
 
+# counter = PeopleCounter(config)
 class PeopleCounter:
     """Stateful line-only people counter for a single camera/view."""
 
+   
     def __init__(self, config: dict):
+         # 1 read config
         self.lines = config.get("lines", [])
-        self.frame_exclude_areas = _extract_frame_exclude_areas(config)
+        self.active_zones = _extract_active_zones(config)
+        self.frame_exclude_areas = self.active_zones
         self.enabled = config.get("enabled", True)
 
+        # init all the variable
         self._line_track_states: dict[str, dict[int, _LineTrackState]] = {}
         self._line_track_frame_totals: dict[int, int] = {}
         self._counted_tracks: dict[int, _CountedTrackRecord] = {}
@@ -116,12 +142,13 @@ class PeopleCounter:
 
         track_bboxes: dict[int, list[float]] = {}
         line_tracks_seen_this_update: set[int] = set()
-        skipped_no_track = 0
+        skipped_missing_bbox = 0
+        skipped_missing_track = 0
 
         for det in detections:
             bbox = det.get("person_bbox")
             if bbox is None:
-                skipped_no_track += 1
+                skipped_missing_bbox += 1
                 continue
 
             count_anchor = self._bbox_bottom_center_point(bbox, w, h)
@@ -137,7 +164,7 @@ class PeopleCounter:
 
             track_id = det.get("track_id")
             if track_id is None:
-                skipped_no_track += 1
+                skipped_missing_track += 1
                 continue
 
             tid = int(track_id)
@@ -146,18 +173,21 @@ class PeopleCounter:
             if tid in line_tracks_seen_this_update:
                 continue
 
-            line_probe_point = self._bbox_line_right_midlower_point(bbox, w, h)
-            if self._should_accumulate_line_frames(line_probe_point):
+            if self._should_accumulate_track_frames(count_anchor):
                 self._line_track_frame_totals[tid] = self._line_track_frame_totals.get(tid, 0) + 1
-            elif self._should_debug_track(tid):
-                print(
-                    f"  [LINE-FRAME-SKIP] Track {tid}: point={self._format_point(line_probe_point)} "
-                    "inside frame exclusion area, accumulated frames unchanged"
-                )
             line_tracks_seen_this_update.add(tid)
 
-        if DEBUG_COUNTING and skipped_no_track > 0:
-            print(f"  [WARN] {skipped_no_track} detection(s) skipped: missing bbox or track_id")
+        if DEBUG_COUNTING_VERBOSE and (skipped_missing_bbox > 0 or skipped_missing_track > 0):
+            print(
+                " ".join(
+                    [
+                        "[COUNT-SKIP]",
+                        "event=invalid_detection",
+                        f"missing_bbox={skipped_missing_bbox}",
+                        f"missing_track_id={skipped_missing_track}",
+                    ]
+                )
+            )
 
         for line_index, line_cfg in enumerate(self.lines):
             points = line_cfg.get("points", [])
@@ -193,6 +223,7 @@ class PeopleCounter:
             "total_out": self.total_out,
             "occupancy": occupancy,
             "lines": self.lines,
+            "active_zones": self.active_zones,
             "frame_exclude_areas": self.frame_exclude_areas,
         }
 
@@ -231,7 +262,8 @@ class PeopleCounter:
     def update_config(self, config: dict):
         """Hot-reload config without resetting counts."""
         self.lines = config.get("lines", [])
-        self.frame_exclude_areas = _extract_frame_exclude_areas(config)
+        self.active_zones = _extract_active_zones(config)
+        self.frame_exclude_areas = self.active_zones
         self.enabled = config.get("enabled", True)
         self.disappear_timeout = config.get("disappear_timeout", DEFAULT_DISAPPEAR_TIMEOUT)
         self.count_cooldown = config.get("count_cooldown", DEFAULT_COUNT_COOLDOWN)
@@ -301,6 +333,8 @@ class PeopleCounter:
         curr_side = self._line_target_side_value(line_cfg, right_point)
         count_event = self._line_count_event(line_cfg)
         required_frames = self._line_min_track_frames(line_cfg)
+        in_active_zone = self._is_inside_active_zone(right_point)
+        active_zone_arm_frames = self._out_zone_arm_min_frames(line_cfg)
 
         if ts is None:
             ts = _LineTrackState()
@@ -308,40 +342,74 @@ class PeopleCounter:
             ts.frame_count = self._line_track_frame_totals.get(int(track_id), 0)
             ts.last_right_point = right_point
             ts.last_in_side_value = curr_side
+            ts.last_in_active_zone = in_active_zone
+            if count_event == LINE_EVENT_OUT and in_active_zone:
+                ts.active_zone_streak = 1
+                ts.out_zone_armed = active_zone_arm_frames <= 1
             states[track_id] = ts
             self._log_live_track_frame(
                 track_id,
                 line_name,
                 event="spawn",
+                count_event=count_event,
                 point=right_point,
                 side=curr_side,
                 frame_count=ts.frame_count,
+                in_active_zone=in_active_zone,
+                out_zone_armed=ts.out_zone_armed,
+                active_zone_streak=ts.active_zone_streak,
             )
             return 0
 
         prev_point = ts.last_right_point
         prev_side = ts.last_in_side_value
+        prev_in_active_zone = ts.last_in_active_zone
+        prev_active_zone_streak = ts.active_zone_streak
+        cross_point = self._line_crossing_point(prev_point, right_point, prev_side, curr_side)
+        crossing_point_in_active_zone = self._is_inside_active_zone(cross_point or right_point)
 
         ts.last_seen_time = now
         ts.frame_count = self._line_track_frame_totals.get(int(track_id), ts.frame_count)
         ts.last_right_point = right_point
         ts.last_in_side_value = curr_side
+        ts.last_in_active_zone = in_active_zone
+        if count_event == LINE_EVENT_OUT and in_active_zone:
+            ts.active_zone_streak += 1
+            if ts.active_zone_streak >= active_zone_arm_frames:
+                ts.out_zone_armed = True
+        elif count_event == LINE_EVENT_OUT and not in_active_zone:
+            ts.active_zone_streak = 0
 
         self._log_live_track_frame(
             track_id,
             line_name,
             event="visible",
+            count_event=count_event,
             point=right_point,
             side=curr_side,
             frame_count=ts.frame_count,
+            in_active_zone=in_active_zone,
+            out_zone_armed=ts.out_zone_armed,
+            active_zone_streak=ts.active_zone_streak,
         )
 
-        if DEBUG_COUNTING and ts.frame_count in {10, 30, 60, 100, 101}:
-            target_label = self._line_count_event(line_cfg).upper()
+        if DEBUG_COUNTING_VERBOSE and self._should_debug_track(track_id) and ts.frame_count in {10, 30, 60, 100, 101}:
             print(
-                f"  [LINE-TRACK] Track {track_id}: {line_name} "
-                f"target={target_label} frames={ts.frame_count} side={curr_side:.4f} "
-                f"point={self._format_point(right_point)}"
+                " ".join(
+                    [
+                        "[LINE-TRACK]",
+                        f"track_id={track_id}",
+                        f"line={line_name}",
+                        f"count_event={count_event.upper()}",
+                        f"frames={ts.frame_count}",
+                        f"side_state={self._side_label(curr_side)}",
+                        f"side_value={curr_side:.4f}",
+                        f"in_active_zone={self._bool_label(in_active_zone)}",
+                        f"out_zone_armed={self._bool_label(ts.out_zone_armed)}",
+                        f"zone_streak={ts.active_zone_streak}",
+                        f"point={self._format_point(right_point)}",
+                    ]
+                )
             )
 
         max_frames = self._line_max_track_frames(line_cfg)
@@ -350,13 +418,17 @@ class PeopleCounter:
             and prev_side <= DEFAULT_LINE_SIDE_EPS
             and curr_side > DEFAULT_LINE_SIDE_EPS
         ):
-            if ts.frame_count >= required_frames and (max_frames is None or ts.frame_count <= max_frames):
+            if (
+                crossing_point_in_active_zone
+                and ts.frame_count >= required_frames
+                and (max_frames is None or ts.frame_count <= max_frames)
+            ):
                 if self._register_count(track_id, "OUT", "line_cross", now):
                     self._log_count_event(
                         track_id,
                         "OUT",
                         "line_cross",
-                        point=right_point,
+                        point=cross_point or right_point,
                         prev_point=prev_point,
                         detail=(
                             f"line={line_name} target={count_event} side={curr_side:.4f} "
@@ -365,26 +437,140 @@ class PeopleCounter:
                     )
                     if DEBUG_COUNTING:
                         print(
-                            f"  [LINE-INFER] Track {track_id}: OUT +1 "
-                            f"(crossed into OUT area on {line_name}, frames={ts.frame_count})"
+                            " ".join(
+                                [
+                                    "[COUNT-DECISION]",
+                                    f"track_id={track_id}",
+                                    f"line={line_name}",
+                                    "direction=OUT",
+                                    "source=line_cross",
+                                    "result=counted",
+                                    f"frames={ts.frame_count}",
+                                    f"cross_point={self._format_point(cross_point or right_point)}",
+                                    f"cross_in_active_zone={self._bool_label(crossing_point_in_active_zone)}",
+                                ]
+                            )
                         )
                     self._log_live_track_frame(
                         track_id,
                         line_name,
                         event="count_out",
+                        count_event=count_event,
                         point=right_point,
                         side=curr_side,
                         frame_count=ts.frame_count,
+                        in_active_zone=in_active_zone,
+                        out_zone_armed=ts.out_zone_armed,
+                        active_zone_streak=ts.active_zone_streak,
                     )
                     return 1
             if DEBUG_COUNTING:
+                reasons: list[str] = []
+                if not crossing_point_in_active_zone:
+                    reasons.append("cross_point_outside_active_zone")
                 if ts.frame_count < required_frames:
-                    reason = f"tracked_updates={ts.frame_count} < required={required_frames}"
-                else:
-                    reason = f"tracked_updates={ts.frame_count} > max_allowed={max_frames}"
+                    reasons.append(f"frames_below_min({ts.frame_count}<{required_frames})")
+                if max_frames is not None and ts.frame_count > max_frames:
+                    reasons.append(f"frames_above_max({ts.frame_count}>{max_frames})")
+                reason = ",".join(reasons) if reasons else "not_eligible"
                 print(
-                    f"  [LINE-REJECT] Track {track_id}: crossed into OUT area on {line_name} "
-                    f"but {reason}"
+                    " ".join(
+                        [
+                            "[COUNT-DECISION]",
+                            f"track_id={track_id}",
+                            f"line={line_name}",
+                            "direction=OUT",
+                            "source=line_cross",
+                            "result=rejected",
+                            f"reason={reason}",
+                            f"cross_point={self._format_point(cross_point or right_point)}",
+                            f"cross_in_active_zone={self._bool_label(crossing_point_in_active_zone)}",
+                            f"frames={ts.frame_count}",
+                        ]
+                    )
+                )
+
+        if (
+            count_event == LINE_EVENT_OUT
+            and ts.out_zone_armed
+            and prev_in_active_zone
+            and not in_active_zone
+            and curr_side > DEFAULT_LINE_SIDE_EPS
+            and ts.frame_count >= required_frames
+            and (max_frames is None or ts.frame_count <= max_frames)
+        ):
+            if self._register_count(track_id, "OUT", "zone_exit", now):
+                self._log_count_event(
+                    track_id,
+                    "OUT",
+                    "zone_exit",
+                    point=right_point,
+                    prev_point=prev_point,
+                    detail=(
+                        f"line={line_name} side={curr_side:.4f} "
+                        f"zone_streak={prev_active_zone_streak}"
+                    ),
+                )
+                if DEBUG_COUNTING:
+                    print(
+                        " ".join(
+                            [
+                                "[COUNT-DECISION]",
+                                f"track_id={track_id}",
+                                f"line={line_name}",
+                                "direction=OUT",
+                                "source=zone_exit",
+                                "result=counted",
+                                f"frames={ts.frame_count}",
+                                f"zone_streak={prev_active_zone_streak}",
+                                f"side_state={self._side_label(curr_side)}",
+                            ]
+                        )
+                    )
+                self._log_live_track_frame(
+                    track_id,
+                    line_name,
+                    event="count_out_zone_exit",
+                    count_event=count_event,
+                    point=right_point,
+                    side=curr_side,
+                    frame_count=ts.frame_count,
+                    in_active_zone=in_active_zone,
+                    out_zone_armed=ts.out_zone_armed,
+                    active_zone_streak=ts.active_zone_streak,
+                )
+                return 1
+        elif (
+            DEBUG_COUNTING
+            and count_event == LINE_EVENT_OUT
+            and prev_in_active_zone
+            and not in_active_zone
+            and curr_side > DEFAULT_LINE_SIDE_EPS
+        ):
+            reasons: list[str] = []
+            if not ts.out_zone_armed:
+                reasons.append(
+                    f"active_zone_frames_below_arm({prev_active_zone_streak}<{active_zone_arm_frames})"
+                )
+            if ts.frame_count < required_frames:
+                reasons.append(f"frames_below_min({ts.frame_count}<{required_frames})")
+            if max_frames is not None and ts.frame_count > max_frames:
+                reasons.append(f"frames_above_max({ts.frame_count}>{max_frames})")
+            if reasons:
+                print(
+                    " ".join(
+                        [
+                            "[COUNT-DECISION]",
+                            f"track_id={track_id}",
+                            f"line={line_name}",
+                            "direction=OUT",
+                            "source=zone_exit",
+                            "result=rejected",
+                            f"reason={','.join(reasons)}",
+                            f"side_state={self._side_label(curr_side)}",
+                            f"zone_streak={prev_active_zone_streak}",
+                        ]
+                    )
                 )
 
         return 0
@@ -410,16 +596,22 @@ class PeopleCounter:
                     track_id,
                     line_name,
                     event="missing",
+                    count_event=count_event,
                     point=ts.last_right_point,
                     side=ts.last_in_side_value,
                     frame_count=ts.frame_count,
                     elapsed=elapsed,
+                    in_active_zone=self._is_inside_active_zone(ts.last_right_point),
+                    out_zone_armed=ts.out_zone_armed,
+                    active_zone_streak=ts.active_zone_streak,
                 )
                 if elapsed < self.disappear_timeout:
                     continue
 
+                in_active_zone = self._is_inside_active_zone(ts.last_right_point)
                 if (
                     count_event == LINE_EVENT_IN
+                    and in_active_zone
                     and ts.last_in_side_value > DEFAULT_LINE_SIDE_EPS
                     and ts.frame_count >= required_frames
                 ):
@@ -438,28 +630,58 @@ class PeopleCounter:
                         )
                         if DEBUG_COUNTING:
                             print(
-                                f"  [LINE-INFER] Track {track_id}: IN +1 "
-                                f"(line={line_name}, frames={ts.frame_count})"
+                                " ".join(
+                                    [
+                                        "[COUNT-DECISION]",
+                                        f"track_id={track_id}",
+                                        f"line={line_name}",
+                                        "direction=IN",
+                                        "source=line_disappear",
+                                        "result=counted",
+                                        f"frames={ts.frame_count}",
+                                        f"elapsed={elapsed:.2f}s",
+                                        f"in_active_zone={self._bool_label(in_active_zone)}",
+                                    ]
+                                )
                             )
                         self._log_live_track_frame(
                             track_id,
                             line_name,
                             event="count_in",
+                            count_event=count_event,
                             point=ts.last_right_point,
                             side=ts.last_in_side_value,
                             frame_count=ts.frame_count,
                             elapsed=elapsed,
+                            in_active_zone=in_active_zone,
+                            out_zone_armed=ts.out_zone_armed,
+                            active_zone_streak=ts.active_zone_streak,
                         )
                 elif DEBUG_COUNTING:
                     if count_event == LINE_EVENT_OUT:
-                        reason = "OUT lines count on crossing, not disappearance"
+                        reason = "out_lines_do_not_count_on_disappear"
+                    elif not in_active_zone:
+                        reason = "last_point_outside_active_zone"
                     elif ts.last_in_side_value <= DEFAULT_LINE_SIDE_EPS:
-                        reason = f"point not in {count_event.upper()} area at disappear"
+                        reason = f"last_point_not_in_{count_event}_target_side"
                     else:
-                        reason = f"tracked_updates={ts.frame_count} < required={required_frames}"
+                        reason = f"frames_below_min({ts.frame_count}<{required_frames})"
                     print(
-                        f"  [LINE-CLEANUP] Track {track_id}: no {count_event.upper()} count for {line_name} "
-                        f"({reason}, side={ts.last_in_side_value:.4f}, elapsed={elapsed:.1f}s)"
+                        " ".join(
+                            [
+                                "[COUNT-DECISION]",
+                                f"track_id={track_id}",
+                                f"line={line_name}",
+                                f"direction={count_event.upper()}",
+                                "source=line_disappear",
+                                "result=rejected",
+                                f"reason={reason}",
+                                f"side_state={self._side_label(ts.last_in_side_value)}",
+                                f"side_value={ts.last_in_side_value:.4f}",
+                                f"elapsed={elapsed:.2f}s",
+                                f"in_active_zone={self._bool_label(in_active_zone)}",
+                            ]
+                        )
                     )
 
                 to_remove.append(track_id)
@@ -474,8 +696,16 @@ class PeopleCounter:
             if DEBUG_COUNTING:
                 record = self._counted_tracks[int(track_id)]
                 print(
-                    f"  [COUNT-SKIP] Track {track_id}: already counted once "
-                    f"(dir={record.direction}, source={record.source}, uncounted={record.uncounted})"
+                    " ".join(
+                        [
+                            "[COUNT-SKIP]",
+                            "event=duplicate_count_attempt",
+                            f"track_id={track_id}",
+                            f"existing_direction={record.direction}",
+                            f"existing_source={record.source}",
+                            f"uncounted={self._bool_label(record.uncounted)}",
+                        ]
+                    )
                 )
             return False
 
@@ -521,8 +751,19 @@ class PeopleCounter:
                     self.total_in = max(0, self.total_in - 1)
                     record.uncounted = True
                     print(
-                        f"[Uncount] dir=IN track_id={track_id} source={record.source} "
-                        f"reason=reappeared_visible_over_{DEFAULT_UNCOUNT_IN_REAPPEAR_FRAMES}_frames"
+                        " ".join(
+                            [
+                                "[COUNT-DECISION]",
+                                f"track_id={track_id}",
+                                "direction=IN",
+                                f"source={record.source}",
+                                "result=uncounted",
+                                (
+                                    "reason="
+                                    f"reappeared_visible_over_{DEFAULT_UNCOUNT_IN_REAPPEAR_FRAMES}_frames"
+                                ),
+                            ]
+                        )
                     )
             else:
                 record.visible_streak_after_count = 0
@@ -531,6 +772,23 @@ class PeopleCounter:
         if point is None:
             return "n/a"
         return f"({point[0]:.3f},{point[1]:.3f})"
+
+    def _bool_label(self, value: bool) -> str:
+        return "yes" if bool(value) else "no"
+
+    def _side_label(self, side: float) -> str:
+        if side > DEFAULT_LINE_SIDE_EPS:
+            return "target"
+        if side < -DEFAULT_LINE_SIDE_EPS:
+            return "source"
+        return "on_line"
+
+    def _should_accumulate_track_frames(self, point: tuple[float, float] | None) -> bool:
+        if point is None:
+            return False
+        if not self.active_zones:
+            return True
+        return not self._is_inside_active_zone(point)
 
     def _should_debug_track(self, track_id: int) -> bool:
         if not DEBUG_COUNTING:
@@ -545,23 +803,36 @@ class PeopleCounter:
         line_name: str,
         *,
         event: str,
+        count_event: str,
         point: tuple[float, float] | None,
         side: float,
         frame_count: int,
         elapsed: float | None = None,
+        in_active_zone: bool | None = None,
+        out_zone_armed: bool | None = None,
+        active_zone_streak: int | None = None,
     ):
+        if not DEBUG_COUNTING_VERBOSE:
+            return
         if not self._should_debug_track(track_id):
             return
         parts = [
             "[LINE-LIVE]",
             f"track_id={track_id}",
             f"line={line_name}",
+            f"count_event={count_event.upper()}",
             f"event={event}",
             f"frames={frame_count}",
-            f"target_area={side > DEFAULT_LINE_SIDE_EPS}",
+            f"side_state={self._side_label(side)}",
             f"side={side:.4f}",
             f"point={self._format_point(point)}",
         ]
+        if in_active_zone is not None:
+            parts.append(f"in_active_zone={self._bool_label(in_active_zone)}")
+        if out_zone_armed is not None:
+            parts.append(f"out_zone_armed={self._bool_label(out_zone_armed)}")
+        if active_zone_streak is not None:
+            parts.append(f"zone_streak={active_zone_streak}")
         if elapsed is not None:
             parts.append(f"elapsed={elapsed:.2f}s")
         print(" ".join(parts))
@@ -589,14 +860,35 @@ class PeopleCounter:
             parts.append(f"point={self._format_point(point)}")
         print(" ".join(parts))
 
-    def _should_accumulate_line_frames(self, point: tuple[float, float] | None) -> bool:
+    def _is_inside_active_zone(self, point: tuple[float, float] | None) -> bool:
         if point is None:
             return False
-        for area in self.frame_exclude_areas:
+        if not self.active_zones:
+            return True
+        for area in self.active_zones:
             polygon = area.get("points", [])
             if len(polygon) >= 3 and _point_in_polygon(point, polygon):
-                return False
-        return True
+                return True
+        return False
+
+    def _line_crossing_point(
+        self,
+        prev_point: tuple[float, float] | None,
+        curr_point: tuple[float, float] | None,
+        prev_side: float,
+        curr_side: float,
+    ) -> tuple[float, float] | None:
+        if prev_point is None or curr_point is None:
+            return None
+        denominator = prev_side - curr_side
+        if abs(denominator) <= 1e-9:
+            return None
+        t = prev_side / denominator
+        t = max(0.0, min(1.0, t))
+        return (
+            prev_point[0] + ((curr_point[0] - prev_point[0]) * t),
+            prev_point[1] + ((curr_point[1] - prev_point[1]) * t),
+        )
 
     def _bbox_bottom_center_point(self, bbox: list[float], frame_w: int, frame_h: int) -> tuple[float, float]:
         x1, y1, x2, y2 = bbox
@@ -640,6 +932,11 @@ class PeopleCounter:
             return DEFAULT_LINE_OUT_MAX_TRACK_FRAMES
         return None
 
+    def _out_zone_arm_min_frames(self, line_cfg: dict) -> int:
+        if self._line_count_event(line_cfg) == LINE_EVENT_OUT:
+            return max(1, int(line_cfg.get("out_zone_arm_frames", DEFAULT_OUT_ZONE_ARM_MIN_FRAMES) or DEFAULT_OUT_ZONE_ARM_MIN_FRAMES))
+        return 1
+
     def _line_target_side_value(self, line_cfg: dict, point: tuple[float, float]) -> float:
         points = line_cfg.get("points", [])
         if len(points) < 2:
@@ -658,6 +955,7 @@ class PeopleCounter:
             "total_out": 0,
             "occupancy": 0,
             "lines": self.lines,
+            "active_zones": self.active_zones,
             "frame_exclude_areas": self.frame_exclude_areas,
         }
 

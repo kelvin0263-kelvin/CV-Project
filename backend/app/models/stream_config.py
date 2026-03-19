@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, Integer, Boolean, ForeignKey
+from sqlalchemy import Column, String, Integer, Boolean, ForeignKey, JSON
 from sqlalchemy.orm import relationship
 from app.models.base import Base
 
@@ -13,6 +13,7 @@ class StreamConfig(Base):
     runtime_key = Column(String(1500), nullable=False, default="")
     view_index = Column(Integer, nullable=False, default=-1)
     is_fisheye = Column(Boolean, nullable=False, default=False)
+    detection_roi = Column(JSON, nullable=True)
 
     # Relationship back to Camera
     camera = relationship("Camera", backref="stream_config", uselist=False)

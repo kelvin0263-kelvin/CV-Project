@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Any
 
 
 class CameraCreate(BaseModel):
@@ -18,6 +18,7 @@ class CameraCreate(BaseModel):
     source_path: Optional[str] = None
     view_index: int = -1
     is_fisheye: bool = False
+    detection_roi: Optional[dict[str, Any]] = None
 
 
 class CameraRead(BaseModel):
@@ -36,6 +37,7 @@ class CameraRead(BaseModel):
     source_path: Optional[str] = None
     view_index: int = -1
     is_fisheye: bool = False
+    detection_roi: Optional[dict[str, Any]] = None
     analysis_tags: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
@@ -56,3 +58,4 @@ class CameraUpdate(BaseModel):
     source_path: Optional[str] = None
     view_index: Optional[int] = None
     is_fisheye: Optional[bool] = None
+    detection_roi: Optional[dict[str, Any]] = None

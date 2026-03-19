@@ -40,6 +40,10 @@ from app.services.building_counter import (
     reset_building_runtime,
     sync_building_runtime,
 )
+from app.services.cross_camera_verifier import (
+    reset_cross_camera_state,
+    sync_cross_camera_runtime,
+)
 
 router = APIRouter()
 BUILDING_SNAPSHOT_HEARTBEAT_SEC = 300.0
@@ -82,6 +86,11 @@ def _serialize_counting_config_row(row: PeopleCountingConfig) -> dict:
         "enabled": row.enabled,
         "participate_in_building_count": row.participate_in_building_count,
         "entrance_id": row.entrance_id,
+        "cross_camera_enabled": row.cross_camera_enabled,
+        "cross_camera_pair_id": row.cross_camera_pair_id,
+        "cross_camera_role": row.cross_camera_role,
+        "verification_camera_id": row.verification_camera_id,
+        "verification_inward_threshold": row.verification_inward_threshold,
         "lines": row.lines or [],
         "frame_exclude_areas": frame_exclude_areas,
     }
@@ -114,6 +123,11 @@ def _cache_config(camera_id: str, row: PeopleCountingConfig):
         "enabled": row.enabled,
         "participate_in_building_count": row.participate_in_building_count,
         "entrance_id": row.entrance_id,
+        "cross_camera_enabled": row.cross_camera_enabled,
+        "cross_camera_pair_id": row.cross_camera_pair_id,
+        "cross_camera_role": row.cross_camera_role,
+        "verification_camera_id": row.verification_camera_id,
+        "verification_inward_threshold": row.verification_inward_threshold,
         "lines": row.lines or [],
         "frame_exclude_areas": frame_exclude_areas,
     }
@@ -163,6 +177,13 @@ def _build_empty_live_count(camera_id: str) -> dict:
         "total_in": 0,
         "total_out": 0,
         "occupancy": 0,
+        "raw_total_in": 0,
+        "verification_confirmed_in": 0,
+        "verification_correction_in": 0,
+        "verification_camera_id": None,
+        "cross_camera_pair_id": None,
+        "cross_camera_active_event": None,
+        "cross_camera_last_event": None,
         "lines": config.get("lines", []),
         "frame_exclude_areas": config.get("frame_exclude_areas", []),
     }
@@ -502,6 +523,60 @@ def _validate_building_entrance_fields(
         raise HTTPException(status_code=400, detail="entrance_id is required when building counting is enabled for a camera.")
 
 
+def _normalize_cross_camera_role(raw_value: str | None) -> str:
+    value = (raw_value or "none").strip().lower()
+    return value if value in {"none", "primary", "verifier"} else "none"
+
+
+def _normalize_cross_camera_pair_id(raw_value: str | None) -> str | None:
+    value = (raw_value or "").strip()
+    return value or None
+
+
+def _coerce_cross_camera_role(
+    *,
+    enabled: bool,
+    requested_role: str,
+    existing_role: str,
+    verification_camera_id: str | None,
+) -> str:
+    if not enabled:
+        return "none"
+
+    normalized_requested = _normalize_cross_camera_role(requested_role)
+    if normalized_requested in {"primary", "verifier"}:
+        return normalized_requested
+
+    normalized_existing = _normalize_cross_camera_role(existing_role)
+    if normalized_existing in {"primary", "verifier"}:
+        return normalized_existing
+
+    if verification_camera_id:
+        return "primary"
+    return "verifier"
+
+
+def _validate_cross_camera_fields(
+    *,
+    camera_id: str,
+    cross_camera_enabled: bool,
+    cross_camera_pair_id: str | None,
+    cross_camera_role: str,
+    verification_camera_id: str | None,
+):
+    if not cross_camera_enabled:
+        return
+    if cross_camera_role not in {"primary", "verifier"}:
+        raise HTTPException(status_code=400, detail="cross_camera_role must be 'primary' or 'verifier' when cross-camera verification is enabled.")
+    if not cross_camera_pair_id:
+        raise HTTPException(status_code=400, detail="cross_camera_pair_id is required when cross-camera verification is enabled.")
+    if cross_camera_role == "primary":
+        if not verification_camera_id:
+            raise HTTPException(status_code=400, detail="verification_camera_id is required for a primary cross-camera counting config.")
+        if verification_camera_id == camera_id:
+            raise HTTPException(status_code=400, detail="verification_camera_id must be a different camera.")
+
+
 async def sync_counting_runtime_from_db(session: AsyncSession):
     """
     Rebuild counting caches from the database.
@@ -523,6 +598,11 @@ async def sync_counting_runtime_from_db(session: AsyncSession):
             "enabled": row.enabled,
             "participate_in_building_count": row.participate_in_building_count,
             "entrance_id": row.entrance_id,
+            "cross_camera_enabled": row.cross_camera_enabled,
+            "cross_camera_pair_id": row.cross_camera_pair_id,
+            "cross_camera_role": row.cross_camera_role,
+            "verification_camera_id": row.verification_camera_id,
+            "verification_inward_threshold": row.verification_inward_threshold,
             "lines": row.lines or [],
             "frame_exclude_areas": frame_exclude_areas,
         }
@@ -537,6 +617,7 @@ async def sync_counting_runtime_from_db(session: AsyncSession):
             }
 
     _counting_configs = new_configs
+    sync_cross_camera_runtime(new_configs)
     _live_counts = {
         camera_id: data
         for camera_id, data in _live_counts.items()
@@ -609,6 +690,40 @@ async def upsert_config(
         entrance_id=entrance_id,
     )
 
+    cross_camera_enabled = (
+        update.cross_camera_enabled
+        if update.cross_camera_enabled is not None
+        else (row.cross_camera_enabled if row is not None else False)
+    )
+    cross_camera_pair_id = (
+        _normalize_cross_camera_pair_id(update.cross_camera_pair_id)
+        if update.cross_camera_pair_id is not None
+        else (row.cross_camera_pair_id if row is not None else None)
+    )
+    verification_camera_id = (
+        _normalize_entrance_id(update.verification_camera_id)
+        if update.verification_camera_id is not None
+        else (row.verification_camera_id if row is not None else None)
+    )
+    cross_camera_role = _coerce_cross_camera_role(
+        enabled=bool(cross_camera_enabled),
+        requested_role=update.cross_camera_role if update.cross_camera_role is not None else (row.cross_camera_role if row is not None else "none"),
+        existing_role=row.cross_camera_role if row is not None else "none",
+        verification_camera_id=verification_camera_id,
+    )
+    verification_inward_threshold = (
+        float(update.verification_inward_threshold)
+        if update.verification_inward_threshold is not None
+        else float(row.verification_inward_threshold if row is not None else 0.02)
+    )
+    _validate_cross_camera_fields(
+        camera_id=camera_id,
+        cross_camera_enabled=bool(cross_camera_enabled),
+        cross_camera_pair_id=cross_camera_pair_id,
+        cross_camera_role=cross_camera_role,
+        verification_camera_id=verification_camera_id,
+    )
+
     frame_exclude_areas = None
     if update.frame_exclude_areas is not None:
         frame_exclude_areas = _normalize_frame_exclude_areas(update.frame_exclude_areas)
@@ -621,6 +736,11 @@ async def upsert_config(
             enabled=update.enabled if update.enabled is not None else True,
             participate_in_building_count=bool(participate_in_building_count),
             entrance_id=entrance_id,
+            cross_camera_enabled=bool(cross_camera_enabled),
+            cross_camera_pair_id=cross_camera_pair_id,
+            cross_camera_role=cross_camera_role,
+            verification_camera_id=verification_camera_id,
+            verification_inward_threshold=max(0.0, verification_inward_threshold),
             lines=update.lines or [],
             frame_exclude_areas=frame_exclude_areas or [],
         )
@@ -633,6 +753,16 @@ async def upsert_config(
             row.participate_in_building_count = update.participate_in_building_count
         if update.entrance_id is not None:
             row.entrance_id = entrance_id
+        if update.cross_camera_enabled is not None:
+            row.cross_camera_enabled = bool(cross_camera_enabled)
+        if update.cross_camera_pair_id is not None:
+            row.cross_camera_pair_id = cross_camera_pair_id
+        if update.cross_camera_role is not None or row.cross_camera_enabled:
+            row.cross_camera_role = cross_camera_role
+        if update.verification_camera_id is not None:
+            row.verification_camera_id = verification_camera_id
+        if update.verification_inward_threshold is not None:
+            row.verification_inward_threshold = max(0.0, verification_inward_threshold)
         if update.lines is not None:
             row.lines = update.lines
         if frame_exclude_areas is not None:
@@ -640,6 +770,12 @@ async def upsert_config(
 
     if not row.participate_in_building_count:
         row.entrance_id = None
+    if not row.cross_camera_enabled:
+        row.cross_camera_pair_id = None
+        row.cross_camera_role = "none"
+        row.verification_camera_id = None
+    elif row.cross_camera_role == "primary":
+        row.verification_camera_id = verification_camera_id
 
     await db.flush()
     await db.refresh(row)
@@ -690,6 +826,7 @@ async def get_summary():
 async def reset_camera_counting(camera_id: str):
     request_counting_reset(camera_id)
     reset_camera_rollup(camera_id)
+    reset_cross_camera_state(camera_id)
     _last_saved_snapshot_signature.pop(camera_id, None)
 
     empty_data = _build_empty_live_count(camera_id)
