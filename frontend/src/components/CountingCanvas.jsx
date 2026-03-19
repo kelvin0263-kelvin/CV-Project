@@ -8,7 +8,7 @@ import React, { useRef, useEffect, useState, useCallback } from 'react';
  * compensating for object-contain letterboxing/pillarboxing.
  *
  * Props:
- *   lines            - array of line configs [{id, name, points, direction}]
+ *   lines            - array of line configs [{id, name, points, direction, line_type}]
  *   frameExcludeAreas - array of active zones [{id, name, points}]
  *   countingData     - live counting data from WebSocket
  *   drawingMode      - 'line' | 'frame_exclude' | null
@@ -26,6 +26,34 @@ const FRAME_EXCLUDE_COLORS = {
 const DRAWING_COLORS = {
     frame_exclude: FRAME_EXCLUDE_COLORS,
     default: { fill: 'rgba(59, 130, 246, 0.15)', stroke: '#3b82f6', label: '#3b82f6' },  // blue
+};
+
+const getLineType = (line) => line?.line_type === 'foot_traffic' ? 'foot_traffic' : 'occupancy';
+const getFootTrafficLabelsForLine = (line) => {
+    const points = Array.isArray(line?.points) ? line.points : [];
+    if (points.length >= 2) {
+        const [start, end] = points;
+        const dx = Number(end?.[0] ?? 0) - Number(start?.[0] ?? 0);
+        const dy = Number(end?.[1] ?? 0) - Number(start?.[1] ?? 0);
+        if (Math.abs(dy) >= Math.abs(dx)) {
+            return { negative: 'Left', positive: 'Right', shortNegative: 'L', shortPositive: 'R', mode: 'left_right' };
+        }
+    }
+    return { negative: 'Up', positive: 'Down', shortNegative: 'U', shortPositive: 'D', mode: 'up_down' };
+};
+
+const getFootTrafficSummaryLabels = (lines) => {
+    const ftLines = Array.isArray(lines) ? lines.filter((line) => getLineType(line) === 'foot_traffic') : [];
+    if (!ftLines.length) {
+        return { negative: 'Left', positive: 'Right', shortNegative: 'L', shortPositive: 'R', mixed: false };
+    }
+    const labels = ftLines.map(getFootTrafficLabelsForLine);
+    const firstMode = labels[0].mode;
+    const mixed = labels.some((label) => label.mode !== firstMode);
+    if (mixed) {
+        return { negative: 'Direction A', positive: 'Direction B', shortNegative: 'A', shortPositive: 'B', mixed: true };
+    }
+    return { ...labels[0], mixed: false };
 };
 
 const CountingCanvas = ({
@@ -181,8 +209,9 @@ const CountingCanvas = ({
     const renderLine = (line, index) => {
         const pts = line.points || [];
         if (pts.length < 2) return null;
-        const countEvent = line.count_event === 'out' ? 'OUT' : 'IN';
-        const lineColor = line.count_event === 'out' ? '#ef4444' : '#facc15';
+        const isFootTraffic = line.line_type === 'foot_traffic';
+        const countEvent = isFootTraffic ? 'FT' : (line.count_event === 'out' ? 'OUT' : 'IN');
+        const lineColor = isFootTraffic ? '#06b6d4' : (line.count_event === 'out' ? '#ef4444' : '#facc15');
         const p1 = toPx(pts[0][0], pts[0][1]);
         const p2 = toPx(pts[1][0], pts[1][1]);
         const midX = (p1.x + p2.x) / 2;
@@ -309,7 +338,13 @@ const CountingCanvas = ({
         return elements;
     };
 
-    const isCountingActive = countingData && countingData.total_in !== undefined;
+    const isCountingActive = countingData && (
+        countingData.total_in !== undefined
+        || countingData.foot_traffic_total !== undefined
+    );
+    const showFootTraffic = Number(countingData?.foot_traffic_total ?? 0) > 0
+        || (Array.isArray(countingData?.foot_traffic_lines) && countingData.foot_traffic_lines.length > 0);
+    const footTrafficLabels = getFootTrafficSummaryLabels(countingData?.lines);
 
     return (
         <svg
@@ -342,23 +377,30 @@ const CountingCanvas = ({
             {isCountingActive && (
                 <g>
                     <rect x={videoArea.offsetX + videoArea.displayW - 140}
-                          y={videoArea.offsetY + videoArea.displayH - 50}
-                          width="130" height="42" rx="8" fill="rgba(0,0,0,0.7)" />
+                          y={videoArea.offsetY + videoArea.displayH - (showFootTraffic ? 66 : 50)}
+                          width="130" height={showFootTraffic ? '58' : '42'} rx="8" fill="rgba(0,0,0,0.7)" />
                     <text x={videoArea.offsetX + videoArea.displayW - 125}
-                          y={videoArea.offsetY + videoArea.displayH - 30}
+                          y={videoArea.offsetY + videoArea.displayH - (showFootTraffic ? 46 : 30)}
                           fill="#22c55e" fontSize="12" fontWeight="bold">
-                        IN: {countingData.total_in}
+                        IN: {countingData.total_in ?? 0}
                     </text>
                     <text x={videoArea.offsetX + videoArea.displayW - 60}
-                          y={videoArea.offsetY + videoArea.displayH - 30}
+                          y={videoArea.offsetY + videoArea.displayH - (showFootTraffic ? 46 : 30)}
                           fill="#ef4444" fontSize="12" fontWeight="bold">
-                        OUT: {countingData.total_out}
+                        OUT: {countingData.total_out ?? 0}
                     </text>
                     <text x={videoArea.offsetX + videoArea.displayW - 125}
-                          y={videoArea.offsetY + videoArea.displayH - 14}
+                          y={videoArea.offsetY + videoArea.displayH - (showFootTraffic ? 30 : 14)}
                           fill="#fff" fontSize="11">
                         Now: {countingData.occupancy ?? 0}
                     </text>
+                    {showFootTraffic && (
+                        <text x={videoArea.offsetX + videoArea.displayW - 125}
+                              y={videoArea.offsetY + videoArea.displayH - 14}
+                              fill="#67e8f9" fontSize="10.5" fontWeight="bold">
+                            FT {footTrafficLabels.shortNegative}:{countingData.foot_traffic_left ?? 0} {footTrafficLabels.shortPositive}:{countingData.foot_traffic_right ?? 0} T:{countingData.foot_traffic_total ?? 0}
+                        </text>
+                    )}
                 </g>
             )}
         </svg>

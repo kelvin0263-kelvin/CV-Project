@@ -43,6 +43,7 @@ from app.services.fall_detector import is_person_in_fall_pose
 from app.services.building_counter import ingest_sensor_events
 from app.services.cross_camera_verifier import (
     apply_primary_camera_correction,
+    get_verifier_camera_status,
     observe_verifier_tracks,
     register_primary_in_events,
     reset_cross_camera_state,
@@ -230,6 +231,14 @@ def _set_runtime_stream_status(
     clear_images: bool = False,
 ):
     with PRODUCER_LOCK:
+        producer_meta = dict(PRODUCER_META.get(runtime_key, {}))
+        producer_meta["stream_status"] = status
+        if reason:
+            producer_meta["stream_reason"] = reason
+        else:
+            producer_meta.pop("stream_reason", None)
+        PRODUCER_META[runtime_key] = producer_meta
+
         current_buffer = FRAME_BUFFERS.get(runtime_key)
         if clear_images or current_buffer is None:
             current_buffer = {}
@@ -1345,7 +1354,6 @@ def _cleanup_producer_state(runtime_key: str, clear_frame_buffer: bool):
     with PRODUCER_LOCK:
         PRODUCER_THREADS.pop(runtime_key, None)
         PRODUCER_STOP_EVENTS.pop(runtime_key, None)
-        PRODUCER_META.pop(runtime_key, None)
     if clear_frame_buffer:
         FRAME_BUFFERS.pop(runtime_key, None)
 
@@ -1365,6 +1373,7 @@ def video_producer(
 ):
     print(f"[Producer] Starting loop for runtime_key={runtime_key}, source={source_path}")
     _set_runtime_stream_status(runtime_key, status="connecting", reason="initializing", clear_images=True)
+    reached_eof = False
 
     if stop_event is None:
         stop_event = threading.Event()
@@ -1416,6 +1425,7 @@ def video_producer(
         return
 
     local_model = None
+    local_models_by_view: dict[str, YOLO] = {}
     use_batch_infer = MULTI_STREAM_BATCH_INFER and not _pose_model_uses_engine()
     if MULTI_STREAM_BATCH_INFER and not use_batch_infer:
         print("[Producer] TensorRT engine detected; disabling shared multi-stream batching.")
@@ -1438,6 +1448,22 @@ def video_producer(
             cap.release()
             _cleanup_producer_state(runtime_key, clear_frame_buffer=True)
             return
+
+    def _get_local_model_for_view(view_key: str) -> YOLO | None:
+        if local_model is None:
+            return None
+        if not is_fisheye:
+            return local_model
+
+        model_for_view = local_models_by_view.get(view_key)
+        if model_for_view is None:
+            # The TensorRT fallback path uses persist=True inside YOLO.track(),
+            # so fisheye partitions need isolated model instances to avoid
+            # sharing one tracker namespace across views.
+            print(f"[Producer] Loading isolated YOLO model for runtime_key={runtime_key}, view={view_key}")
+            model_for_view = _load_pose_model()
+            local_models_by_view[view_key] = model_for_view
+        return model_for_view
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -1542,7 +1568,8 @@ def video_producer(
                 need_fall_detection=need_fall_detection,
             )
 
-        if local_model is None:
+        model_for_view = _get_local_model_for_view(view_key)
+        if model_for_view is None:
             return _empty_detection_result(track_state)
 
         try:
@@ -1563,7 +1590,7 @@ def video_producer(
             if YOLO_DEVICE:
                 track_kwargs["device"] = YOLO_DEVICE
 
-            results = local_model.track(**track_kwargs)
+            results = model_for_view.track(**track_kwargs)
             infer_predict_ms = (time.perf_counter() - detect_started_at) * 1000.0
 
             if not results:
@@ -1869,6 +1896,7 @@ def video_producer(
                 reset_cross_camera_state(camera_id)
             now_ts = time.time()
             observe_verifier_tracks(camera_id, detections_unscaled, config, frame_shape, now_ts)
+            verifier_status = get_verifier_camera_status(camera_id)
             counting_event_state[view_key] = {
                 "total_in": 0,
                 "total_out": 0,
@@ -1879,6 +1907,10 @@ def video_producer(
                 "total_in": 0,
                 "total_out": 0,
                 "occupancy": 0,
+                "foot_traffic_left": 0,
+                "foot_traffic_right": 0,
+                "foot_traffic_total": 0,
+                "foot_traffic_lines": [],
                 "raw_total_in": 0,
                 "verification_confirmed_in": 0,
                 "verification_correction_in": 0,
@@ -1890,6 +1922,7 @@ def video_producer(
                 "active_zones": config.get("active_zones", config.get("frame_exclude_areas", [])),
                 "frame_exclude_areas": config.get("frame_exclude_areas", []),
             }
+            counting_data.update(verifier_status)
             update_live_counts(camera_id, counting_data)
             return counting_data
 
@@ -2156,6 +2189,7 @@ def video_producer(
                 break
             if packet_type == "eof":
                 print(f"[Producer] EOF reached, stopping uploaded source: {source_path}")
+                reached_eof = True
                 break
             if packet_type != "frame":
                 continue
@@ -2181,6 +2215,7 @@ def video_producer(
                 # Uploaded file source reached EOF: stop producer automatically.
                 if source_meta.get("is_uploaded_source") and source_meta.get("is_file_source"):
                     print(f"[Producer] EOF reached, stopping uploaded source: {source_path}")
+                    reached_eof = True
                     break
 
                 if source_meta.get("is_network_stream_source"):
@@ -2361,7 +2396,8 @@ def video_producer(
         async_reader.close()
     else:
         cap.release()
-    _set_runtime_stream_status(runtime_key, status="offline", reason="stopped", clear_images=True)
+    final_reason = "finished" if reached_eof else "stopped"
+    _set_runtime_stream_status(runtime_key, status="offline", reason=final_reason, clear_images=True)
     _cleanup_producer_state(runtime_key, clear_frame_buffer=True)
     print(f"[Producer] Stopped loop for runtime_key={runtime_key}, source={source_path}")
 

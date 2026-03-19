@@ -143,7 +143,7 @@ const DressCode = () => {
                             <input
                                 type="range"
                                 min="50"
-                                max="99"
+                                max="100"
                                 value={confidence}
                                 onChange={(e) => { setConfidence(Number(e.target.value)); setSaved(false); }}
                                 className="w-full h-2 bg-secondary rounded-lg appearance-none cursor-pointer accent-primary"

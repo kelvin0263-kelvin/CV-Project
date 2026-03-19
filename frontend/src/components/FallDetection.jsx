@@ -25,6 +25,8 @@ const FallDetection = () => {
     const [saving, setSaving] = useState(false);
     const [saveMessage, setSaveMessage] = useState('');
     const [stats, setStats] = useState({ fps: 0, people_count: 0 });
+    const [runtimePreviewImage, setRuntimePreviewImage] = useState('');
+    const [loadingRuntimePreview, setLoadingRuntimePreview] = useState(false);
 
     const handle401 = useCallback(() => {
         clearAuthSession();
@@ -213,6 +215,52 @@ const FallDetection = () => {
 
     const selectedCam = cameras.find((camera) => camera.id === selectedCamera);
     const wsUrl = selectedCamera ? getWSUrl(`/ws/${selectedCamera}`) : null;
+    const showStoppedUploadPreview = Boolean(
+        selectedCam?.is_uploaded && !selectedCam?.producer_running,
+    );
+
+    useEffect(() => {
+        let cancelled = false;
+
+        const loadRuntimePreview = async () => {
+            if (!selectedCam?.runtime_key || !showStoppedUploadPreview) {
+                setRuntimePreviewImage('');
+                setLoadingRuntimePreview(false);
+                return;
+            }
+
+            setLoadingRuntimePreview(true);
+            try {
+                const res = await fetch(`${apiUrl}/api/upload-videos/preview`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ runtime_key: selectedCam.runtime_key }),
+                });
+                const data = await res.json().catch(() => ({}));
+                if (cancelled) {
+                    return;
+                }
+                if (!res.ok || !data.preview_image) {
+                    throw new Error(data.detail || 'Preview unavailable.');
+                }
+                setRuntimePreviewImage(`data:image/jpeg;base64,${data.preview_image}`);
+            } catch (err) {
+                if (!cancelled) {
+                    console.error('Failed to load fall detection preview:', err);
+                    setRuntimePreviewImage('');
+                }
+            } finally {
+                if (!cancelled) {
+                    setLoadingRuntimePreview(false);
+                }
+            }
+        };
+
+        loadRuntimePreview();
+        return () => {
+            cancelled = true;
+        };
+    }, [apiUrl, selectedCam, showStoppedUploadPreview]);
 
     return (
         <div className="flex flex-col h-full space-y-6">
@@ -331,13 +379,27 @@ const FallDetection = () => {
                 <Card className="lg:col-span-2 overflow-hidden flex flex-col bg-black">
                     <div ref={videoContainerRef} className="relative flex-1 min-h-[400px]">
                         {wsUrl ? (
-                            <StreamPlayer
-                                wsUrl={wsUrl}
-                                className="w-full h-full"
-                                alt={selectedCam?.name || 'Camera Feed'}
-                                onStats={handleStats}
-                                overlayMode="fall"
-                            />
+                            showStoppedUploadPreview ? (
+                                runtimePreviewImage ? (
+                                    <img
+                                        src={runtimePreviewImage}
+                                        alt={selectedCam?.name || 'Camera Preview'}
+                                        className="h-full w-full object-contain"
+                                    />
+                                ) : (
+                                    <div className="absolute inset-0 flex items-center justify-center text-muted-foreground">
+                                        <p>{loadingRuntimePreview ? 'Loading preview...' : 'Preview unavailable for this uploaded video.'}</p>
+                                    </div>
+                                )
+                            ) : (
+                                <StreamPlayer
+                                    wsUrl={wsUrl}
+                                    className="w-full h-full"
+                                    alt={selectedCam?.name || 'Camera Feed'}
+                                    onStats={handleStats}
+                                    overlayMode="fall"
+                                />
+                            )
                         ) : (
                             <div className="absolute inset-0 flex items-center justify-center text-muted-foreground">
                                 <p>Select a camera to view the feed</p>

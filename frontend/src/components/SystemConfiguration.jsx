@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Camera, FolderUp, Plus, Edit2, Trash2, Save, X, Loader2 } from 'lucide-react';
+import { useSearchParams } from 'react-router-dom';
+import { Camera, Plus, Edit2, Trash2, Save, X, Loader2 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardContent } from './ui/card';
 import { Button } from './ui/button';
 import { cn } from '../lib/utils';
@@ -7,6 +8,7 @@ import { Checkbox } from './ui/checkbox';
 import { Label } from './ui/label';
 import StreamPlayer from './StreamPlayer';
 import RoiEditorCanvas from './RoiEditorCanvas';
+import VideoUpload from './VideoUpload';
 import { getApiBaseUrl, getWSUrl } from '../apiConfig';
 
 const CAMERA_ANALYSIS_TAGS_UPDATED_EVENT = 'camera-analysis-tags-updated';
@@ -60,7 +62,12 @@ const parseResolutionString = (resolution) => {
 const SystemConfiguration = () => {
     const apiUrl = getApiBaseUrl();
     const previewContainerRef = useRef(null);
+    const [searchParams, setSearchParams] = useSearchParams();
     const [cameras, setCameras] = useState([]);
+    const [activeManagementTab, setActiveManagementTab] = useState(
+        searchParams.get('tab') === 'uploads' ? 'uploads' : 'streams'
+    );
+    const [activeStreamTab, setActiveStreamTab] = useState('added');
     const [isAddMode, setIsAddMode] = useState(false);
     const [isEditMode, setIsEditMode] = useState(false);
     const [selectedCamera, setSelectedCamera] = useState(null);
@@ -101,6 +108,11 @@ const SystemConfiguration = () => {
     }, []);
 
     useEffect(() => {
+        const requestedTab = searchParams.get('tab') === 'uploads' ? 'uploads' : 'streams';
+        setActiveManagementTab(requestedTab);
+    }, [searchParams]);
+
+    useEffect(() => {
         const handleCameraTagsUpdated = () => {
             fetchCameras();
         };
@@ -116,7 +128,7 @@ const SystemConfiguration = () => {
             console.log("SystemConfig fetching from:", apiUrl);
             const res = await fetch(`${apiUrl}/api/cameras`);
             const data = await res.json();
-            setCameras(data);
+            setCameras((Array.isArray(data) ? data : []).filter((camera) => !camera.is_uploaded));
         } catch (error) {
             console.error("Failed to fetch cameras:", error);
         }
@@ -161,6 +173,9 @@ const SystemConfiguration = () => {
 
     const handleAddClick = () => {
         resetForm();
+        setActiveManagementTab('streams');
+        setActiveStreamTab('form');
+        setSearchParams({}, { replace: true });
         setIsAddMode(true);
     };
 
@@ -183,12 +198,30 @@ const SystemConfiguration = () => {
         setIsDrawingSourceRoi(false);
         setStreamPreview(null);
         setSelectedCamera(cam);
+        setActiveManagementTab('streams');
+        setActiveStreamTab('form');
+        setSearchParams({}, { replace: true });
         setIsEditMode(true);
     };
 
-    const handleUploadClick = () => {
+    const handleShowStreams = () => {
         resetForm();
-        setShowUpload(true);
+        setActiveManagementTab('streams');
+        setActiveStreamTab('added');
+        setSearchParams({}, { replace: true });
+    };
+
+    const handleShowUploads = () => {
+        resetForm();
+        setActiveManagementTab('uploads');
+        setSearchParams({ tab: 'uploads' }, { replace: true });
+    };
+
+    const handleShowAddedStreams = () => {
+        resetForm();
+        setActiveManagementTab('streams');
+        setActiveStreamTab('added');
+        setSearchParams({}, { replace: true });
     };
 
     const handleInputChange = (e) => {
@@ -513,7 +546,11 @@ const SystemConfiguration = () => {
             const res = await fetch(`${apiUrl}/api/cameras/test-stream`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ source_path: formData.streamUrl.trim() }),
+                body: JSON.stringify({
+                    source_path: formData.streamUrl.trim(),
+                    enable_fisheye: enableFisheye,
+                    selected_view: Array.from(selectedViews)[0] ?? DEFAULT_FISHEYE_VIEW,
+                }),
                 signal: controller.signal,
             });
             clearTimeout(timeoutId);
@@ -552,42 +589,7 @@ const SystemConfiguration = () => {
     };
 
     const isStreamSource = (cam) =>
-        cam.type.includes('RTSP') || cam.type.includes('Network') || cam.type.includes('File') || cam.type.includes('Fisheye');
-
-    const handleStartSyncGroup = async () => {
-        if (!syncGroupId.trim()) {
-            setUploadMessage({ type: 'error', text: 'Please enter a sync group ID.' });
-            return;
-        }
-
-        setStartingSyncGroup(true);
-        setUploadMessage(null);
-        try {
-            const res = await fetch(`${apiUrl}/api/upload-sync-groups/${encodeURIComponent(syncGroupId.trim())}/start`, {
-                method: 'POST',
-            });
-            const data = await res.json().catch(() => ({}));
-            if (!res.ok) {
-                throw new Error(data.detail || 'Failed to start sync group.');
-            }
-
-            await fetchCameras();
-            await fetchSyncGroups();
-            setUploadMessage({
-                type: 'success',
-                text: `Started ${data.started_sources} source(s) in sync group "${data.group_id}".`,
-            });
-        } catch (err) {
-            setUploadMessage({
-                type: 'error',
-                text: err.message || 'Failed to start sync group.',
-            });
-        } finally {
-            setStartingSyncGroup(false);
-        }
-    };
-
-    const currentSyncGroup = syncGroups.find((group) => group.group_id === syncGroupId.trim());
+        cam.source_kind === 'rtsp' || cam.source_kind === 'network';
 
 
     return (
@@ -600,83 +602,118 @@ const SystemConfiguration = () => {
                 {/* Toolbar */}
                 <div className="flex items-center justify-between mb-4">
                     <div className="flex gap-2">
-                        <Button onClick={handleAddClick} className="flex items-center gap-2">
-                            <Plus className="w-4 h-4" /> Add Stream Camera
+                        <Button
+                            type="button"
+                            onClick={handleShowStreams}
+                            variant={activeManagementTab === 'streams' ? 'default' : 'outline'}
+                        >
+                            Live Stream Camera
                         </Button>
-                        <Button variant="outline" onClick={handleUploadClick} className="flex items-center gap-2">
-                            <FolderUp className="w-4 h-4" /> Upload Video Source
+                        <Button
+                            type="button"
+                            onClick={handleShowUploads}
+                            variant={activeManagementTab === 'uploads' ? 'default' : 'outline'}
+                        >
+                            Upload Video
                         </Button>
                     </div>
                     <div className="text-sm text-muted-foreground">
-                        {cameras.length} Sources Configured
+                        {activeManagementTab === 'streams'
+                            ? `${cameras.length} Live Sources Configured`
+                            : 'Manage uploaded video sources'}
                     </div>
                 </div>
 
                 {/* Content */}
                 <div className="flex-1 overflow-auto pr-2">
-                    {!isAddMode && !isEditMode && !showUpload && (
-                        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-                            {cameras.map((cam) => {
-                                const overlayMode = inferOverlayMode(cam.analysis_tags);
-                                return (
-                                <Card key={cam.id} className={cn("relative group overflow-hidden hover:border-primary/50 transition-all cursor-pointer border-muted", !cam.enabled && "opacity-60")}>
-                                    <div className="aspect-video bg-muted relative flex items-center justify-center bg-black">
-                                        {isStreamSource(cam) ? (
-                                            <StreamPlayer
-                                                wsUrl={getWSUrl(`/ws/${cam.id}`)}
-                                                className="w-full h-full"
-                                                alt="Live Stream"
-                                                overlayMode={overlayMode}
-                                                showCountingAnchors={overlayMode === 'counting'}
-                                            />
-                                        ) : (
-                                            <div className="flex flex-col items-center">
-                                                <Camera className="w-8 h-8 text-muted-foreground mb-2" />
-                                                <span className="text-xs text-muted-foreground">Live Stream</span>
-                                            </div>
-                                        )}
-
-                                        <div className="absolute top-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                                            {!cam.is_fisheye && (
-                                                <Button size="icon" variant="secondary" className="h-8 w-8" onClick={() => handleEditClick(cam)}>
-                                                    <Edit2 className="w-4 h-4" />
-                                                </Button>
-                                            )}
-                                            <Button size="icon" variant="destructive" className="h-8 w-8" onClick={() => handleDelete(cam.id)}>
-                                                <Trash2 className="w-4 h-4" />
-                                            </Button>
-                                        </div>
-                                        <div className={cn("absolute top-2 left-2 px-2 py-0.5 rounded text-xs font-medium", cam.enabled ? "bg-green-500/20 text-green-500" : "bg-red-500/20 text-red-500")}>
-                                            {cam.type}
-                                        </div>
-                                    </div>
-                                    <CardContent className="p-4">
-                                        <h3 className="font-semibold text-lg truncate" title={cam.name}>{cam.name}</h3>
-                                        <p className="text-sm text-muted-foreground truncate">
-                                            {cam.location || cam.source_path || 'No location configured'}
-                                        </p>
-                                        <div className="mt-3 flex flex-wrap gap-2">
-                                            {(Array.isArray(cam.analysis_tags) && cam.analysis_tags.length > 0
-                                                ? cam.analysis_tags
-                                                : ['Unassigned']
-                                            ).map((tag) => (
-                                                <span
-                                                    key={`${cam.id}-${tag}`}
-                                                    className="text-xs px-2 py-1 bg-secondary rounded-full"
-                                                >
-                                                    {tag}
-                                                </span>
-                                            ))}
-                                        </div>
-                                    </CardContent>
-                                </Card>
-                                );
-                            })}
+                    {activeManagementTab === 'streams' && (
+                        <div className="mb-4 flex gap-2">
+                            <Button
+                                type="button"
+                                onClick={handleShowAddedStreams}
+                                variant={activeStreamTab === 'added' && !isAddMode && !isEditMode ? 'default' : 'outline'}
+                            >
+                                Added Stream Camera
+                            </Button>
+                            <Button
+                                type="button"
+                                onClick={handleAddClick}
+                                className="flex items-center gap-2"
+                                variant={activeStreamTab === 'form' ? 'default' : 'outline'}
+                            >
+                                <Plus className="w-4 h-4" />
+                                {isEditMode ? 'Modify Stream Camera' : 'Add Stream Camera'}
+                            </Button>
                         </div>
                     )}
 
+                    {activeManagementTab === 'uploads' ? (
+                        <VideoUpload embedded />
+                    ) : (
+                        activeStreamTab === 'added' && !isAddMode && !isEditMode && !showUpload ? (
+                            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                                {cameras.map((cam) => {
+                                    const overlayMode = inferOverlayMode(cam.analysis_tags);
+                                    return (
+                                    <Card key={cam.id} className={cn("relative group overflow-hidden hover:border-primary/50 transition-all cursor-pointer border-muted", !cam.enabled && "opacity-60")}>
+                                        <div className="aspect-video bg-muted relative flex items-center justify-center bg-black">
+                                            {isStreamSource(cam) ? (
+                                                <StreamPlayer
+                                                    wsUrl={getWSUrl(`/ws/${cam.id}`)}
+                                                    className="w-full h-full"
+                                                    alt="Live Stream"
+                                                    overlayMode={overlayMode}
+                                                    showCountingAnchors={overlayMode === 'counting'}
+                                                />
+                                            ) : (
+                                                <div className="flex flex-col items-center">
+                                                    <Camera className="w-8 h-8 text-muted-foreground mb-2" />
+                                                    <span className="text-xs text-muted-foreground">Live Stream</span>
+                                                </div>
+                                            )}
+
+                                            <div className="absolute top-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                                {!cam.is_fisheye && (
+                                                    <Button size="icon" variant="secondary" className="h-8 w-8" onClick={() => handleEditClick(cam)}>
+                                                        <Edit2 className="w-4 h-4" />
+                                                    </Button>
+                                                )}
+                                                <Button size="icon" variant="destructive" className="h-8 w-8" onClick={() => handleDelete(cam.id)}>
+                                                    <Trash2 className="w-4 h-4" />
+                                                </Button>
+                                            </div>
+                                            <div className={cn("absolute top-2 left-2 px-2 py-0.5 rounded text-xs font-medium", cam.enabled ? "bg-green-500/20 text-green-500" : "bg-red-500/20 text-red-500")}>
+                                                {cam.type}
+                                            </div>
+                                        </div>
+                                        <CardContent className="p-4">
+                                            <h3 className="font-semibold text-lg truncate" title={cam.name}>{cam.name}</h3>
+                                            <p className="text-sm text-muted-foreground truncate">
+                                                {cam.location || cam.source_path || 'No location configured'}
+                                            </p>
+                                            <div className="mt-3 flex flex-wrap gap-2">
+                                                {(Array.isArray(cam.analysis_tags) && cam.analysis_tags.length > 0
+                                                    ? cam.analysis_tags
+                                                    : ['Unassigned']
+                                                ).map((tag) => (
+                                                    <span
+                                                        key={`${cam.id}-${tag}`}
+                                                        className="text-xs px-2 py-1 bg-secondary rounded-full"
+                                                    >
+                                                        {tag}
+                                                    </span>
+                                                ))}
+                                            </div>
+                                        </CardContent>
+                                    </Card>
+                                    );
+                                })}
+                            </div>
+                        ) : null
+                    )}
+
                     {/* Edit/Add/Upload Form Overlay */}
-                    {(isAddMode || isEditMode || showUpload) && (
+                    {activeManagementTab === 'streams' && activeStreamTab === 'form' && (isAddMode || isEditMode || showUpload) && (
                         <Card className="max-w-2xl mx-auto">
                             <CardHeader className="flex flex-row items-center justify-between">
                                 <CardTitle>

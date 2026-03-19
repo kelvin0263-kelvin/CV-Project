@@ -35,8 +35,13 @@ class CameraRead(BaseModel):
     enabled: bool
     image: str
     source_path: Optional[str] = None
+    runtime_key: Optional[str] = None
     view_index: int = -1
     is_fisheye: bool = False
+    is_uploaded: bool = False
+    is_rtsp: bool = False
+    source_kind: str = "other"
+    producer_running: bool = False
     detection_roi: Optional[dict[str, Any]] = None
     analysis_tags: list[str] = Field(default_factory=list)
 

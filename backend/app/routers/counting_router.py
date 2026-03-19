@@ -12,13 +12,14 @@ import asyncio
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete as sa_delete, desc
 
 from app.core.database import get_db, AsyncSessionLocal
+from app.core.video_capture import is_rtsp_source
 from app.models.camera_model import Camera
 from app.models.building_counting_config import BuildingCountingConfig
 from app.models.building_counting_snapshot import BuildingCountingSnapshot
@@ -58,6 +59,7 @@ _counting_configs: dict[str, dict] = {}  # camera_id -> config dict
 _counting_source_map: dict[str, set[str]] = {}
 # Reverse lookup: "runtime_key||view_key" -> camera_id (for cameras with counting)
 _counting_camera_resolve: dict[str, str] = {}
+_rtsp_counting_camera_ids: set[str] = set()
 
 
 def _normalize_frame_exclude_areas(
@@ -177,6 +179,10 @@ def _build_empty_live_count(camera_id: str) -> dict:
         "total_in": 0,
         "total_out": 0,
         "occupancy": 0,
+        "foot_traffic_left": 0,
+        "foot_traffic_right": 0,
+        "foot_traffic_total": 0,
+        "foot_traffic_lines": [],
         "raw_total_in": 0,
         "verification_confirmed_in": 0,
         "verification_correction_in": 0,
@@ -222,11 +228,21 @@ def _drain_building_snapshot_queue() -> list[dict]:
     return items
 
 
-def _snapshot_signature(total_in, total_out, current_occupancy) -> tuple[int, int, int]:
+def _snapshot_signature(
+    total_in,
+    total_out,
+    current_occupancy,
+    foot_traffic_left=0,
+    foot_traffic_right=0,
+    foot_traffic_total=0,
+) -> tuple[int, int, int, int, int, int]:
     return (
         int(total_in or 0),
         int(total_out or 0),
         int(current_occupancy or 0),
+        int(foot_traffic_left or 0),
+        int(foot_traffic_right or 0),
+        int(foot_traffic_total or 0),
     )
 
 
@@ -279,6 +295,9 @@ async def _is_duplicate_snapshot(session: AsyncSession, snapshot: dict) -> tuple
         snapshot.get("total_in"),
         snapshot.get("total_out"),
         snapshot.get("current_occupancy"),
+        snapshot.get("foot_traffic_left"),
+        snapshot.get("foot_traffic_right"),
+        snapshot.get("foot_traffic_total"),
     )
 
     cached_signature = _last_saved_snapshot_signature.get(camera_id)
@@ -294,6 +313,9 @@ async def _is_duplicate_snapshot(session: AsyncSession, snapshot: dict) -> tuple
                 latest_row.total_in,
                 latest_row.total_out,
                 latest_row.current_occupancy,
+                latest_row.foot_traffic_left,
+                latest_row.foot_traffic_right,
+                latest_row.foot_traffic_total,
             )
             _last_saved_snapshot_signature[camera_id] = cached_signature
 
@@ -348,6 +370,58 @@ def _queue_building_snapshot_if_needed(heartbeat_interval: float = BUILDING_SNAP
         queue_building_snapshot(_build_building_snapshot(summary))
         _last_queued_building_snapshot_signature = signature
         _last_building_snapshot_time = now
+
+
+def reset_all_runtime_counts():
+    """
+    Reset in-memory counting runtime across all cameras.
+    Historical rows already stored in the database are preserved.
+    """
+    global _last_saved_building_snapshot_signature, _last_queued_building_snapshot_signature, _last_building_snapshot_time
+
+    camera_ids = sorted(_rtsp_counting_camera_ids)
+    for camera_id in camera_ids:
+        request_counting_reset(camera_id)
+        reset_camera_rollup(camera_id)
+        reset_cross_camera_state(camera_id)
+        _last_saved_snapshot_signature.pop(camera_id, None)
+        update_live_counts(camera_id, _build_empty_live_count(camera_id))
+
+    _last_saved_building_snapshot_signature = None
+    _last_queued_building_snapshot_signature = None
+    _last_building_snapshot_time = 0.0
+
+    print(
+        " ".join(
+            [
+                "[CountingReset]",
+                "scope=daily_runtime_reset",
+                f"camera_count={len(camera_ids)}",
+                f"timestamp={datetime.now().astimezone().isoformat()}",
+            ]
+        )
+    )
+
+
+def _seconds_until_next_local_midnight(now: datetime | None = None) -> float:
+    local_now = now or datetime.now().astimezone()
+    next_midnight = (local_now + timedelta(days=1)).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    return max((next_midnight - local_now).total_seconds(), 1.0)
+
+
+async def daily_runtime_reset_loop():
+    """Reset in-memory counting state at the next local midnight, then repeat daily."""
+    while True:
+        await asyncio.sleep(_seconds_until_next_local_midnight())
+        try:
+            reset_all_runtime_counts()
+        except Exception as e:
+            print(f"[CountingReset] Daily runtime reset failed: {e}")
 
 
 def _coerce_snapshot_timestamp(raw_value) -> datetime:
@@ -415,6 +489,9 @@ async def counting_snapshot_persistence_loop():
                         total_in=snap.get("total_in", 0),
                         total_out=snap.get("total_out", 0),
                         current_occupancy=snap.get("current_occupancy", 0),
+                        foot_traffic_left=snap.get("foot_traffic_left", 0),
+                        foot_traffic_right=snap.get("foot_traffic_right", 0),
+                        foot_traffic_total=snap.get("foot_traffic_total", 0),
                     )
                     session.add(row)
                     await session.commit()
@@ -466,9 +543,10 @@ async def _rebuild_source_map(session: AsyncSession):
     Rebuild _counting_source_map and _counting_camera_resolve from the
     current in-memory configs + stream_configs in DB.
     """
-    global _counting_source_map, _counting_camera_resolve
+    global _counting_source_map, _counting_camera_resolve, _rtsp_counting_camera_ids
     new_source_map: dict[str, set[str]] = {}
     new_resolve: dict[str, str] = {}
+    new_rtsp_camera_ids: set[str] = set()
 
     enabled_camera_ids = [
         cid for cid, cfg in _counting_configs.items() if cfg.get("enabled", True)
@@ -486,9 +564,12 @@ async def _rebuild_source_map(session: AsyncSession):
                 new_source_map[runtime_key] = set()
             new_source_map[runtime_key].add(view_key)
             new_resolve[f"{runtime_key}||{view_key}"] = sc.camera_id
+            if is_rtsp_source(sc.source_path):
+                new_rtsp_camera_ids.add(sc.camera_id)
 
     _counting_source_map = new_source_map
     _counting_camera_resolve = new_resolve
+    _rtsp_counting_camera_ids = new_rtsp_camera_ids
 
 
 async def _get_or_create_building_config(session: AsyncSession) -> BuildingCountingConfig:

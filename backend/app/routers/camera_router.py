@@ -9,6 +9,9 @@ import cv2
 import base64
 import json
 import tempfile
+import time
+import threading
+import re
 
 from pydantic import BaseModel
 
@@ -20,8 +23,8 @@ from app.models.people_counting_config import PeopleCountingConfig
 from app.models.stream_config import StreamConfig
 from app.schemas.camera import CameraCreate, CameraRead
 from app.core.database import get_db, AsyncSessionLocal
-from app.core.globals import FRAME_BUFFERS
-from app.services.video_processor import start_producer_thread, stop_producer_thread
+from app.core.globals import FRAME_BUFFERS, PRODUCER_META, PRODUCER_LOCK
+from app.services.video_processor import start_producer_thread, stop_producer_thread, is_producer_running
 from app.services.source_roi_registry import replace_source_detection_rois
 from app.services.upload_sync import (
     discard_pending_runtime_key,
@@ -32,6 +35,7 @@ from app.services.upload_sync import (
 )
 from app.routers.policy_router import sync_policy_runtime_from_db
 from app.routers.counting_router import sync_counting_runtime_from_db
+from DefishVideoCV import FisheyeMultiView
 
 router = APIRouter()
 
@@ -52,6 +56,8 @@ WS_SEND_INTERVAL = 0.0 if WS_MAX_FPS <= 0 else 1.0 / WS_MAX_FPS
 
 class StreamConnectionTestRequest(BaseModel):
     source_path: str
+    enable_fisheye: bool = False
+    selected_view: int | None = None
 
 
 class StreamSourceCreateRequest(BaseModel):
@@ -65,6 +71,28 @@ class StreamSourceCreateRequest(BaseModel):
     enable_fisheye: bool = False
     selected_views: list[int] = []
     detection_roi: dict[str, Any] | None = None
+
+
+class UploadRuntimeActionRequest(BaseModel):
+    runtime_keys: list[str]
+
+
+class UploadPreviewRequest(BaseModel):
+    runtime_key: str
+
+
+FISHEYE_VIEW_CONFIGS = [
+    {"angle_z": 0, "angle_up": 35, "zoom": 80},
+    {"angle_z": 45, "angle_up": 35, "zoom": 80},
+    {"angle_z": 90, "angle_up": 35, "zoom": 80},
+    {"angle_z": 135, "angle_up": 35, "zoom": 80},
+    {"angle_z": 180, "angle_up": 35, "zoom": 80},
+    {"angle_z": 225, "angle_up": 35, "zoom": 80},
+    {"angle_z": 270, "angle_up": 35, "zoom": 80},
+    {"angle_z": 315, "angle_up": 35, "zoom": 80},
+]
+
+FISHEYE_UPLOAD_NAME_PATTERN = re.compile(r"^(?P<prefix>.+?)\s-\sView\s\d+\s*\([^)]*\)$")
 
 
 def _normalize_detection_roi(raw_roi: dict | None) -> dict | None:
@@ -103,6 +131,26 @@ def _default_ws_url(camera_id: str) -> str:
     return f"ws://localhost:8000/ws/{camera_id}"
 
 
+def _is_uploaded_source_path(source_path: str | None) -> bool:
+    if not source_path:
+        return False
+    try:
+        source_abs = os.path.abspath(source_path)
+        return os.path.commonpath([source_abs, UPLOAD_DIR]) == UPLOAD_DIR
+    except ValueError:
+        return False
+
+
+def _infer_source_kind(source_path: str | None) -> str:
+    if not source_path:
+        return "other"
+    if _is_uploaded_source_path(source_path):
+        return "uploaded_video"
+    if is_rtsp_source(source_path):
+        return "rtsp"
+    return "network"
+
+
 def _normalize_runtime_key(source_path: str, runtime_key: str | None = None) -> str:
     normalized_source = source_path.strip()
     normalized_runtime_key = (runtime_key or normalized_source).strip()
@@ -127,21 +175,35 @@ def _build_camera_read(
     stream_config: StreamConfig | None = None,
     analysis_tags: list[str] | None = None,
 ) -> CameraRead:
+    source_path = stream_config.source_path if stream_config is not None else None
+    runtime_key = _get_runtime_key(stream_config) if stream_config is not None else None
+    is_uploaded = _is_uploaded_source_path(source_path)
+    source_kind = _infer_source_kind(source_path)
+    producer_running = bool(runtime_key and is_producer_running(runtime_key))
+    status = camera.status
+    if is_uploaded:
+        status = _resolve_uploaded_runtime_status(runtime_key, producer_running)
+
     return CameraRead(
         id=camera.id,
         name=camera.name,
         location=camera.location,
         type=camera.type,
-        status=camera.status,
+        status=status,
         mode=camera.mode,
         ws_url=camera.ws_url or _default_ws_url(camera.id),
         resolution=camera.resolution,
         fps=camera.fps,
         enabled=camera.enabled,
         image=camera.image,
-        source_path=stream_config.source_path if stream_config is not None else None,
+        source_path=source_path,
+        runtime_key=runtime_key,
         view_index=stream_config.view_index if stream_config is not None else -1,
         is_fisheye=bool(stream_config.is_fisheye) if stream_config is not None else False,
+        is_uploaded=is_uploaded,
+        is_rtsp=bool(source_path and is_rtsp_source(source_path)),
+        source_kind=source_kind,
+        producer_running=producer_running,
         detection_roi=_normalize_detection_roi(stream_config.detection_roi) if stream_config is not None else None,
         analysis_tags=analysis_tags or [],
     )
@@ -160,6 +222,33 @@ async def sync_stream_roi_runtime_from_db(session: AsyncSession):
             next_map[f"{runtime_key}||{view_key}"] = normalized_roi
 
     replace_source_detection_rois(next_map)
+
+
+def _get_runtime_stream_state(runtime_key: str | None) -> dict[str, Any]:
+    if not runtime_key:
+        return {}
+
+    frame_meta = {}
+    if runtime_key in FRAME_BUFFERS:
+        frame_meta = dict((FRAME_BUFFERS.get(runtime_key) or {}).get("__meta__", {}))
+
+    with PRODUCER_LOCK:
+        producer_meta = dict(PRODUCER_META.get(runtime_key, {}))
+
+    if frame_meta:
+        producer_meta.update(frame_meta)
+    return producer_meta
+
+
+def _resolve_uploaded_runtime_status(runtime_key: str | None, producer_running: bool) -> str:
+    if producer_running:
+        return "Running"
+
+    runtime_state = _get_runtime_stream_state(runtime_key)
+    stream_reason = str(runtime_state.get("stream_reason") or "").lower()
+    if stream_reason == "finished":
+        return "Finished"
+    return "Ready"
 
 
 async def load_stream_roi_runtime_from_db():
@@ -242,7 +331,149 @@ async def _get_active_views_for_runtime(
     return active_views or None
 
 
+async def _get_uploaded_runtime_rows(
+    session: AsyncSession,
+    runtime_keys: list[str] | None = None,
+) -> list[tuple[Camera, StreamConfig]]:
+    result = await session.execute(
+        select(Camera, StreamConfig).join(StreamConfig, StreamConfig.camera_id == Camera.id)
+    )
+    rows = []
+    allowed_runtime_keys = set(runtime_keys or [])
+    for camera, stream_config in result.all():
+        if not _is_uploaded_source_path(stream_config.source_path):
+            continue
+        runtime_key = _get_runtime_key(stream_config)
+        if allowed_runtime_keys and runtime_key not in allowed_runtime_keys:
+            continue
+        rows.append((camera, stream_config))
+    return rows
+
+
+def _build_upload_runtime_payload(
+    runtime_key: str,
+    rows: list[tuple[Camera, StreamConfig]],
+    tags_map: dict[str, list[str]],
+) -> dict:
+    first_camera, first_stream = rows[0]
+    source_path = first_stream.source_path
+    unique_tags: list[str] = []
+    seen_tags: set[str] = set()
+    cameras_payload = []
+    for camera, stream_config in rows:
+        camera_tags = tags_map.get(camera.id, ["Unassigned"])
+        for tag in camera_tags:
+            if tag not in seen_tags:
+                unique_tags.append(tag)
+                seen_tags.add(tag)
+        cameras_payload.append(
+            _build_camera_read(camera, stream_config, analysis_tags=camera_tags).model_dump()
+        )
+
+    producer_running = is_producer_running(runtime_key)
+    status = _resolve_uploaded_runtime_status(runtime_key, producer_running)
+    first_camera_name = (first_camera.name or "").strip()
+    display_name = first_camera_name
+    matched_prefix = FISHEYE_UPLOAD_NAME_PATTERN.match(first_camera_name)
+    if matched_prefix:
+        display_name = matched_prefix.group("prefix").strip() or first_camera_name
+
+    return {
+        "runtime_key": runtime_key,
+        "source_path": source_path,
+        "file_name": os.path.basename(source_path),
+        "display_name": display_name or os.path.basename(source_path),
+        "source_kind": _infer_source_kind(source_path),
+        "is_fisheye": bool(first_stream.is_fisheye),
+        "selected_views": sorted({
+            int(stream_config.view_index)
+            for _, stream_config in rows
+            if stream_config.view_index is not None and int(stream_config.view_index) >= 0
+        }),
+        "primary_camera_id": first_camera.id,
+        "producer_running": producer_running,
+        "status": status,
+        "camera_count": len(rows),
+        "analysis_tags": unique_tags or ["Unassigned"],
+        "cameras": cameras_payload,
+        "uploaded_at": time.strftime(
+            "%Y-%m-%dT%H:%M:%S",
+            time.localtime(os.path.getmtime(source_path)),
+        ) if os.path.exists(source_path) else None,
+    }
+
+
+def _normalize_fisheye_view_index(selected_view: int | None) -> int:
+    try:
+        view_index = int(selected_view if selected_view is not None else 0)
+    except (TypeError, ValueError):
+        return 0
+    return view_index if 0 <= view_index < len(FISHEYE_VIEW_CONFIGS) else 0
+
+
+def _build_single_fisheye_view_config(selected_view: int | None) -> list[dict | None]:
+    normalized_index = _normalize_fisheye_view_index(selected_view)
+    configs: list[dict | None] = []
+    for index, config in enumerate(FISHEYE_VIEW_CONFIGS):
+        configs.append(config if index == normalized_index else None)
+    return configs
+
+
+def _apply_fisheye_preview(frame, selected_view: int | None):
+    if frame is None or not hasattr(frame, "shape"):
+        return frame
+    processor = FisheyeMultiView(
+        frame.shape[:2],
+        _build_single_fisheye_view_config(selected_view),
+        show_original=False,
+        use_cuda=False,
+        downscale_size=(640, 360),
+    )
+    normalized_index = _normalize_fisheye_view_index(selected_view)
+    processed_frames, _, _ = processor.process_frame(frame, overlay=False, view_id=f"partition_{normalized_index}")
+    preview_frame = processed_frames.get(f"partition_{normalized_index}")
+    return preview_frame if preview_frame is not None else frame
+
+
+async def _get_uploaded_runtime_stream(
+    session: AsyncSession,
+    runtime_key: str,
+) -> StreamConfig | None:
+    rows = await _get_uploaded_runtime_rows(session, [runtime_key])
+    if not rows:
+        return None
+    return rows[0][1]
+
+
+def _start_uploaded_runtime_members(members: list[dict]) -> int:
+    if not members:
+        return 0
+
+    sync_state = {"started_at": None}
+    if len(members) > 1:
+        sync_barrier = threading.Barrier(
+            len(members),
+            action=lambda: sync_state.__setitem__("started_at", time.perf_counter()),
+        )
+    else:
+        sync_barrier = None
+        sync_state["started_at"] = time.perf_counter()
+
+    for member in members:
+        start_producer_thread(
+            member["runtime_key"],
+            member["source_path"],
+            member["is_fisheye"],
+            member["active_views"],
+            sync_barrier=sync_barrier,
+            sync_state=sync_state,
+        )
+    return len(members)
+
+
 async def _ensure_stream_running(session: AsyncSession, stream_config: StreamConfig):
+    if _is_uploaded_source_path(stream_config.source_path):
+        return
     runtime_key = _get_runtime_key(stream_config)
     if is_pending_runtime_key(runtime_key):
         return
@@ -341,7 +572,12 @@ def _is_usable_preview_frame(frame) -> bool:
         return False
 
 
-def _probe_stream(source_path: str) -> dict:
+def _probe_stream(
+    source_path: str,
+    *,
+    enable_fisheye: bool = False,
+    selected_view: int | None = None,
+) -> dict:
     cap = _open_probe_capture(source_path)
     try:
         if not cap.isOpened():
@@ -366,14 +602,15 @@ def _probe_stream(source_path: str) -> dict:
         if frame is None:
             return {"ok": False, "detail": "Connected, but no frame was received."}
 
-        height, width = frame.shape[:2]
+        preview_source = _apply_fisheye_preview(frame, selected_view) if enable_fisheye else frame
+        height, width = preview_source.shape[:2]
         fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
-        preview = frame
+        preview = preview_source
         max_preview_w = 960
         if width > max_preview_w:
             scale = max_preview_w / float(width)
             preview = cv2.resize(
-                frame,
+                preview_source,
                 (max_preview_w, max(1, int(round(height * scale)))),
                 interpolation=cv2.INTER_AREA,
             )
@@ -384,6 +621,7 @@ def _probe_stream(source_path: str) -> dict:
             "resolution": f"{width}x{height}",
             "fps": round(float(fps), 1),
             "stream_kind": "rtsp" if is_rtsp_source(source_path) else "network",
+            "preview_view_index": _normalize_fisheye_view_index(selected_view) if enable_fisheye else None,
             "preview_image": base64.b64encode(preview_buf).decode("utf-8") if ok_jpg else None,
             "frame_width": int(width),
             "frame_height": int(height),
@@ -392,38 +630,63 @@ def _probe_stream(source_path: str) -> dict:
         cap.release()
 
 
-def _probe_uploaded_video_file(file_path: str) -> dict:
+def _probe_uploaded_video_file(
+    file_path: str,
+    *,
+    enable_fisheye: bool = False,
+    selected_view: int | None = None,
+) -> dict:
     cap = cv2.VideoCapture(file_path)
     try:
         if not cap.isOpened():
             return {"ok": False, "detail": "Unable to open uploaded video."}
 
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        seek_positions: list[int] = []
+        if frame_count > 0:
+            ratios = [0.02, 0.08, 0.15, 0.25, 0.4, 0.55, 0.7]
+            seek_positions = sorted({
+                max(0, min(frame_count - 1, int(frame_count * ratio)))
+                for ratio in ratios
+            })
+
         frame = None
         best_frame = None
-        for attempt in range(60):
-            ok, next_frame = cap.read()
-            if not ok or next_frame is None:
-                if attempt < 10:
+
+        def _try_read_candidate() -> bool:
+            nonlocal frame, best_frame
+            for _ in range(20):
+                ok, next_frame = cap.read()
+                if not ok or next_frame is None:
                     continue
-                break
-            frame = next_frame
-            if _is_usable_preview_frame(next_frame):
-                best_frame = next_frame
-                break
-            if best_frame is None:
-                best_frame = next_frame
+                frame = next_frame
+                if _is_usable_preview_frame(next_frame):
+                    best_frame = next_frame
+                    return True
+                if best_frame is None:
+                    best_frame = next_frame
+            return False
+
+        if seek_positions:
+            for frame_index in seek_positions:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                if _try_read_candidate():
+                    break
+        else:
+            _try_read_candidate()
 
         frame = best_frame if best_frame is not None else frame
         if frame is None:
             return {"ok": False, "detail": "Uploaded video did not yield a readable preview frame."}
 
-        height, width = frame.shape[:2]
-        preview = frame
+        preview_source = _apply_fisheye_preview(frame, selected_view) if enable_fisheye else frame
+        height, width = preview_source.shape[:2]
+        preview = preview_source
         max_preview_w = 960
         if width > max_preview_w:
             scale = max_preview_w / float(width)
             preview = cv2.resize(
-                frame,
+                preview_source,
                 (max_preview_w, max(1, int(round(height * scale)))),
                 interpolation=cv2.INTER_AREA,
             )
@@ -432,6 +695,7 @@ def _probe_uploaded_video_file(file_path: str) -> dict:
         return {
             "ok": True,
             "detail": "Upload preview generated successfully.",
+            "preview_view_index": _normalize_fisheye_view_index(selected_view) if enable_fisheye else None,
             "preview_image": base64.b64encode(preview_buf).decode("utf-8") if ok_jpg else None,
             "frame_width": int(width),
             "frame_height": int(height),
@@ -460,7 +724,8 @@ async def websocket_endpoint(websocket: WebSocket, camera_id: str):
             f"[WS] Config found for {camera_id}: source={config_row.source_path}, "
             f"runtime_key={runtime_key}, view={config_row.view_index}"
         )
-        await _ensure_stream_running(session, config_row)
+        if not _is_uploaded_source_path(config_row.source_path):
+            await _ensure_stream_running(session, config_row)
 
     runtime_key = _get_runtime_key(config_row)
     view_index = config_row.view_index
@@ -568,7 +833,7 @@ async def add_camera(camera: CameraCreate, db: AsyncSession = Depends(get_db)):
 
     await db.refresh(db_camera)
 
-    if stream_config is not None and db_camera.enabled:
+    if stream_config is not None and db_camera.enabled and not _is_uploaded_source_path(source_path):
         await _ensure_stream_running(db, stream_config)
         await _sync_runtime_state(db)
 
@@ -630,7 +895,7 @@ async def update_camera(camera_id: str, camera: CameraCreate, db: AsyncSession =
     if old_runtime_key and (old_source_path != source_path or stream_config is None):
         await _stop_producer_if_unused(db, old_runtime_key)
 
-    if stream_config is not None and db_camera.enabled:
+    if stream_config is not None and db_camera.enabled and not _is_uploaded_source_path(source_path):
         await _ensure_stream_running(db, stream_config)
 
     await _sync_runtime_state(db)
@@ -720,7 +985,14 @@ async def test_stream_connection(payload: StreamConnectionTestRequest):
 
     loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(None, _probe_stream, source_path)
+        return await loop.run_in_executor(
+            None,
+            lambda: _probe_stream(
+                source_path,
+                enable_fisheye=bool(payload.enable_fisheye),
+                selected_view=payload.selected_view,
+            ),
+        )
     except Exception as exc:
         return {
             "ok": False,
@@ -734,7 +1006,11 @@ async def test_rtsp_connection(payload: StreamConnectionTestRequest):
 
 
 @router.post("/api/cameras/upload-preview")
-async def preview_uploaded_video(file: UploadFile = File(...)):
+async def preview_uploaded_video(
+    file: UploadFile = File(...),
+    enable_fisheye: bool = Form(False),
+    selected_view: int = Form(0),
+):
     suffix = os.path.splitext(file.filename or "")[1] or ".mp4"
     temp_path = None
     try:
@@ -747,7 +1023,14 @@ async def preview_uploaded_video(file: UploadFile = File(...)):
                 temp_file.write(chunk)
 
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, _probe_uploaded_video_file, temp_path)
+        result = await loop.run_in_executor(
+            None,
+            lambda: _probe_uploaded_video_file(
+                temp_path,
+                enable_fisheye=bool(enable_fisheye),
+                selected_view=selected_view,
+            ),
+        )
         if not result.get("ok"):
             raise HTTPException(status_code=400, detail=result.get("detail") or "Unable to preview uploaded video.")
         return result
@@ -815,6 +1098,195 @@ async def start_upload_sync_group(group_id: str):
     }
 
 
+@router.get("/api/upload-videos")
+async def list_uploaded_videos(db: AsyncSession = Depends(get_db)):
+    rows = await _get_uploaded_runtime_rows(db)
+    runtime_groups: dict[str, list[tuple[Camera, StreamConfig]]] = {}
+    for camera, stream_config in rows:
+        runtime_groups.setdefault(_get_runtime_key(stream_config), []).append((camera, stream_config))
+
+    camera_ids = [camera.id for camera, _ in rows]
+    tags_map = await _derive_analysis_tags_by_camera(db, camera_ids)
+    items = [
+        _build_upload_runtime_payload(runtime_key, group_rows, tags_map)
+        for runtime_key, group_rows in sorted(
+            runtime_groups.items(),
+            key=lambda item: item[1][0][1].source_path.lower(),
+        )
+    ]
+    return {"items": items}
+
+
+@router.post("/api/upload-videos/start")
+async def start_uploaded_videos(
+    payload: UploadRuntimeActionRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    requested_runtime_keys = [
+        str(runtime_key).strip()
+        for runtime_key in (payload.runtime_keys or [])
+        if str(runtime_key).strip()
+    ]
+    unique_runtime_keys = list(dict.fromkeys(requested_runtime_keys))
+    if not unique_runtime_keys:
+        raise HTTPException(status_code=400, detail="At least one runtime key is required.")
+
+    rows = await _get_uploaded_runtime_rows(db, unique_runtime_keys)
+    runtime_groups: dict[str, list[tuple[Camera, StreamConfig]]] = {}
+    for camera, stream_config in rows:
+        runtime_groups.setdefault(_get_runtime_key(stream_config), []).append((camera, stream_config))
+
+    members_to_start: list[dict] = []
+    for runtime_key in unique_runtime_keys:
+        group_rows = runtime_groups.get(runtime_key)
+        if not group_rows or is_producer_running(runtime_key):
+            continue
+        discard_pending_runtime_key(runtime_key)
+        first_stream = group_rows[0][1]
+        members_to_start.append(
+            {
+                "runtime_key": runtime_key,
+                "source_path": first_stream.source_path,
+                "is_fisheye": bool(first_stream.is_fisheye),
+                "active_views": await _get_active_views_for_runtime(db, runtime_key, bool(first_stream.is_fisheye)),
+            }
+        )
+
+    started_sources = _start_uploaded_runtime_members(members_to_start)
+    return {
+        "status": "started",
+        "requested_sources": len(unique_runtime_keys),
+        "started_sources": started_sources,
+    }
+
+
+@router.post("/api/upload-videos/stop")
+async def stop_uploaded_videos(
+    payload: UploadRuntimeActionRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    requested_runtime_keys = [
+        str(runtime_key).strip()
+        for runtime_key in (payload.runtime_keys or [])
+        if str(runtime_key).strip()
+    ]
+    unique_runtime_keys = list(dict.fromkeys(requested_runtime_keys))
+    if not unique_runtime_keys:
+        raise HTTPException(status_code=400, detail="At least one runtime key is required.")
+
+    rows = await _get_uploaded_runtime_rows(db, unique_runtime_keys)
+    valid_runtime_keys = {
+        _get_runtime_key(stream_config)
+        for _, stream_config in rows
+    }
+
+    stopped_sources = 0
+    for runtime_key in unique_runtime_keys:
+        if runtime_key not in valid_runtime_keys:
+            continue
+        if stop_producer_thread(runtime_key):
+            stopped_sources += 1
+
+    return {
+        "status": "stopped",
+        "requested_sources": len(unique_runtime_keys),
+        "stopped_sources": stopped_sources,
+    }
+
+
+@router.post("/api/upload-videos/delete")
+async def delete_uploaded_videos(
+    payload: UploadRuntimeActionRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    requested_runtime_keys = [
+        str(runtime_key).strip()
+        for runtime_key in (payload.runtime_keys or [])
+        if str(runtime_key).strip()
+    ]
+    unique_runtime_keys = list(dict.fromkeys(requested_runtime_keys))
+    if not unique_runtime_keys:
+        raise HTTPException(status_code=400, detail="At least one runtime key is required.")
+
+    rows = await _get_uploaded_runtime_rows(db, unique_runtime_keys)
+    runtime_groups: dict[str, list[tuple[Camera, StreamConfig]]] = {}
+    for camera, stream_config in rows:
+        runtime_groups.setdefault(_get_runtime_key(stream_config), []).append((camera, stream_config))
+
+    deleted_sources = 0
+    deleted_camera_ids: list[str] = []
+    source_paths_to_cleanup: set[str] = set()
+
+    for runtime_key in unique_runtime_keys:
+        group_rows = runtime_groups.get(runtime_key)
+        if not group_rows:
+            continue
+
+        stop_producer_thread(runtime_key)
+        discard_pending_runtime_key(runtime_key)
+
+        deleted_sources += 1
+        for camera, stream_config in group_rows:
+            deleted_camera_ids.append(camera.id)
+            if stream_config.source_path:
+                source_paths_to_cleanup.add(stream_config.source_path)
+
+    if deleted_camera_ids:
+        await db.execute(
+            sa_delete(StreamConfig).where(StreamConfig.camera_id.in_(deleted_camera_ids))
+        )
+        await db.execute(
+            sa_delete(Camera).where(Camera.id.in_(deleted_camera_ids))
+        )
+
+    for source_path in source_paths_to_cleanup:
+        result = await db.execute(
+            select(StreamConfig.id).where(StreamConfig.source_path == source_path).limit(1)
+        )
+        if result.scalar_one_or_none() is not None:
+            continue
+        if os.path.exists(source_path):
+            try:
+                os.remove(source_path)
+            except OSError:
+                pass
+
+    await _sync_runtime_state(db)
+
+    return {
+        "status": "deleted",
+        "requested_sources": len(unique_runtime_keys),
+        "deleted_sources": deleted_sources,
+    }
+
+
+@router.post("/api/upload-videos/preview")
+async def preview_uploaded_runtime(
+    payload: UploadPreviewRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    runtime_key = (payload.runtime_key or "").strip()
+    if not runtime_key:
+        raise HTTPException(status_code=400, detail="runtime_key is required.")
+
+    stream_config = await _get_uploaded_runtime_stream(db, runtime_key)
+    if stream_config is None:
+        raise HTTPException(status_code=404, detail="Uploaded video source not found.")
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        None,
+        lambda: _probe_uploaded_video_file(
+            stream_config.source_path,
+            enable_fisheye=bool(stream_config.is_fisheye),
+            selected_view=stream_config.view_index,
+        ),
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("detail") or "Unable to preview uploaded video.")
+    return result
+
+
 @router.post("/api/upload_and_process")
 async def upload_video(
     file: UploadFile = File(...),
@@ -827,9 +1299,6 @@ async def upload_video(
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        if sync_start and not sync_group_id.strip():
-            raise HTTPException(status_code=400, detail="sync_group_id is required when sync_start is enabled.")
-
         file_id = str(uuid.uuid4())[:8]
         filename = f"{file_id}_{file.filename}"
         input_path = os.path.join(UPLOAD_DIR, filename)
@@ -866,18 +1335,7 @@ async def upload_video(
                 f"{input_path}#group={uuid.uuid4()}",
             )
 
-        if sync_start:
-            pending_count = register_pending_upload(
-                sync_group_id,
-                runtime_key=runtime_key,
-                source_path=input_path,
-                is_fisheye=enable_fisheye,
-                active_views=active_view_indices,
-            )
-        else:
-            pending_count = 0
-            # Start the Producer Thread IMMEDIATELY
-            start_producer_thread(runtime_key, input_path, enable_fisheye, active_view_indices)
+        pending_count = 0
 
         # Helper to create camera + stream_config in DB
         async def create_cam(suffix: str, view_idx: int) -> CameraRead:
@@ -888,7 +1346,7 @@ async def upload_video(
                 name=f"{camera_name_prefix} - {suffix}" if suffix else camera_name_prefix,
                 location="Uploaded Video",
                 type="Fisheye" if enable_fisheye else "File",
-                status="Pending Sync Start" if sync_start else "Online",
+                status="Ready",
                 mode="Unassigned",
                 ws_url=_default_ws_url(cam_id),
                 resolution="640x360",
@@ -929,8 +1387,8 @@ async def upload_video(
         return {
             "status": "success",
             "created_cameras": new_cameras,
-            "sync_start": sync_start,
-            "sync_group_id": sync_group_id.strip() if sync_start else None,
+            "sync_start": False,
+            "sync_group_id": None,
             "pending_sources": pending_count,
         }
 

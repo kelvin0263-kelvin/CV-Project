@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager
 
@@ -18,9 +19,34 @@ from app.services import auth_service
 from app.services.video_processor import stop_all_producer_threads
 
 
+SUPPRESSED_ACCESS_LOG_PATHS = {
+    "/api/building-occupancy-summary",
+    "/api/detection-events",
+}
+
+
+class UvicornAccessPathFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if not isinstance(args, tuple) or len(args) < 3:
+            return True
+
+        request_path = str(args[2]).split("?", 1)[0]
+        return request_path not in SUPPRESSED_ACCESS_LOG_PATHS
+
+
+def configure_uvicorn_access_log_filter() -> None:
+    access_logger = logging.getLogger("uvicorn.access")
+    if any(isinstance(existing_filter, UvicornAccessPathFilter) for existing_filter in access_logger.filters):
+        return
+    access_logger.addFilter(UvicornAccessPathFilter())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Create tables if they don't exist (dev convenience). In production use Alembic."""
+    configure_uvicorn_access_log_filter()
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.execute(
@@ -57,6 +83,24 @@ async def lifespan(app: FastAPI):
             sa.text(
                 "ALTER TABLE people_counting_configs "
                 "ADD COLUMN IF NOT EXISTS verification_inward_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.02"
+            )
+        )
+        await conn.execute(
+            sa.text(
+                "ALTER TABLE people_counting_snapshots "
+                "ADD COLUMN IF NOT EXISTS foot_traffic_left INTEGER NOT NULL DEFAULT 0"
+            )
+        )
+        await conn.execute(
+            sa.text(
+                "ALTER TABLE people_counting_snapshots "
+                "ADD COLUMN IF NOT EXISTS foot_traffic_right INTEGER NOT NULL DEFAULT 0"
+            )
+        )
+        await conn.execute(
+            sa.text(
+                "ALTER TABLE people_counting_snapshots "
+                "ADD COLUMN IF NOT EXISTS foot_traffic_total INTEGER NOT NULL DEFAULT 0"
             )
         )
 
@@ -98,12 +142,14 @@ async def lifespan(app: FastAPI):
 
     # Start background task to persist counting snapshots
     snapshot_task = asyncio.create_task(counting_router.counting_snapshot_persistence_loop())
+    daily_reset_task = asyncio.create_task(counting_router.daily_runtime_reset_loop())
 
     yield
 
     # Cleanup
     task.cancel()
     snapshot_task.cancel()
+    daily_reset_task.cancel()
     still_running = await asyncio.to_thread(stop_all_producer_threads, 2.0)
     if still_running:
         print(f"[Shutdown] Producer threads still running: {still_running}")

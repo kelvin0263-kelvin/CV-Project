@@ -5,8 +5,8 @@ import uuid
 
 
 DEFAULT_INWARD_THRESHOLD = 0.02
-DEFAULT_PRIMARY_EVENT_IDLE_TIMEOUT_SEC =  10.0
-TRACK_STALE_TIMEOUT_SEC = 10.0
+DEFAULT_PRIMARY_EVENT_IDLE_TIMEOUT_SEC =  7.0
+TRACK_STALE_TIMEOUT_SEC = 5.0
 LINE_SIDE_EPS = 0.002
 DEBUG_CROSS_CAMERA = os.getenv("DEBUG_CROSS_CAMERA", "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -126,6 +126,55 @@ def reset_cross_camera_state(camera_id: str) -> None:
                 }
 
     _log_cross_camera(f"[CrossCameraReset] camera={camera_id}")
+
+
+def get_verifier_camera_status(camera_id: str) -> dict:
+    with _runtime_lock:
+        primary_ids = sorted(_verifier_to_primary.get(camera_id, set()))
+        track_states = _verifier_tracks.get(camera_id, {})
+        active_events: list[dict] = []
+        last_events: list[dict] = []
+
+        for primary_camera_id in primary_ids:
+            pair_cfg = _primary_pairs.get(primary_camera_id)
+            pair_state = _pair_states.get(primary_camera_id)
+            if not pair_cfg or not pair_state:
+                continue
+
+            active_event = _serialize_event(pair_state.get("active_event"))
+            if active_event is not None:
+                active_events.append(
+                    {
+                        "primary_camera_id": primary_camera_id,
+                        "pair_id": pair_cfg.get("pair_id"),
+                        **active_event,
+                    }
+                )
+
+            last_event = _serialize_event(pair_state.get("last_completed_event"))
+            if last_event is not None:
+                last_events.append(
+                    {
+                        "primary_camera_id": primary_camera_id,
+                        "pair_id": pair_cfg.get("pair_id"),
+                        **last_event,
+                    }
+                )
+
+        latest_last_event = None
+        if last_events:
+            latest_last_event = max(last_events, key=lambda event: float(event.get("end_time") or 0.0))
+
+        return {
+            "cross_camera_role": "verifier",
+            "cross_camera_pair_id": primary_ids and str((_primary_pairs.get(primary_ids[0]) or {}).get("pair_id") or "") or None,
+            "verifier_primary_camera_ids": primary_ids,
+            "verifier_observed_tracks": len(track_states),
+            "verifier_active_events": active_events,
+            "verifier_active_event": active_events[0] if active_events else None,
+            "verifier_last_events": last_events,
+            "verifier_last_event": latest_last_event,
+        }
 
 
 def register_primary_in_events(camera_id: str, delta_in: int, now: float | None = None) -> None:

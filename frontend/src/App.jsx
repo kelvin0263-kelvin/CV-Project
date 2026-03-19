@@ -9,7 +9,6 @@ import SystemConfiguration from './components/SystemConfiguration';
 import Login from './components/Login';
 import FallDetection from './components/FallDetection';
 import AccountSettings from './components/AccountSettings';
-import VideoUpload from './components/VideoUpload';
 import { clearAuthSession, getStoredToken, storeAuthSession, subscribeAuthChanges } from './apiConfig';
 
 function App() {
@@ -50,7 +49,7 @@ function App() {
           <Route path="reports" element={<Reporting />} />
           <Route path="settings" element={<SystemConfiguration />} />
           <Route path="account" element={<AccountSettings />} />
-          <Route path="upload" element={<VideoUpload />} />
+          <Route path="upload" element={<Navigate to="/settings?tab=uploads" replace />} />
         </Route>
       </Routes>
     </Router>

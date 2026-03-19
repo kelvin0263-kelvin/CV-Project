@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { NavLink, Outlet, Link } from 'react-router-dom';
-import { LayoutDashboard, Users, Shirt, Activity, BarChart3, Settings, Bell, LogOut, ArrowDownCircle, UploadCloud, AlertTriangle, X } from 'lucide-react';
+import { LayoutDashboard, Users, Shirt, Activity, BarChart3, Settings, Bell, LogOut, ArrowDownCircle, AlertTriangle, X } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { getApiBaseUrl, getStoredUser } from '../apiConfig';
 import { Button } from './ui/button';
@@ -312,7 +312,6 @@ const Layout = ({ onLogout }) => {
                             <SidebarItem to="/dress-code" icon={Shirt} label="Dress Code Policy" />
                             <SidebarItem to="/fall-detection" icon={ArrowDownCircle} label="Fall Detection" />
                             <SidebarItem to="/reports" icon={BarChart3} label="Reporting" />
-                            <SidebarItem to="/upload" icon={UploadCloud} label="Video Analysis Upload" />
                             <SidebarItem to="/settings" icon={Settings} label="System Configuration" />
                         </nav>
                     </div>

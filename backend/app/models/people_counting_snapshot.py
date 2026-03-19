@@ -13,6 +13,9 @@ class PeopleCountingSnapshot(Base):
     total_in = Column(Integer, nullable=False, default=0)
     total_out = Column(Integer, nullable=False, default=0)
     current_occupancy = Column(Integer, nullable=False, default=0)
+    foot_traffic_left = Column(Integer, nullable=False, default=0)
+    foot_traffic_right = Column(Integer, nullable=False, default=0)
+    foot_traffic_total = Column(Integer, nullable=False, default=0)
 
     def __repr__(self) -> str:
         return f"<PeopleCountingSnapshot(id={self.id!r}, camera={self.camera_id!r}, occupancy={self.current_occupancy})>"

@@ -115,5 +115,8 @@ class PeopleCountingSnapshotRead(BaseModel):
     total_in: int
     total_out: int
     current_occupancy: int
+    foot_traffic_left: int = 0
+    foot_traffic_right: int = 0
+    foot_traffic_total: int = 0
 
     model_config = {"from_attributes": True}
