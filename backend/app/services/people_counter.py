@@ -4,8 +4,8 @@ People Counting Service
 Line-based people counting with optional active counting zones.
 
 Supports:
-1. Door/occupancy counting with OUT line crosses and IN-on-disappear logic.
-2. Foot-traffic counting with directional line-cross totals (left/right).
+1. Door/occupancy counting with IN/OUT line-cross logic.
+2. Foot-traffic counting with per-line directional line-cross totals.
 3. Optional polygons that gate count events. A crossing/disappear event only
    counts when its probe point is inside the configured active zone.
 
@@ -41,6 +41,7 @@ DEFAULT_COUNT_COOLDOWN = 4.0
 DEFAULT_LINE_SIDE_EPS = 0.002 #line tolerance
 DEFAULT_FOOT_TRAFFIC_REARM_SIDE_EPS = 0.015
 DEFAULT_FOOT_TRAFFIC_RECOUNT_COOLDOWN = 0.75
+DEFAULT_FOOT_TRAFFIC_SEGMENT_ENDPOINT_TOL = 0.01
 DEFAULT_LINE_IN_MIN_TRACK_FRAMES = 10
 
 # frame_count >= DEFAULT_LINE_OUT_MIN_TRACK_FRAMES and frame_count <= DEFAULT_LINE_OUT_MAX_TRACK_FRAMES
@@ -148,6 +149,7 @@ class PeopleCounter:
         self._line_track_frame_totals: dict[int, int] = {}
         self._counted_in_tracks: dict[int, _CountedTrackRecord] = {}
         self._counted_out_tracks: dict[int, _CountedTrackRecord] = {}
+        self._counted_foot_traffic_tracks: set[int] = set()
         self._foot_traffic_line_counts: dict[str, dict[str, int]] = {}
 
         self.total_in = 0
@@ -241,7 +243,7 @@ class PeopleCounter:
                         now,
                     )
                 else:
-                    self.total_out += self._update_line_track_state(
+                    line_delta = self._update_line_track_state(
                         line_key,
                         line_name,
                         line_cfg,
@@ -249,6 +251,10 @@ class PeopleCounter:
                         target_point,
                         now,
                     )
+                    if self._line_count_event(line_cfg) == LINE_EVENT_IN:
+                        self.total_in += line_delta
+                    else:
+                        self.total_out += line_delta
 
         line_in, line_out = self._process_line_disappears(set(track_bboxes.keys()), now)
         self.total_in += line_in
@@ -337,6 +343,7 @@ class PeopleCounter:
         self._line_track_frame_totals = {}
         self._counted_in_tracks = {}
         self._counted_out_tracks = {}
+        self._counted_foot_traffic_tracks = set()
         self.total_in = 0
         self.total_out = 0
         self.foot_traffic_left = 0
@@ -487,20 +494,18 @@ class PeopleCounter:
             )
 
         max_frames = self._line_max_track_frames(line_cfg)
-        if (
-            count_event == LINE_EVENT_OUT
-            and prev_side <= DEFAULT_LINE_SIDE_EPS
-            and curr_side > DEFAULT_LINE_SIDE_EPS
-        ):
+        if prev_side <= DEFAULT_LINE_SIDE_EPS and curr_side > DEFAULT_LINE_SIDE_EPS:
+            direction = "OUT" if count_event == LINE_EVENT_OUT else "IN"
             if (
                 crossing_point_in_active_zone
                 and ts.frame_count >= required_frames
                 and (max_frames is None or ts.frame_count <= max_frames)
+                and (count_event != LINE_EVENT_IN or self._can_count_in(track_id, now))
             ):
-                if self._register_count(track_id, "OUT", "line_cross", now):
+                if self._register_count(track_id, direction, "line_cross", now):
                     self._log_count_event(
                         track_id,
-                        "OUT",
+                        direction,
                         "line_cross",
                         point=cross_point or right_point,
                         prev_point=prev_point,
@@ -516,7 +521,7 @@ class PeopleCounter:
                                     "[COUNT-DECISION]",
                                     f"track_id={track_id}",
                                     f"line={line_name}",
-                                    "direction=OUT",
+                                    f"direction={direction}",
                                     "source=line_cross",
                                     "result=counted",
                                     f"frames={ts.frame_count}",
@@ -546,6 +551,8 @@ class PeopleCounter:
                     reasons.append(f"frames_below_min({ts.frame_count}<{required_frames})")
                 if max_frames is not None and ts.frame_count > max_frames:
                     reasons.append(f"frames_above_max({ts.frame_count}>{max_frames})")
+                if count_event == LINE_EVENT_IN and not self._can_count_in(track_id, now):
+                    reasons.append("in_count_cooldown_active")
                 reason = ",".join(reasons) if reasons else "not_eligible"
                 print(
                     " ".join(
@@ -553,7 +560,7 @@ class PeopleCounter:
                             "[COUNT-DECISION]",
                             f"track_id={track_id}",
                             f"line={line_name}",
-                            "direction=OUT",
+                            f"direction={direction}",
                             "source=line_cross",
                             "result=rejected",
                             f"reason={reason}",
@@ -687,6 +694,7 @@ class PeopleCounter:
         prev_point = ts.last_point
         prev_side = ts.last_side_value
         cross_point = self._line_crossing_point(prev_point, target_point, prev_side, curr_side)
+        crosses_segment = self._foot_traffic_crosses_segment(line_cfg, cross_point)
         traffic_direction = self._foot_traffic_direction(
             prev_point=prev_point,
             curr_point=target_point,
@@ -716,15 +724,20 @@ class PeopleCounter:
         direction_already_counted = (
             ts.counted_right if traffic_direction == "right" else ts.counted_left
         ) if traffic_direction else False
+        track_already_counted = int(track_id) in self._counted_foot_traffic_tracks
+        allowed_direction = self._foot_traffic_allowed_direction(line_cfg)
 
         if (
             traffic_direction
+            and crosses_segment
+            and (allowed_direction is None or traffic_direction == allowed_direction)
+            and not track_already_counted
             and not direction_already_counted
             and traffic_direction != ts.last_count_direction
             and ts.rearmed
             and self._foot_traffic_cooldown_elapsed(ts, now, line_cfg)
         ):
-            self._register_foot_traffic_count(line_key, traffic_direction)
+            self._register_foot_traffic_count(line_key, traffic_direction, line_cfg, track_id)
             ts.last_count_direction = traffic_direction
             ts.last_count_time = now
             ts.rearmed = False
@@ -785,63 +798,11 @@ class PeopleCounter:
                     continue
 
                 in_active_zone = self._is_inside_active_zone(ts.last_right_point)
-                if (
-                    count_event == LINE_EVENT_IN
-                    and in_active_zone
-                    and ts.last_in_side_value > DEFAULT_LINE_SIDE_EPS
-                    and ts.frame_count >= required_frames
-                ):
-                    if self._can_count_in(track_id, now):
-                        total_in += 1
-                        self._register_count(track_id, "IN", "line_disappear", now)
-                        self._log_count_event(
-                            track_id,
-                            "IN",
-                            "line_disappear",
-                            point=ts.last_right_point,
-                            detail=(
-                                f"line={line_name} target={count_event} side={ts.last_in_side_value:.4f} "
-                                f"elapsed={elapsed:.1f}s"
-                            ),
-                        )
-                        if DEBUG_COUNTING:
-                            print(
-                                " ".join(
-                                    [
-                                        "[COUNT-DECISION]",
-                                        f"track_id={track_id}",
-                                        f"line={line_name}",
-                                        "direction=IN",
-                                        "source=line_disappear",
-                                        "result=counted",
-                                        f"frames={ts.frame_count}",
-                                        f"elapsed={elapsed:.2f}s",
-                                        f"in_active_zone={self._bool_label(in_active_zone)}",
-                                    ]
-                                )
-                            )
-                        self._log_live_track_frame(
-                            track_id,
-                            line_name,
-                            event="count_in",
-                            count_event=count_event,
-                            point=ts.last_right_point,
-                            side=ts.last_in_side_value,
-                            frame_count=ts.frame_count,
-                            elapsed=elapsed,
-                            in_active_zone=in_active_zone,
-                            out_zone_armed=ts.out_zone_armed,
-                            active_zone_streak=ts.active_zone_streak,
-                        )
-                elif DEBUG_COUNTING:
+                if DEBUG_COUNTING:
                     if count_event == LINE_EVENT_OUT:
                         reason = "out_lines_do_not_count_on_disappear"
-                    elif not in_active_zone:
-                        reason = "last_point_outside_active_zone"
-                    elif ts.last_in_side_value <= DEFAULT_LINE_SIDE_EPS:
-                        reason = f"last_point_not_in_{count_event}_target_side"
                     else:
-                        reason = f"frames_below_min({ts.frame_count}<{required_frames})"
+                        reason = "in_lines_count_on_cross"
                     print(
                         " ".join(
                             [
@@ -998,14 +959,28 @@ class PeopleCounter:
             )
         return summaries
 
-    def _register_foot_traffic_count(self, line_key: str, direction: str) -> None:
+    def _register_foot_traffic_count(self, line_key: str, direction: str, line_cfg: dict, track_id: int) -> None:
         counts = self._foot_traffic_line_counts.setdefault(line_key, {"left": 0, "right": 0})
-        normalized_direction = "right" if str(direction).lower() in {"right", "down"} else "left"
+        normalized_direction = self._foot_traffic_bucket_direction(direction, line_cfg)
         counts[normalized_direction] = int(counts.get(normalized_direction, 0) or 0) + 1
+        self._counted_foot_traffic_tracks.add(int(track_id))
         if normalized_direction == "right":
             self.foot_traffic_right += 1
         else:
             self.foot_traffic_left += 1
+
+    def _foot_traffic_bucket_direction(self, direction: str, line_cfg: dict) -> str:
+        normalized = str(direction).lower()
+        negative_label, positive_label = self._foot_traffic_labels(line_cfg)
+
+        # Vertical-style FT lines report left/right motion, but the user wants
+        # the inside-facing FT side to contribute to the opposite summary bucket.
+        if (negative_label, positive_label) == ("left", "right"):
+            return "left" if normalized == "right" else "right"
+
+        # Horizontal-style FT lines keep the original bucket expectation:
+        # down contributes to the right total, up contributes to the left total.
+        return "right" if normalized == "down" else "left"
 
     def _format_point(self, point: tuple[float, float] | None) -> str:
         if point is None:
@@ -1079,6 +1054,17 @@ class PeopleCounter:
                 return ("left", "right")
         return ("up", "down")
 
+    def _foot_traffic_allowed_direction(self, line_cfg: dict) -> str | None:
+        configured_direction = str(line_cfg.get("direction") or "").strip().lower()
+        if configured_direction not in {"left_to_right", "right_to_left"}:
+            return None
+
+        negative_label, positive_label = self._foot_traffic_labels(line_cfg)
+        if (negative_label, positive_label) == ("left", "right"):
+            return "left" if configured_direction == "left_to_right" else "right"
+
+        return "down" if configured_direction == "left_to_right" else "up"
+
     def _foot_traffic_direction(
         self,
         *,
@@ -1108,10 +1094,29 @@ class PeopleCounter:
                 return "up"
 
         if crossed_forward:
-            return positive_label if line_cfg.get("direction", "left_to_right") == "left_to_right" else negative_label
-        if crossed_backward:
             return negative_label if line_cfg.get("direction", "left_to_right") == "left_to_right" else positive_label
+        if crossed_backward:
+            return positive_label if line_cfg.get("direction", "left_to_right") == "left_to_right" else negative_label
         return None
+
+    def _foot_traffic_crosses_segment(
+        self,
+        line_cfg: dict,
+        cross_point: tuple[float, float] | None,
+    ) -> bool:
+        if cross_point is None:
+            return False
+        points = line_cfg.get("points", [])
+        if len(points) < 2:
+            return False
+        start = (float(points[0][0]), float(points[0][1]))
+        end = (float(points[1][0]), float(points[1][1]))
+        return self._point_projects_onto_segment(
+            point=cross_point,
+            seg_start=start,
+            seg_end=end,
+            endpoint_tol=DEFAULT_FOOT_TRAFFIC_SEGMENT_ENDPOINT_TOL,
+        )
 
     def _should_accumulate_track_frames(self, point: tuple[float, float] | None) -> bool:
         if point is None:
@@ -1219,6 +1224,27 @@ class PeopleCounter:
             prev_point[0] + ((curr_point[0] - prev_point[0]) * t),
             prev_point[1] + ((curr_point[1] - prev_point[1]) * t),
         )
+
+    def _point_projects_onto_segment(
+        self,
+        *,
+        point: tuple[float, float],
+        seg_start: tuple[float, float],
+        seg_end: tuple[float, float],
+        endpoint_tol: float = 0.0,
+    ) -> bool:
+        seg_dx = seg_end[0] - seg_start[0]
+        seg_dy = seg_end[1] - seg_start[1]
+        seg_len_sq = (seg_dx * seg_dx) + (seg_dy * seg_dy)
+        if seg_len_sq <= 1e-12:
+            return False
+
+        proj = (
+            ((point[0] - seg_start[0]) * seg_dx) +
+            ((point[1] - seg_start[1]) * seg_dy)
+        ) / seg_len_sq
+        tol_ratio = max(0.0, endpoint_tol / max(math.sqrt(seg_len_sq), 1e-9))
+        return (-tol_ratio) <= proj <= (1.0 + tol_ratio)
 
     def _bbox_bottom_center_point(self, bbox: list[float], frame_w: int, frame_h: int) -> tuple[float, float]:
         x1, y1, x2, y2 = bbox

@@ -39,7 +39,7 @@ const getFootTrafficLabelsForLine = (line) => {
             return { negative: 'Left', positive: 'Right', shortNegative: 'L', shortPositive: 'R', mode: 'left_right' };
         }
     }
-    return { negative: 'Up', positive: 'Down', shortNegative: 'U', shortPositive: 'D', mode: 'up_down' };
+    return { negative: 'Down', positive: 'Up', shortNegative: 'D', shortPositive: 'U', mode: 'up_down' };
 };
 
 const getFootTrafficSummaryLabels = (lines) => {
@@ -51,7 +51,7 @@ const getFootTrafficSummaryLabels = (lines) => {
     const firstMode = labels[0].mode;
     const mixed = labels.some((label) => label.mode !== firstMode);
     if (mixed) {
-        return { negative: 'Direction A', positive: 'Direction B', shortNegative: 'A', shortPositive: 'B', mixed: true };
+        return { negative: 'Left', positive: 'Right', shortNegative: 'L', shortPositive: 'R', mixed: false };
     }
     return { ...labels[0], mixed: false };
 };

@@ -41,6 +41,23 @@ const filterValidFrameExcludeAreas = (areas) => Array.isArray(areas)
     ? areas.filter((area) => area?.points?.length >= 3)
     : [];
 
+const getNextNamedIndex = (items, prefix) => {
+    const pattern = new RegExp(`^${prefix} (\\d+)$`);
+    let maxIndex = 0;
+
+    (Array.isArray(items) ? items : []).forEach((item) => {
+        const name = String(item?.name || '').trim();
+        const match = pattern.exec(name);
+        if (!match) return;
+        const parsed = Number(match[1]);
+        if (Number.isFinite(parsed) && parsed > maxIndex) {
+            maxIndex = parsed;
+        }
+    });
+
+    return maxIndex + 1;
+};
+
 const getLineType = (line) => line?.line_type === 'foot_traffic' ? 'foot_traffic' : 'occupancy';
 const getFootTrafficLabelsForLine = (line) => {
     const points = Array.isArray(line?.points) ? line.points : [];
@@ -52,7 +69,7 @@ const getFootTrafficLabelsForLine = (line) => {
             return { negative: 'Left', positive: 'Right', shortNegative: 'L', shortPositive: 'R', mode: 'left_right' };
         }
     }
-    return { negative: 'Up', positive: 'Down', shortNegative: 'U', shortPositive: 'D', mode: 'up_down' };
+    return { negative: 'Down', positive: 'Up', shortNegative: 'D', shortPositive: 'U', mode: 'up_down' };
 };
 
 const getFootTrafficSummaryLabels = (lines) => {
@@ -64,7 +81,7 @@ const getFootTrafficSummaryLabels = (lines) => {
     const firstMode = labels[0].mode;
     const mixed = labels.some((label) => label.mode !== firstMode);
     if (mixed) {
-        return { negative: 'Direction A', positive: 'Direction B', shortNegative: 'A', shortPositive: 'B', mixed: true };
+        return { negative: 'Left', positive: 'Right', shortNegative: 'L', shortPositive: 'R', mixed: false };
     }
     return { ...labels[0], mixed: false };
 };
@@ -437,29 +454,35 @@ const PeopleCounting = () => {
     };
 
     const handleLineDrawn = useCallback(({ points, direction }) => {
-        setLines((prevLines) => [
-            ...prevLines,
-            {
-                id: `line_${Date.now()}`,
-                name: `Line ${prevLines.length + 1}`,
-                points,
-                direction: direction || 'left_to_right',
-                count_event: 'in',
-                line_type: 'occupancy',
-            },
-        ]);
+        setLines((prevLines) => {
+            const nextIndex = getNextNamedIndex(prevLines, 'Line');
+            return [
+                ...prevLines,
+                {
+                    id: `line_${Date.now()}`,
+                    name: `Line ${nextIndex}`,
+                    points,
+                    direction: direction || 'left_to_right',
+                    count_event: 'in',
+                    line_type: 'occupancy',
+                },
+            ];
+        });
         setDrawingMode(null);
     }, []);
 
     const handleFrameExcludeAreaDrawn = useCallback(({ points }) => {
-        setFrameExcludeAreas((prevAreas) => [
-            ...prevAreas,
-            {
-                id: `frame_exclude_${Date.now()}`,
-                name: `Active Zone ${prevAreas.length + 1}`,
-                points,
-            },
-        ]);
+        setFrameExcludeAreas((prevAreas) => {
+            const nextIndex = getNextNamedIndex(prevAreas, 'Active Zone');
+            return [
+                ...prevAreas,
+                {
+                    id: `frame_exclude_${Date.now()}`,
+                    name: `Active Zone ${nextIndex}`,
+                    points,
+                },
+            ];
+        });
         setDrawingMode(null);
     }, []);
 
@@ -650,7 +673,7 @@ const PeopleCounting = () => {
                                         <span className="rounded-full border px-2 py-0.5">
                                             {isFootTraffic
                                                 ? `Auto ${lineFootTrafficLabels.negative} / ${lineFootTrafficLabels.positive}`
-                                                : line.direction === 'left_to_right' ? 'Left to Right' : 'Right to Left'}
+                                                : line.direction === 'left_to_right' ? 'Right to Left' : 'Left to Right'}
                                         </span>
                                     </div>
                                 </div>
@@ -666,7 +689,7 @@ const PeopleCounting = () => {
                                             </Button>
                                         )}
                                         {!isFootTraffic && (
-                                            <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => toggleDirection(line.id)} title={`Direction: ${line.direction === 'left_to_right' ? 'L->R' : 'R->L'}`}>
+                                            <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => toggleDirection(line.id)} title={`Direction: ${line.direction === 'left_to_right' ? 'R->L' : 'L->R'}`}>
                                                 <ArrowRightLeft className="h-3.5 w-3.5" />
                                             </Button>
                                         )}

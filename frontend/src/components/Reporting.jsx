@@ -1,19 +1,21 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
 import { Button } from './ui/button';
+import { Checkbox } from './ui/checkbox';
 import {
-    BarChart, Bar, LineChart, Line,
+    BarChart, Bar, LineChart, Line, ComposedChart,
     XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer, Brush
 } from 'recharts';
-import { Download, Calendar, Eye, FileText, XCircle, AlertTriangle, RefreshCw, Users, Building2 } from 'lucide-react';
+import {
+    Download, Calendar, Eye, FileText, XCircle, AlertTriangle, RefreshCw, Users, Building2,
+    ArrowDownToLine, ArrowUpFromLine, Activity, Clock3, TrendingUp, ArrowLeft, ArrowRight, Target,
+} from 'lucide-react';
 import { cn } from '../lib/utils';
 import { getApiBaseUrl } from '../apiConfig';
 
 const HAS_TZ_SUFFIX = /(Z|[+-]\d{2}:\d{2})$/i;
 const SNAPSHOT_PAGE_SIZE = 1000;
 const MAX_COUNTING_HISTORY_ROWS = 20000;
-const OCCUPANCY_HISTORY_PAGE_SIZE = 1000;
-const MAX_OCCUPANCY_HISTORY_ROWS = 10000;
 const BUILDING_HISTORY_PAGE_SIZE = 1000;
 const MAX_BUILDING_HISTORY_ROWS = 10000;
 const OCCUPANCY_CHART_MAX_POINTS = 300;
@@ -23,6 +25,11 @@ const OCCUPANCY_RANGE_LOOKBACK_MS = {
     '24h': 24 * 60 * 60 * 1000,
     '7d': 7 * 24 * 60 * 60 * 1000,
     '30d': 30 * 24 * 60 * 60 * 1000,
+};
+const FLOW_BUCKET_DURATIONS_MS = {
+    '15m': 15 * 60 * 1000,
+    '1h': 60 * 60 * 1000,
+    '1d': 24 * 60 * 60 * 1000,
 };
 
 const parseApiTimestamp = (value) => {
@@ -95,12 +102,355 @@ const formatDateTimeLocal = (date) => {
     return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 };
 
+const formatDateOnlyLocal = (date) => {
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+};
+
+const formatNumber = (value) => new Intl.NumberFormat('en-US').format(Number(value || 0));
+
 const createDefaultCustomRange = () => {
     const now = new Date();
     const oneDayAgo = new Date(now.getTime() - (24 * 60 * 60 * 1000));
     return {
         start: formatDateTimeLocal(oneDayAgo),
         end: formatDateTimeLocal(now),
+    };
+};
+
+const getQuickRangeDateBounds = (quickRange, customStartDate, customEndDate) => {
+    if (quickRange === 'custom') {
+        return {
+            startDate: customStartDate,
+            endDate: customEndDate,
+        };
+    }
+
+    if (quickRange === 'all') {
+        return {
+            startDate: '',
+            endDate: '',
+        };
+    }
+
+    const end = new Date();
+    end.setHours(0, 0, 0, 0);
+
+    const start = new Date(end);
+    if (quickRange === 'today') {
+        return {
+            startDate: formatDateOnlyLocal(start),
+            endDate: formatDateOnlyLocal(end),
+        };
+    }
+    if (quickRange === '7d') {
+        start.setDate(start.getDate() - 6);
+    } else if (quickRange === '30d') {
+        start.setDate(start.getDate() - 29);
+    }
+
+    return {
+        startDate: formatDateOnlyLocal(start),
+        endDate: formatDateOnlyLocal(end),
+    };
+};
+
+const getDateRangeBounds = (startDate, endDate) => {
+    const startMs = startDate ? new Date(`${startDate}T00:00:00`).getTime() : null;
+    const endMs = endDate ? new Date(`${endDate}T23:59:59.999`).getTime() : null;
+    return { startMs, endMs };
+};
+
+const getHistoryRangeBounds = (timeRange, customStart, customEnd, fallbackEndMs = Date.now()) => {
+    let startMs = null;
+    let endMs = fallbackEndMs;
+
+    if (timeRange === 'custom') {
+        const customStartMs = new Date(customStart).getTime();
+        const customEndMs = new Date(customEnd).getTime();
+        if (Number.isNaN(customStartMs) || Number.isNaN(customEndMs) || customStartMs > customEndMs) {
+            return { valid: false, startMs: null, endMs: null };
+        }
+        startMs = customStartMs;
+        endMs = customEndMs;
+    } else if (timeRange !== 'all') {
+        startMs = fallbackEndMs - OCCUPANCY_RANGE_LOOKBACK_MS[timeRange];
+    }
+
+    return { valid: true, startMs, endMs };
+};
+
+const getAdaptiveFlowBucket = (timeRange, startMs, endMs) => {
+    if (timeRange === '1h' || timeRange === '6h') return '15m';
+    if (timeRange === '24h') return '1h';
+    if (timeRange === '7d') return '1h';
+    if (timeRange === '30d' || timeRange === 'all') return '1d';
+
+    if (startMs == null || endMs == null) return '1h';
+    const durationMs = Math.max(0, endMs - startMs);
+    if (durationMs <= 12 * 60 * 60 * 1000) return '15m';
+    if (durationMs <= 10 * 24 * 60 * 60 * 1000) return '1h';
+    return '1d';
+};
+
+const getBucketStartMs = (tsMs, bucket) => {
+    const date = new Date(tsMs);
+    if (bucket === '15m') {
+        date.setMinutes(Math.floor(date.getMinutes() / 15) * 15, 0, 0);
+        return date.getTime();
+    }
+    if (bucket === '1h') {
+        date.setMinutes(0, 0, 0);
+        return date.getTime();
+    }
+    date.setHours(0, 0, 0, 0);
+    return date.getTime();
+};
+
+const formatFlowBucketTick = (tsMs, bucket) => {
+    const date = new Date(tsMs);
+    if (bucket === '15m' || bucket === '1h') {
+        return date.toLocaleString('en-US', {
+            month: 'short',
+            day: 'numeric',
+            hour: 'numeric',
+            minute: bucket === '15m' ? '2-digit' : undefined,
+        });
+    }
+    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+};
+
+const formatFlowBucketRange = (tsMs, bucket) => {
+    const start = new Date(tsMs);
+    const end = new Date(tsMs + (FLOW_BUCKET_DURATIONS_MS[bucket] || FLOW_BUCKET_DURATIONS_MS['1d']));
+
+    if (bucket === '15m' || bucket === '1h') {
+        return `${start.toLocaleString('en-US', {
+            month: 'short',
+            day: 'numeric',
+            hour: 'numeric',
+            minute: bucket === '15m' ? '2-digit' : undefined,
+        })} - ${end.toLocaleTimeString('en-US', {
+            hour: 'numeric',
+            minute: bucket === '15m' ? '2-digit' : undefined,
+        })}`;
+    }
+
+    return start.toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        year: start.getFullYear() !== end.getFullYear() ? 'numeric' : undefined,
+    });
+};
+
+const normalizeSnapshotRows = (rows) => rows
+    .map((row) => {
+        const ts = parseApiTimestamp(row.timestamp);
+        if (!ts) return null;
+        return {
+            ...row,
+            ts,
+            tsMs: ts.getTime(),
+        };
+    })
+    .filter(Boolean);
+
+const aggregateCountingFlow = (rows, { startMs = null, endMs = null, bucket = '1d' } = {}) => {
+    const groupedRows = new Map();
+    const bucketMap = new Map();
+    let totalIn = 0;
+    let totalOut = 0;
+    let peakOccupancy = 0;
+    let latestSnapshot = null;
+    let resetCount = 0;
+
+    normalizeSnapshotRows(rows).forEach((row) => {
+        const existing = groupedRows.get(row.camera_id) || [];
+        existing.push(row);
+        groupedRows.set(row.camera_id, existing);
+    });
+
+    groupedRows.forEach((cameraRows) => {
+        cameraRows.sort((a, b) => a.tsMs - b.tsMs);
+        let previousRow = null;
+
+        cameraRows.forEach((row) => {
+            if (startMs != null && row.tsMs < startMs) {
+                previousRow = row;
+                return;
+            }
+            if (endMs != null && row.tsMs > endMs) {
+                return;
+            }
+
+            const resetDetected = previousRow
+                && ((row.total_in ?? 0) < (previousRow.total_in ?? 0) || (row.total_out ?? 0) < (previousRow.total_out ?? 0));
+            const deltaIn = previousRow
+                ? Math.max(0, resetDetected ? (row.total_in ?? 0) : ((row.total_in ?? 0) - (previousRow.total_in ?? 0)))
+                : Math.max(0, row.total_in ?? 0);
+            const deltaOut = previousRow
+                ? Math.max(0, resetDetected ? (row.total_out ?? 0) : ((row.total_out ?? 0) - (previousRow.total_out ?? 0)))
+                : Math.max(0, row.total_out ?? 0);
+
+            if (resetDetected) {
+                resetCount += 1;
+            }
+
+            totalIn += deltaIn;
+            totalOut += deltaOut;
+            peakOccupancy = Math.max(peakOccupancy, Number(row.current_occupancy ?? 0));
+            if (!latestSnapshot || row.tsMs > latestSnapshot.tsMs) {
+                latestSnapshot = row;
+            }
+
+            const bucketStartMs = getBucketStartMs(row.tsMs, bucket);
+            const bucketEntry = bucketMap.get(bucketStartMs) || {
+                tsMs: bucketStartMs,
+                label: formatFlowBucketTick(bucketStartMs, bucket),
+                fullLabel: formatFlowBucketRange(bucketStartMs, bucket),
+                in: 0,
+                out: 0,
+                totalTraffic: 0,
+                occupancy: 0,
+                peakOccupancy: 0,
+            };
+
+            bucketEntry.in += deltaIn;
+            bucketEntry.out += deltaOut;
+            bucketEntry.totalTraffic += deltaIn + deltaOut;
+            bucketEntry.occupancy = Number(row.current_occupancy ?? bucketEntry.occupancy ?? 0);
+            bucketEntry.peakOccupancy = Math.max(bucketEntry.peakOccupancy, Number(row.current_occupancy ?? 0));
+            bucketMap.set(bucketStartMs, bucketEntry);
+            previousRow = row;
+        });
+    });
+
+    const series = Array.from(bucketMap.values()).sort((a, b) => a.tsMs - b.tsMs);
+    const peakPeriod = series.reduce((best, point) => {
+        if (!best || point.totalTraffic > best.totalTraffic) return point;
+        return best;
+    }, null);
+
+    return {
+        series,
+        totalIn,
+        totalOut,
+        totalTraffic: totalIn + totalOut,
+        peakOccupancy,
+        estimatedOccupancy: Number(latestSnapshot?.current_occupancy ?? 0),
+        peakPeriodLabel: peakPeriod?.fullLabel || '-',
+        resetCount,
+    };
+};
+
+const aggregateTrafficAnalytics = (rows, { startMs = null, endMs = null, bucket = '1d' } = {}) => {
+    const groupedRows = new Map();
+    const bucketMap = new Map();
+    let totalLeftTraffic = 0;
+    let totalRightTraffic = 0;
+    let totalEntries = 0;
+    let resetCount = 0;
+
+    normalizeSnapshotRows(rows).forEach((row) => {
+        const existing = groupedRows.get(row.camera_id) || [];
+        existing.push(row);
+        groupedRows.set(row.camera_id, existing);
+    });
+
+    groupedRows.forEach((cameraRows) => {
+        cameraRows.sort((a, b) => a.tsMs - b.tsMs);
+        let previousRow = null;
+
+        cameraRows.forEach((row) => {
+            if (startMs != null && row.tsMs < startMs) {
+                previousRow = row;
+                return;
+            }
+            if (endMs != null && row.tsMs > endMs) {
+                return;
+            }
+
+            const currentLeft = Number(row.foot_traffic_left ?? 0);
+            const currentRight = Number(row.foot_traffic_right ?? 0);
+            const currentEntries = Number(row.total_in ?? 0);
+            const previousLeft = Number(previousRow?.foot_traffic_left ?? 0);
+            const previousRight = Number(previousRow?.foot_traffic_right ?? 0);
+            const previousEntries = Number(previousRow?.total_in ?? 0);
+
+            const resetDetected = previousRow
+                && (
+                    currentLeft < previousLeft
+                    || currentRight < previousRight
+                    || currentEntries < previousEntries
+                );
+
+            const deltaLeft = previousRow
+                ? Math.max(0, resetDetected ? currentLeft : (currentLeft - previousLeft))
+                : Math.max(0, currentLeft);
+            const deltaRight = previousRow
+                ? Math.max(0, resetDetected ? currentRight : (currentRight - previousRight))
+                : Math.max(0, currentRight);
+            const deltaEntries = previousRow
+                ? Math.max(0, resetDetected ? currentEntries : (currentEntries - previousEntries))
+                : Math.max(0, currentEntries);
+
+            if (resetDetected) {
+                resetCount += 1;
+            }
+
+            totalLeftTraffic += deltaLeft;
+            totalRightTraffic += deltaRight;
+            totalEntries += deltaEntries;
+
+            const bucketStartMs = getBucketStartMs(row.tsMs, bucket);
+            const bucketEntry = bucketMap.get(bucketStartMs) || {
+                tsMs: bucketStartMs,
+                label: formatFlowBucketTick(bucketStartMs, bucket),
+                fullLabel: formatFlowBucketRange(bucketStartMs, bucket),
+                leftTraffic: 0,
+                rightTraffic: 0,
+                totalFootTraffic: 0,
+                entries: 0,
+                captureRate: 0,
+            };
+
+            bucketEntry.leftTraffic += deltaLeft;
+            bucketEntry.rightTraffic += deltaRight;
+            bucketEntry.totalFootTraffic += deltaLeft + deltaRight;
+            bucketEntry.entries += deltaEntries;
+            bucketMap.set(bucketStartMs, bucketEntry);
+            previousRow = row;
+        });
+    });
+
+    const series = Array.from(bucketMap.values())
+        .sort((a, b) => a.tsMs - b.tsMs)
+        .map((point) => ({
+            ...point,
+            captureRate: point.totalFootTraffic > 0 ? (point.entries / point.totalFootTraffic) * 100 : 0,
+        }));
+
+    const peakTrafficPeriod = series.reduce((best, point) => {
+        if (!best || point.totalFootTraffic > best.totalFootTraffic) return point;
+        return best;
+    }, null);
+    const peakConversionPeriod = series.reduce((best, point) => {
+        if (point.totalFootTraffic <= 0) return best;
+        if (!best || point.captureRate > best.captureRate) return point;
+        return best;
+    }, null);
+    const totalFootTraffic = totalLeftTraffic + totalRightTraffic;
+
+    return {
+        series,
+        totalLeftTraffic,
+        totalRightTraffic,
+        totalFootTraffic,
+        totalEntries,
+        captureRate: totalFootTraffic > 0 ? (totalEntries / totalFootTraffic) * 100 : 0,
+        peakTrafficPeriodLabel: peakTrafficPeriod?.fullLabel || '-',
+        peakConversionPeriodLabel: peakConversionPeriod?.fullLabel || '-',
+        resetCount,
     };
 };
 
@@ -263,224 +613,451 @@ const ExportDialog = ({ isOpen, onClose, onExport }) => {
     );
 };
 
-// --- Occupancy Over Time Chart ---
-const OccupancyChart = ({ apiUrl, cameras }) => {
-    const [selectedCameraOverride, setSelectedCameraOverride] = useState('');
-    const [historyData, setHistoryData] = useState([]);
-    const [loading, setLoading] = useState(false);
+const FlowTrendPanel = ({ snapshots, cameraLabel }) => {
     const [timeRange, setTimeRange] = useState('24h');
     const [customStart, setCustomStart] = useState(() => createDefaultCustomRange().start);
     const [customEnd, setCustomEnd] = useState(() => createDefaultCustomRange().end);
-    const [brushWindow, setBrushWindow] = useState({ key: '', startTs: null, endTs: null });
-    const selectedCamera = useMemo(() => (
-        cameras.some((camera) => camera.id === selectedCameraOverride)
-            ? selectedCameraOverride
-            : (cameras[0]?.id || '')
-    ), [cameras, selectedCameraOverride]);
-    const brushContextKey = `${selectedCamera}|${timeRange}|${customStart}|${customEnd}`;
-    const activeBrushWindow = useMemo(() => (
-        brushWindow.key === brushContextKey
-            ? brushWindow
-            : { key: brushContextKey, startTs: null, endTs: null }
-    ), [brushContextKey, brushWindow]);
+    const [selectedBucket, setSelectedBucket] = useState('auto');
+    const [showOccupancy, setShowOccupancy] = useState(false);
 
-    useEffect(() => {
-        if (!selectedCamera) return;
-        const fetchHistory = async () => {
-            setLoading(true);
-            try {
-                const nowMs = Date.now();
-                let rangeStartMs = null;
-                let rangeEndMs = nowMs;
-                if (timeRange === 'custom') {
-                    const customStartMs = new Date(customStart).getTime();
-                    const customEndMs = new Date(customEnd).getTime();
-                    if (Number.isNaN(customStartMs) || Number.isNaN(customEndMs) || customStartMs > customEndMs) {
-                        setHistoryData([]);
-                        setLoading(false);
-                        return;
-                    }
-                    rangeStartMs = customStartMs;
-                    rangeEndMs = customEndMs;
-                } else if (timeRange !== 'all') {
-                    rangeStartMs = nowMs - OCCUPANCY_RANGE_LOOKBACK_MS[timeRange];
-                }
+    const rangeBounds = useMemo(
+        () => getHistoryRangeBounds(timeRange, customStart, customEnd),
+        [timeRange, customStart, customEnd],
+    );
+    const effectiveBucket = useMemo(() => (
+        selectedBucket === 'auto'
+            ? getAdaptiveFlowBucket(timeRange, rangeBounds.startMs, rangeBounds.endMs)
+            : selectedBucket
+    ), [selectedBucket, timeRange, rangeBounds.startMs, rangeBounds.endMs]);
 
-                const rows = [];
-                let offset = 0;
-                while (offset < MAX_OCCUPANCY_HISTORY_ROWS) {
-                    const res = await fetch(
-                        `${apiUrl}/api/people-counting-history?camera_id=${selectedCamera}&limit=${OCCUPANCY_HISTORY_PAGE_SIZE}&offset=${offset}`,
-                    );
-                    if (!res.ok) break;
-
-                    const data = await res.json();
-                    if (!Array.isArray(data) || data.length === 0) break;
-
-                    rows.push(...data);
-                    offset += data.length;
-                    if (data.length < OCCUPANCY_HISTORY_PAGE_SIZE) break;
-                }
-
-                const filteredRows = rows
-                    .map((row) => {
-                        const ts = parseApiTimestamp(row.timestamp);
-                        if (!ts) return null;
-                        const ms = ts.getTime();
-                        if (rangeStartMs !== null && ms < rangeStartMs) return null;
-                        if (rangeEndMs !== null && ms > rangeEndMs) return null;
-                        return {
-                            ts,
-                            total_in: row.total_in,
-                            total_out: row.total_out,
-                            occupancy: row.current_occupancy,
-                        };
-                    })
-                    .filter(Boolean)
-                    .sort((a, b) => a.ts.getTime() - b.ts.getTime());
-
-                const sampledRows = downsampleSeries(filteredRows);
-                const chartData = sampledRows.map((row) => ({
-                    time: getOccupancyTickLabel(row.ts, timeRange),
-                    fullTime: row.ts.toLocaleString(),
-                    tsMs: row.ts.getTime(),
-                    in: row.total_in,
-                    out: row.total_out,
-                    occupancy: row.occupancy,
-                }));
-                setHistoryData(chartData);
-            } catch (err) {
-                console.error('Failed to fetch counting history:', err);
-                setHistoryData([]);
-            }
-            setLoading(false);
-        };
-        fetchHistory();
-        const interval = setInterval(fetchHistory, 15000);
-        return () => clearInterval(interval);
-    }, [apiUrl, selectedCamera, timeRange, customStart, customEnd]);
-
-    const brushIndices = useMemo(() => {
-        const maxIndex = Math.max(historyData.length - 1, 0);
-        if (!historyData.length) {
-            return { startIndex: 0, endIndex: 0 };
+    const flowSummary = useMemo(() => {
+        if (!rangeBounds.valid) {
+            return {
+                series: [],
+                totalIn: 0,
+                totalOut: 0,
+                totalTraffic: 0,
+                peakOccupancy: 0,
+                estimatedOccupancy: 0,
+                peakPeriodLabel: '-',
+                resetCount: 0,
+            };
         }
-        if (activeBrushWindow.startTs == null || activeBrushWindow.endTs == null) {
-            return { startIndex: 0, endIndex: maxIndex };
-        }
-
-        let startIndex = findNearestIndexByTimestamp(historyData, activeBrushWindow.startTs);
-        let endIndex = findNearestIndexByTimestamp(historyData, activeBrushWindow.endTs);
-        startIndex = clamp(startIndex, 0, maxIndex);
-        endIndex = clamp(endIndex, 0, maxIndex);
-
-        if (startIndex > endIndex) {
-            return { startIndex: endIndex, endIndex: startIndex };
-        }
-        return { startIndex, endIndex };
-    }, [activeBrushWindow, historyData]);
-
-    const handleBrushChange = useCallback((range) => {
-        if (!range || !historyData.length) return;
-
-        const maxIndex = historyData.length - 1;
-        const startIndex = clamp(Number(range.startIndex ?? 0), 0, maxIndex);
-        const endIndex = clamp(Number(range.endIndex ?? maxIndex), 0, maxIndex);
-        const startTs = historyData[startIndex]?.tsMs ?? null;
-        const endTs = historyData[endIndex]?.tsMs ?? null;
-
-        setBrushWindow((prev) => {
-            if (prev.key === brushContextKey && prev.startTs === startTs && prev.endTs === endTs) return prev;
-            return { key: brushContextKey, startTs, endTs };
+        return aggregateCountingFlow(snapshots, {
+            startMs: rangeBounds.startMs,
+            endMs: rangeBounds.endMs,
+            bucket: effectiveBucket,
         });
-    }, [brushContextKey, historyData]);
+    }, [effectiveBucket, rangeBounds.endMs, rangeBounds.startMs, rangeBounds.valid, snapshots]);
+
+    const isDailyView = effectiveBucket === '1d';
+    const ChartComponent = isDailyView ? ComposedChart : ComposedChart;
 
     return (
         <Card className="flex flex-col min-h-[420px]">
             <CardHeader className="space-y-3">
-                <CardTitle className="flex items-center gap-2">
-                    <Users className="w-4 h-4" />
-                    Occupancy Over Time
-                </CardTitle>
-                <div className="flex flex-wrap items-center gap-2">
-                    <select
-                        className="h-8 rounded-md border border-input bg-background px-2 text-xs"
-                        value={selectedCamera}
-                        onChange={(e) => setSelectedCameraOverride(e.target.value)}
-                    >
-                        <option value="">Select camera...</option>
-                        {cameras.map(cam => (
-                            <option key={cam.id} value={cam.id}>{cam.name || cam.id}</option>
-                        ))}
-                    </select>
-
-                    <select
-                        className="h-8 rounded-md border border-input bg-background px-2 text-xs"
-                        value={timeRange}
-                        onChange={(e) => setTimeRange(e.target.value)}
-                    >
-                        <option value="1h">Last 1 hour</option>
-                        <option value="6h">Last 6 hours</option>
-                        <option value="24h">Last 24 hours</option>
-                        <option value="7d">Last 7 days</option>
-                        <option value="30d">Last 30 days</option>
-                        <option value="all">All data</option>
-                        <option value="custom">Custom range</option>
-                    </select>
-
-                    {timeRange === 'custom' && (
-                        <>
-                            <input
-                                type="datetime-local"
-                                value={customStart}
-                                onChange={(e) => setCustomStart(e.target.value)}
-                                className="h-8 rounded-md border border-input bg-background px-2 text-xs"
-                            />
-                            <span className="text-xs text-muted-foreground">to</span>
-                            <input
-                                type="datetime-local"
-                                value={customEnd}
-                                onChange={(e) => setCustomEnd(e.target.value)}
-                                className="h-8 rounded-md border border-input bg-background px-2 text-xs"
-                            />
-                        </>
-                    )}
+                <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+                    <div>
+                        <CardTitle className="flex items-center gap-2">
+                            <TrendingUp className="w-4 h-4" />
+                            In/Out Over Time
+                        </CardTitle>
+                        <p className="mt-1 text-sm text-muted-foreground">
+                            {cameraLabel} flow trend with adaptive {effectiveBucket === '15m' ? '15-minute' : effectiveBucket === '1h' ? 'hourly' : 'daily'} buckets.
+                        </p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-xs font-medium text-muted-foreground">Range</span>
+                        <select
+                            className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                            value={timeRange}
+                            onChange={(e) => setTimeRange(e.target.value)}
+                        >
+                            <option value="1h">Last 1 hour</option>
+                            <option value="6h">Last 6 hours</option>
+                            <option value="24h">Last 24 hours</option>
+                            <option value="7d">Last 7 days</option>
+                            <option value="30d">Last 30 days</option>
+                            <option value="all">All data</option>
+                            <option value="custom">Custom range</option>
+                        </select>
+                        <span className="text-xs font-medium text-muted-foreground">Grouping</span>
+                        <select
+                            className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                            value={selectedBucket}
+                            onChange={(e) => setSelectedBucket(e.target.value)}
+                        >
+                            <option value="auto">Auto</option>
+                            <option value="15m">15 min</option>
+                            <option value="1h">Hourly</option>
+                            <option value="1d">Daily</option>
+                        </select>
+                        <label className="inline-flex items-center gap-2 rounded-md border border-input px-2 py-1.5 text-xs text-muted-foreground">
+                            <Checkbox checked={showOccupancy} onCheckedChange={setShowOccupancy} />
+                            Show occupancy
+                        </label>
+                    </div>
                 </div>
+                <p className="text-xs text-muted-foreground">
+                    Range controls how much history is shown. Grouping controls whether the trend is combined into 15-minute, hourly, or daily points.
+                </p>
+
+                {timeRange === 'custom' && (
+                    <div className="flex flex-wrap items-center gap-2">
+                        <input
+                            type="datetime-local"
+                            value={customStart}
+                            onChange={(e) => setCustomStart(e.target.value)}
+                            className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                        />
+                        <span className="text-xs text-muted-foreground">to</span>
+                        <input
+                            type="datetime-local"
+                            value={customEnd}
+                            onChange={(e) => setCustomEnd(e.target.value)}
+                            className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                        />
+                    </div>
+                )}
+
+                {flowSummary.resetCount > 0 && (
+                    <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700">
+                        {flowSummary.resetCount} counter reset{flowSummary.resetCount !== 1 ? 's were' : ' was'} detected in this trend range. Flow totals are derived from deltas, while occupancy should be treated as an estimate.
+                    </div>
+                )}
             </CardHeader>
             <CardContent className="flex-1 min-h-[300px]">
-                {historyData.length > 0 ? (
+                {flowSummary.series.length > 0 ? (
                     <ResponsiveContainer width="100%" height="100%">
-                        <LineChart data={historyData} margin={{ top: 10, right: 10, left: -20, bottom: 20 }}>
+                        <ChartComponent data={flowSummary.series} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
                             <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
-                            <XAxis dataKey="time" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
-                            <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} allowDecimals={false} />
+                            <XAxis dataKey="label" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
+                            <YAxis
+                                yAxisId="flow"
+                                className="text-xs text-muted-foreground"
+                                tickLine={false}
+                                axisLine={false}
+                                allowDecimals={false}
+                            />
+                            {showOccupancy && (
+                                <YAxis
+                                    yAxisId="occupancy"
+                                    orientation="right"
+                                    className="text-xs text-muted-foreground"
+                                    tickLine={false}
+                                    axisLine={false}
+                                    allowDecimals={false}
+                                />
+                            )}
                             <RechartsTooltip
                                 cursor={{ strokeDasharray: '3 3' }}
-                                labelFormatter={(_, payload) => payload?.[0]?.payload?.fullTime || ''}
+                                labelFormatter={(_, payload) => payload?.[0]?.payload?.fullLabel || ''}
+                                formatter={(value, name) => [formatNumber(value), name]}
                                 contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
                             />
                             <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
-                            <Line type="monotone" dataKey="occupancy" name="Occupancy" stroke="#3b82f6" strokeWidth={2} dot={false} />
-                            <Line type="monotone" dataKey="in" name="Total In" stroke="#22c55e" strokeWidth={2} dot={false} />
-                            <Line type="monotone" dataKey="out" name="Total Out" stroke="#ef4444" strokeWidth={2} dot={false} />
-                            <Brush
-                                dataKey="time"
-                                height={22}
-                                stroke="#3b82f6"
-                                travellerWidth={8}
-                                startIndex={brushIndices.startIndex}
-                                endIndex={brushIndices.endIndex}
-                                onChange={handleBrushChange}
-                            />
-                        </LineChart>
+                            {isDailyView ? (
+                                <>
+                                    <Bar yAxisId="flow" dataKey="in" name="In" fill="#22c55e" radius={[4, 4, 0, 0]} maxBarSize={36} />
+                                    <Bar yAxisId="flow" dataKey="out" name="Out" fill="#ef4444" radius={[4, 4, 0, 0]} maxBarSize={36} />
+                                </>
+                            ) : (
+                                <>
+                                    <Line yAxisId="flow" type="monotone" dataKey="in" name="In" stroke="#22c55e" strokeWidth={2.5} dot={false} />
+                                    <Line yAxisId="flow" type="monotone" dataKey="out" name="Out" stroke="#ef4444" strokeWidth={2.5} dot={false} />
+                                </>
+                            )}
+                            {showOccupancy && (
+                                <Line
+                                    yAxisId="occupancy"
+                                    type="monotone"
+                                    dataKey="occupancy"
+                                    name="Occupancy"
+                                    stroke="#2563eb"
+                                    strokeWidth={2}
+                                    dot={false}
+                                    strokeDasharray="6 4"
+                                />
+                            )}
+                        </ChartComponent>
                     </ResponsiveContainer>
                 ) : (
                     <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
-                        {loading ? 'Loading...' : selectedCamera ? 'No occupancy data available for selected range' : 'Select a camera to view occupancy history'}
+                        {rangeBounds.valid ? 'No people-counting flow data available for the selected trend range' : 'Choose a valid custom date/time range to view flow'}
                     </div>
                 )}
             </CardContent>
         </Card>
+    );
+};
+
+const TrafficAnalyticsPanel = ({ snapshots, cameraLabel, startMs, endMs, isAllCameras }) => {
+    const summaryBucket = useMemo(() => {
+        const nowMs = Date.now();
+        const effectiveEndMs = endMs ?? nowMs;
+        const effectiveStartMs = startMs ?? Math.max(0, effectiveEndMs - OCCUPANCY_RANGE_LOOKBACK_MS['7d']);
+        return getAdaptiveFlowBucket('custom', effectiveStartMs, effectiveEndMs);
+    }, [endMs, startMs]);
+
+    const trafficSummary = useMemo(() => aggregateTrafficAnalytics(snapshots, {
+        startMs,
+        endMs,
+        bucket: summaryBucket,
+    }), [endMs, snapshots, startMs, summaryBucket]);
+
+    const dailyTrafficSeries = useMemo(() => (
+        aggregateTrafficAnalytics(snapshots, {
+            startMs,
+            endMs,
+            bucket: '1d',
+        }).series.slice(-14)
+    ), [endMs, snapshots, startMs]);
+
+    const isAdaptiveDaily = summaryBucket === '1d';
+    const TrendChartComponent = isAdaptiveDaily ? ComposedChart : ComposedChart;
+
+    return (
+        <div className="space-y-6">
+            <div className="space-y-1">
+                <h2 className="text-lg font-semibold tracking-tight">Traffic Analytics</h2>
+                <p className="text-sm text-muted-foreground">
+                    Foot-traffic and conversion reporting for {cameraLabel}.
+                </p>
+            </div>
+
+            {isAllCameras && (
+                <div className="rounded-md border border-blue-500/20 bg-blue-500/5 px-4 py-3 text-sm text-blue-700">
+                    Combined traffic analytics are being shown across all selected cameras. Choose a single camera for the clearest camera-level conversion view.
+                </div>
+            )}
+
+            {trafficSummary.resetCount > 0 && (
+                <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-700">
+                    Traffic counter resets were detected in the selected report range. Foot-traffic and capture-rate trends are reconstructed from snapshot deltas.
+                </div>
+            )}
+
+            <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+                <div className="rounded-xl border border-sky-500/20 bg-sky-500/10 p-4">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <ArrowLeft className="h-4 w-4 text-sky-600" />
+                        Left Traffic
+                    </div>
+                    <div className="mt-2 text-3xl font-bold text-sky-700">{formatNumber(trafficSummary.totalLeftTraffic)}</div>
+                </div>
+                <div className="rounded-xl border border-violet-500/20 bg-violet-500/10 p-4">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <ArrowRight className="h-4 w-4 text-violet-600" />
+                        Right Traffic
+                    </div>
+                    <div className="mt-2 text-3xl font-bold text-violet-700">{formatNumber(trafficSummary.totalRightTraffic)}</div>
+                </div>
+                <div className="rounded-xl border border-slate-300 bg-slate-50 p-4">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <Activity className="h-4 w-4 text-slate-700" />
+                        Total Traffic Flow
+                    </div>
+                    <div className="mt-2 text-3xl font-bold text-slate-800">{formatNumber(trafficSummary.totalFootTraffic)}</div>
+                </div>
+                <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-4">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <Clock3 className="h-4 w-4 text-amber-600" />
+                        Peak Traffic Period
+                    </div>
+                    <div className="mt-2 text-lg font-semibold text-amber-700">{trafficSummary.peakTrafficPeriodLabel}</div>
+                </div>
+            </div>
+
+            <div className="grid gap-6 xl:grid-cols-2">
+                <Card className="flex flex-col min-h-[360px]">
+                    <CardHeader>
+                        <CardTitle>Left/Right Traffic Over Time</CardTitle>
+                    </CardHeader>
+                    <CardContent className="flex-1 min-h-[260px]">
+                        {trafficSummary.series.length > 0 ? (
+                            <ResponsiveContainer width="100%" height="100%">
+                                <TrendChartComponent data={trafficSummary.series} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                                    <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
+                                    <XAxis dataKey="label" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
+                                    <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} allowDecimals={false} />
+                                    <RechartsTooltip
+                                        cursor={{ strokeDasharray: '3 3' }}
+                                        labelFormatter={(_, payload) => payload?.[0]?.payload?.fullLabel || ''}
+                                        formatter={(value, name) => [formatNumber(value), name]}
+                                        contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
+                                    />
+                                    <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
+                                    {isAdaptiveDaily ? (
+                                        <>
+                                            <Bar dataKey="leftTraffic" name="Left Traffic" fill="#0ea5e9" radius={[4, 4, 0, 0]} maxBarSize={36} />
+                                            <Bar dataKey="rightTraffic" name="Right Traffic" fill="#8b5cf6" radius={[4, 4, 0, 0]} maxBarSize={36} />
+                                        </>
+                                    ) : (
+                                        <>
+                                            <Line type="monotone" dataKey="leftTraffic" name="Left Traffic" stroke="#0ea5e9" strokeWidth={2.5} dot={false} />
+                                            <Line type="monotone" dataKey="rightTraffic" name="Right Traffic" stroke="#8b5cf6" strokeWidth={2.5} dot={false} />
+                                        </>
+                                    )}
+                                </TrendChartComponent>
+                            </ResponsiveContainer>
+                        ) : (
+                            <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
+                                No traffic data available for the selected report range
+                            </div>
+                        )}
+                    </CardContent>
+                </Card>
+
+                <Card className="flex flex-col min-h-[360px]">
+                    <CardHeader>
+                        <CardTitle>Left/Right Traffic by Day</CardTitle>
+                    </CardHeader>
+                    <CardContent className="flex-1 min-h-[260px]">
+                        {dailyTrafficSeries.length > 0 ? (
+                            <ResponsiveContainer width="100%" height="100%">
+                                <BarChart data={dailyTrafficSeries} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                                    <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
+                                    <XAxis dataKey="label" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
+                                    <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} allowDecimals={false} />
+                                    <RechartsTooltip
+                                        cursor={{ fill: 'transparent' }}
+                                        formatter={(value, name) => [formatNumber(value), name]}
+                                        contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
+                                    />
+                                    <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
+                                    <Bar dataKey="leftTraffic" name="Left Traffic" fill="#0ea5e9" radius={[4, 4, 0, 0]} maxBarSize={36} />
+                                    <Bar dataKey="rightTraffic" name="Right Traffic" fill="#8b5cf6" radius={[4, 4, 0, 0]} maxBarSize={36} />
+                                </BarChart>
+                            </ResponsiveContainer>
+                        ) : (
+                            <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
+                                No daily traffic data available
+                            </div>
+                        )}
+                    </CardContent>
+                </Card>
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+                <div className="rounded-xl border border-slate-300 bg-slate-50 p-4">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <Activity className="h-4 w-4 text-slate-700" />
+                        Total Foot Traffic
+                    </div>
+                    <div className="mt-2 text-3xl font-bold text-slate-800">{formatNumber(trafficSummary.totalFootTraffic)}</div>
+                </div>
+                <div className="rounded-xl border border-green-500/20 bg-green-500/10 p-4">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <ArrowDownToLine className="h-4 w-4 text-green-600" />
+                        Total Entries
+                    </div>
+                    <div className="mt-2 text-3xl font-bold text-green-600">{formatNumber(trafficSummary.totalEntries)}</div>
+                </div>
+                <div className="rounded-xl border border-indigo-500/20 bg-indigo-500/10 p-4">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <Target className="h-4 w-4 text-indigo-600" />
+                        Capture Rate
+                    </div>
+                    <div className="mt-2 text-3xl font-bold text-indigo-700">{trafficSummary.captureRate.toFixed(1)}%</div>
+                </div>
+                <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-4">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <Clock3 className="h-4 w-4 text-amber-600" />
+                        Peak Conversion Period
+                    </div>
+                    <div className="mt-2 text-lg font-semibold text-amber-700">{trafficSummary.peakConversionPeriodLabel}</div>
+                </div>
+            </div>
+
+            <div className="grid gap-6 xl:grid-cols-2">
+                <Card className="flex flex-col min-h-[360px]">
+                    <CardHeader>
+                        <CardTitle>Capture Rate Over Time</CardTitle>
+                    </CardHeader>
+                    <CardContent className="flex-1 min-h-[260px]">
+                        {trafficSummary.series.length > 0 ? (
+                            <ResponsiveContainer width="100%" height="100%">
+                                <LineChart data={trafficSummary.series} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                                    <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
+                                    <XAxis dataKey="label" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
+                                    <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} domain={[0, 100]} tickFormatter={(value) => `${value}%`} />
+                                    <RechartsTooltip
+                                        cursor={{ strokeDasharray: '3 3' }}
+                                        labelFormatter={(_, payload) => payload?.[0]?.payload?.fullLabel || ''}
+                                        formatter={(value, name) => [`${Number(value).toFixed(1)}%`, name]}
+                                        contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
+                                    />
+                                    <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
+                                    <Line type="monotone" dataKey="captureRate" name="Capture Rate" stroke="#4f46e5" strokeWidth={2.5} dot={false} />
+                                </LineChart>
+                            </ResponsiveContainer>
+                        ) : (
+                            <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
+                                No capture-rate data available for the selected report range
+                            </div>
+                        )}
+                    </CardContent>
+                </Card>
+
+                <Card className="flex flex-col min-h-[360px]">
+                    <CardHeader>
+                        <CardTitle>Foot Traffic vs Entries Over Time</CardTitle>
+                    </CardHeader>
+                    <CardContent className="flex-1 min-h-[260px]">
+                        {trafficSummary.series.length > 0 ? (
+                            <ResponsiveContainer width="100%" height="100%">
+                                <ComposedChart data={trafficSummary.series} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                                    <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
+                                    <XAxis dataKey="label" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
+                                    <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} allowDecimals={false} />
+                                    <RechartsTooltip
+                                        cursor={{ strokeDasharray: '3 3' }}
+                                        labelFormatter={(_, payload) => payload?.[0]?.payload?.fullLabel || ''}
+                                        formatter={(value, name) => [formatNumber(value), name]}
+                                        contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
+                                    />
+                                    <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
+                                    <Bar dataKey="totalFootTraffic" name="Foot Traffic" fill="#94a3b8" radius={[4, 4, 0, 0]} maxBarSize={36} />
+                                    <Line type="monotone" dataKey="entries" name="Entries" stroke="#16a34a" strokeWidth={2.5} dot={false} />
+                                </ComposedChart>
+                            </ResponsiveContainer>
+                        ) : (
+                            <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
+                                No comparison data available for the selected report range
+                            </div>
+                        )}
+                    </CardContent>
+                </Card>
+            </div>
+
+            <Card className="flex flex-col min-h-[360px]">
+                <CardHeader>
+                    <CardTitle>Capture Rate by Day</CardTitle>
+                </CardHeader>
+                <CardContent className="flex-1 min-h-[260px]">
+                    {dailyTrafficSeries.length > 0 ? (
+                        <ResponsiveContainer width="100%" height="100%">
+                            <BarChart data={dailyTrafficSeries} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                                <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
+                                <XAxis dataKey="label" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
+                                <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} domain={[0, 100]} tickFormatter={(value) => `${value}%`} />
+                                <RechartsTooltip
+                                    cursor={{ fill: 'transparent' }}
+                                    formatter={(value, name) => [`${Number(value).toFixed(1)}%`, name]}
+                                    contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
+                                />
+                                <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
+                                <Bar dataKey="captureRate" name="Capture Rate" fill="#4f46e5" radius={[4, 4, 0, 0]} maxBarSize={36} />
+                            </BarChart>
+                        </ResponsiveContainer>
+                    ) : (
+                        <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
+                            No daily capture-rate data available
+                        </div>
+                    )}
+                </CardContent>
+            </Card>
+        </div>
     );
 };
 
@@ -884,8 +1461,9 @@ const Reporting = () => {
     const [selectedCategory, setSelectedCategory] = useState('All');
     const [selectedPeopleCountingView, setSelectedPeopleCountingView] = useState('building');
     const [selectedCameraFilter, setSelectedCameraFilter] = useState('all');
-    const [startDate, setStartDate] = useState('');
-    const [endDate, setEndDate] = useState('');
+    const [selectedQuickRange, setSelectedQuickRange] = useState('7d');
+    const [startDate, setStartDate] = useState(() => formatDateOnlyLocal(new Date(Date.now() - (6 * 24 * 60 * 60 * 1000))));
+    const [endDate, setEndDate] = useState(() => formatDateOnlyLocal(new Date()));
     const [selectedRecord, setSelectedRecord] = useState(null);
     const [showExportModal, setShowExportModal] = useState(false);
     const [currentPage, setCurrentPage] = useState(1);
@@ -1009,16 +1587,23 @@ const Reporting = () => {
             .map(([id, name]) => ({ id, name }))
             .sort((a, b) => a.name.localeCompare(b.name));
     }, [cameras, events, countingSnapshots]);
+    const effectiveDateRange = useMemo(
+        () => getQuickRangeDateBounds(selectedQuickRange, startDate, endDate),
+        [selectedQuickRange, startDate, endDate],
+    );
+    const effectiveStartDate = effectiveDateRange.startDate;
+    const effectiveEndDate = effectiveDateRange.endDate;
+    const isCustomQuickRange = selectedQuickRange === 'custom';
 
     // Date filter helper
     const dateFilter = (timestamp) => {
         const dayIso = getTimestampIsoDate(timestamp);
         if (!dayIso) return false;
-        if (startDate) {
-            if (dayIso < startDate) return false;
+        if (effectiveStartDate) {
+            if (dayIso < effectiveStartDate) return false;
         }
-        if (endDate) {
-            if (dayIso > endDate) return false;
+        if (effectiveEndDate) {
+            if (dayIso > effectiveEndDate) return false;
         }
         return true;
     };
@@ -1038,7 +1623,37 @@ const Reporting = () => {
         .filter(s => dateFilter(s.timestamp) && cameraFilter(s.camera_id));
     const isPeopleCountingCategory = selectedCategory === 'People Counting';
     const isPeopleCountingBuildingView = isPeopleCountingCategory && selectedPeopleCountingView === 'building';
-    const showOccupancyChart = selectedCategory === 'All' || (isPeopleCountingCategory && !isPeopleCountingBuildingView);
+    const isPeopleCountingCameraView = isPeopleCountingCategory && selectedPeopleCountingView === 'camera';
+    const isPeopleCountingTrafficView = isPeopleCountingCategory && selectedPeopleCountingView === 'traffic';
+    const selectedCountingSnapshots = countingSnapshots
+        .map(s => ({ ...s, camera_name: s.camera_name || cameraNameById[s.camera_id] || s.camera_id }))
+        .filter(s => cameraFilter(s.camera_id));
+    const reportingDateBounds = getDateRangeBounds(effectiveStartDate, effectiveEndDate);
+    const selectedCameraMeta = selectedCameraFilter === 'all'
+        ? null
+        : cameraOptions.find((cam) => cam.id === selectedCameraFilter);
+    const selectedCameraLabel = selectedCameraMeta?.name
+        || (selectedCameraFilter === 'all'
+            ? `Selected cameras${cameraOptions.length ? ` (${cameraOptions.length})` : ''}`
+            : selectedCameraFilter);
+    const peopleCountingSummaryBucket = useMemo(() => {
+        const nowMs = Date.now();
+        const effectiveEndMs = reportingDateBounds.endMs ?? nowMs;
+        const effectiveStartMs = reportingDateBounds.startMs ?? Math.max(0, effectiveEndMs - OCCUPANCY_RANGE_LOOKBACK_MS['7d']);
+        return getAdaptiveFlowBucket('custom', effectiveStartMs, effectiveEndMs);
+    }, [reportingDateBounds.endMs, reportingDateBounds.startMs]);
+    const peopleCountingSummary = useMemo(() => aggregateCountingFlow(selectedCountingSnapshots, {
+        startMs: reportingDateBounds.startMs,
+        endMs: reportingDateBounds.endMs,
+        bucket: peopleCountingSummaryBucket,
+    }), [peopleCountingSummaryBucket, reportingDateBounds.endMs, reportingDateBounds.startMs, selectedCountingSnapshots]);
+    const dailyFlowSeries = useMemo(() => (
+        aggregateCountingFlow(selectedCountingSnapshots, {
+            startMs: reportingDateBounds.startMs,
+            endMs: reportingDateBounds.endMs,
+            bucket: '1d',
+        }).series.slice(-14)
+    ), [reportingDateBounds.endMs, reportingDateBounds.startMs, selectedCountingSnapshots]);
 
     // Build combined display rows for log table
     const displayRows = (() => {
@@ -1081,18 +1696,11 @@ const Reporting = () => {
     // Build chart data
     const chartData = (() => {
         if (selectedCategory === 'People Counting') {
-            // Aggregate counting snapshots by day: show max IN/OUT per day
-            const byDay = {};
-            filteredSnapshots.forEach(s => {
-                const parsed = parseApiTimestamp(s.timestamp);
-                if (!parsed) return;
-                const day = parsed.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-                if (!byDay[day]) byDay[day] = { name: day, totalIn: 0, totalOut: 0, maxOccupancy: 0 };
-                byDay[day].totalIn = Math.max(byDay[day].totalIn, s.total_in);
-                byDay[day].totalOut = Math.max(byDay[day].totalOut, s.total_out);
-                byDay[day].maxOccupancy = Math.max(byDay[day].maxOccupancy, s.current_occupancy);
-            });
-            return Object.values(byDay).slice(-7);
+            return dailyFlowSeries.map((point) => ({
+                name: point.label,
+                totalIn: point.in,
+                totalOut: point.out,
+            }));
         }
         // Detection events aggregated by day
         const byDay = {};
@@ -1107,6 +1715,7 @@ const Reporting = () => {
     })();
 
     const isPeopleCountingChart = isPeopleCountingCategory;
+    const showStandardReportSections = !isPeopleCountingBuildingView && !isPeopleCountingTrafficView;
     const totalDisplayRows = displayRows.length;
     const totalPages = Math.max(1, Math.ceil(totalDisplayRows / rowsPerPage));
     const pageStartIndex = (currentPage - 1) * rowsPerPage;
@@ -1116,7 +1725,7 @@ const Reporting = () => {
 
     useEffect(() => {
         setCurrentPage(1);
-    }, [selectedCategory, selectedPeopleCountingView, selectedCameraFilter, startDate, endDate]);
+    }, [selectedCategory, selectedPeopleCountingView, selectedCameraFilter, selectedQuickRange, startDate, endDate]);
 
     useEffect(() => {
         if (currentPage > totalPages) {
@@ -1186,84 +1795,123 @@ const Reporting = () => {
 
             {/* Filter Bar */}
             <Card className="shrink-0">
-                <CardContent className="p-4 flex flex-wrap items-end gap-4">
-                    <div className="space-y-2">
-                        <label className="text-sm font-medium">Report Category</label>
-                        <div className="flex bg-muted rounded-md p-1 h-10 items-center">
-                            {['All', 'Dress Code', 'Fall Detection', 'People Counting'].map(cat => (
-                                <button key={cat} onClick={() => handleCategoryChange(cat)}
-                                    className={cn("px-3 py-1.5 text-sm font-medium rounded-sm transition-all flex-1 whitespace-nowrap",
-                                        selectedCategory === cat ? "bg-background shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground")}>
-                                    {cat}
-                                </button>
-                            ))}
-                        </div>
-                    </div>
-
-                    {isPeopleCountingCategory && (
+                <CardContent className="space-y-4 p-4">
+                    <div className={cn(
+                        "grid gap-4",
+                        isPeopleCountingCategory
+                            ? "xl:grid-cols-[minmax(0,2fr)_minmax(0,1.2fr)]"
+                            : "xl:grid-cols-1",
+                    )}>
                         <div className="space-y-2">
-                            <label className="text-sm font-medium">People Counting View</label>
+                            <label className="text-sm font-medium">Report Category</label>
                             <div className="flex bg-muted rounded-md p-1 h-10 items-center">
-                                {[
-                                    { id: 'building', label: 'Building' },
-                                    { id: 'camera', label: 'Camera' },
-                                ].map(view => (
-                                    <button
-                                        key={view.id}
-                                        onClick={() => setSelectedPeopleCountingView(view.id)}
-                                        className={cn(
-                                            "px-3 py-1.5 text-sm font-medium rounded-sm transition-all flex-1 whitespace-nowrap",
-                                            selectedPeopleCountingView === view.id
-                                                ? "bg-background shadow-sm text-foreground"
-                                                : "text-muted-foreground hover:text-foreground",
-                                        )}
-                                    >
-                                        {view.label}
+                                {['All', 'Dress Code', 'Fall Detection', 'People Counting'].map(cat => (
+                                    <button key={cat} onClick={() => handleCategoryChange(cat)}
+                                        className={cn("px-3 py-1.5 text-sm font-medium rounded-sm transition-all flex-1 whitespace-nowrap",
+                                            selectedCategory === cat ? "bg-background shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground")}>
+                                        {cat}
                                     </button>
                                 ))}
                             </div>
                         </div>
-                    )}
 
-                    <div className="space-y-2">
-                        <label className="text-sm font-medium">Date Range</label>
-                        <div className="flex items-center gap-2">
-                            <div className="relative">
-                                <Calendar className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-                                <input type="date"
-                                    className="h-10 rounded-md border border-input bg-background px-3 py-2 pl-9 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                                    value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+                        {isPeopleCountingCategory && (
+                            <div className="space-y-2">
+                                <label className="text-sm font-medium">People Counting View</label>
+                                <div className="flex bg-muted rounded-md p-1 h-10 items-center">
+                                    {[
+                                        { id: 'building', label: 'Building' },
+                                        { id: 'camera', label: 'Camera' },
+                                        { id: 'traffic', label: 'Traffic Analytics' },
+                                    ].map(view => (
+                                        <button
+                                            key={view.id}
+                                            onClick={() => setSelectedPeopleCountingView(view.id)}
+                                            className={cn(
+                                                "px-3 py-1.5 text-sm font-medium rounded-sm transition-all flex-1 whitespace-nowrap",
+                                                selectedPeopleCountingView === view.id
+                                                    ? "bg-background shadow-sm text-foreground"
+                                                    : "text-muted-foreground hover:text-foreground",
+                                            )}
+                                        >
+                                            {view.label}
+                                        </button>
+                                    ))}
+                                </div>
                             </div>
-                            <span className="text-muted-foreground">-</span>
-                            <div className="relative">
-                                <Calendar className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-                                <input type="date"
-                                    className="h-10 rounded-md border border-input bg-background px-3 py-2 pl-9 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                                    value={endDate} onChange={(e) => setEndDate(e.target.value)} />
-                            </div>
-                        </div>
+                        )}
                     </div>
 
-                    {!isPeopleCountingBuildingView && (
+                    <div className={cn(
+                        "grid gap-4 xl:items-end",
+                        isPeopleCountingBuildingView
+                            ? "xl:grid-cols-[minmax(180px,0.8fr)_minmax(180px,1fr)_minmax(180px,1fr)_auto]"
+                            : "xl:grid-cols-[minmax(180px,0.8fr)_minmax(180px,1fr)_minmax(180px,1fr)_minmax(220px,1fr)_auto]",
+                    )}>
                         <div className="space-y-2">
-                            <label className="text-sm font-medium">Camera</label>
+                            <label className="text-sm font-medium">Quick Range</label>
                             <select
-                                className="h-10 min-w-[220px] rounded-md border border-input bg-background px-3 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                                value={selectedCameraFilter}
-                                onChange={(e) => setSelectedCameraFilter(e.target.value)}
+                                className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                value={selectedQuickRange}
+                                onChange={(e) => setSelectedQuickRange(e.target.value)}
                             >
-                                <option value="all">All Cameras</option>
-                                {cameraOptions.map(cam => (
-                                    <option key={cam.id} value={cam.id}>{cam.name || cam.id}</option>
-                                ))}
+                                <option value="today">Today</option>
+                                <option value="7d">Last 7 Days</option>
+                                <option value="30d">Last 30 Days</option>
+                                <option value="all">All Time</option>
+                                <option value="custom">Custom</option>
                             </select>
                         </div>
-                    )}
 
-                    <div className="text-sm text-muted-foreground ml-auto self-end pb-2">
-                        {isPeopleCountingBuildingView
-                            ? 'Building-level occupancy view'
-                            : `${totalDisplayRows} record${totalDisplayRows !== 1 ? 's' : ''} found`}
+                        <div className={cn("space-y-2 transition-opacity", !isCustomQuickRange && "opacity-50")}>
+                            <label className="text-sm font-medium">Start Date</label>
+                            <div className="relative">
+                                <Calendar className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+                                <input
+                                    type="date"
+                                    disabled={!isCustomQuickRange}
+                                    className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 pl-9 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:bg-muted/30"
+                                    value={startDate}
+                                    onChange={(e) => setStartDate(e.target.value)}
+                                />
+                            </div>
+                        </div>
+
+                        <div className={cn("space-y-2 transition-opacity", !isCustomQuickRange && "opacity-50")}>
+                            <label className="text-sm font-medium">End Date</label>
+                            <div className="relative">
+                                <Calendar className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+                                <input
+                                    type="date"
+                                    disabled={!isCustomQuickRange}
+                                    className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 pl-9 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:bg-muted/30"
+                                    value={endDate}
+                                    onChange={(e) => setEndDate(e.target.value)}
+                                />
+                            </div>
+                        </div>
+
+                        {!isPeopleCountingBuildingView && (
+                            <div className="space-y-2">
+                                <label className="text-sm font-medium">Camera</label>
+                                <select
+                                    className="h-10 w-full min-w-[220px] rounded-md border border-input bg-background px-3 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                    value={selectedCameraFilter}
+                                    onChange={(e) => setSelectedCameraFilter(e.target.value)}
+                                >
+                                    <option value="all">All Cameras</option>
+                                    {cameraOptions.map(cam => (
+                                        <option key={cam.id} value={cam.id}>{cam.name || cam.id}</option>
+                                    ))}
+                                </select>
+                            </div>
+                        )}
+
+                        <div className="text-sm text-muted-foreground xl:justify-self-end xl:self-end pb-2">
+                            {isPeopleCountingBuildingView
+                                ? 'Building-level occupancy view'
+                                : `${totalDisplayRows} record${totalDisplayRows !== 1 ? 's' : ''} found`}
+                        </div>
                     </div>
                 </CardContent>
             </Card>
@@ -1272,8 +1920,8 @@ const Reporting = () => {
             <div className="flex-1 overflow-y-auto grid grid-cols-1 gap-6 min-h-0">
                 <BuildingOccupancyPanel
                     apiUrl={apiUrl}
-                    startDate={startDate}
-                    endDate={endDate}
+                    startDate={effectiveStartDate}
+                    endDate={effectiveEndDate}
                     refreshToken={refreshToken}
                     visible={selectedCategory === 'All' || isPeopleCountingBuildingView}
                 />
@@ -1287,10 +1935,86 @@ const Reporting = () => {
 
                 {!isPeopleCountingBuildingView && (
                     <>
+                        {isPeopleCountingCameraView && (
+                            <>
+                                <div className="space-y-1">
+                                    <h2 className="text-lg font-semibold tracking-tight">Reporting</h2>
+                                    <p className="text-sm text-muted-foreground">
+                                        Camera-focused flow reporting for {selectedCameraLabel}.
+                                    </p>
+                                </div>
+
+                                {selectedCameraFilter === 'all' && (
+                                    <div className="rounded-md border border-blue-500/20 bg-blue-500/5 px-4 py-3 text-sm text-blue-700">
+                                        Combined flow is being shown across all selected cameras. Choose a single camera for the clearest entrance-level report.
+                                    </div>
+                                )}
+
+                                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6">
+                                    <div className="rounded-xl border border-green-500/20 bg-green-500/10 p-4">
+                                        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                            <ArrowDownToLine className="h-4 w-4 text-green-600" />
+                                            Total In
+                                        </div>
+                                        <div className="mt-2 text-3xl font-bold text-green-600">{formatNumber(peopleCountingSummary.totalIn)}</div>
+                                    </div>
+                                    <div className="rounded-xl border border-red-500/20 bg-red-500/10 p-4">
+                                        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                            <ArrowUpFromLine className="h-4 w-4 text-red-600" />
+                                            Total Out
+                                        </div>
+                                        <div className="mt-2 text-3xl font-bold text-red-600">{formatNumber(peopleCountingSummary.totalOut)}</div>
+                                    </div>
+                                    <div className="rounded-xl border border-slate-300 bg-slate-50 p-4">
+                                        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                            <Activity className="h-4 w-4 text-slate-700" />
+                                            Total Traffic
+                                        </div>
+                                        <div className="mt-2 text-3xl font-bold text-slate-800">{formatNumber(peopleCountingSummary.totalTraffic)}</div>
+                                    </div>
+                                    <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-4">
+                                        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                            <Clock3 className="h-4 w-4 text-amber-600" />
+                                            Peak Period
+                                        </div>
+                                        <div className="mt-2 text-lg font-semibold text-amber-700">{peopleCountingSummary.peakPeriodLabel}</div>
+                                    </div>
+                                    <div className="rounded-xl border border-blue-500/20 bg-blue-500/10 p-4">
+                                        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                            <Users className="h-4 w-4 text-blue-600" />
+                                            Peak Occupancy
+                                        </div>
+                                        <div className="mt-2 text-3xl font-bold text-blue-700">{formatNumber(peopleCountingSummary.peakOccupancy)}</div>
+                                    </div>
+                                    <div className="rounded-xl border border-indigo-500/20 bg-indigo-500/10 p-4">
+                                        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                            <TrendingUp className="h-4 w-4 text-indigo-600" />
+                                            Estimated Occupancy
+                                        </div>
+                                        <div className="mt-2 text-3xl font-bold text-indigo-700">{formatNumber(peopleCountingSummary.estimatedOccupancy)}</div>
+                                    </div>
+                                </div>
+
+                                <FlowTrendPanel snapshots={selectedCountingSnapshots} cameraLabel={selectedCameraLabel} />
+                            </>
+                        )}
+
+                        {isPeopleCountingTrafficView && (
+                            <TrafficAnalyticsPanel
+                                snapshots={selectedCountingSnapshots}
+                                cameraLabel={selectedCameraLabel}
+                                startMs={reportingDateBounds.startMs}
+                                endMs={reportingDateBounds.endMs}
+                                isAllCameras={selectedCameraFilter === 'all'}
+                            />
+                        )}
+
+                {showStandardReportSections && (
+                    <>
                 {/* Events / Counting by Day Chart */}
                 <Card className="flex flex-col min-h-[350px]">
                     <CardHeader>
-                        <CardTitle>{isPeopleCountingChart ? 'Counting by Day' : 'Events by Day'}</CardTitle>
+                        <CardTitle>{isPeopleCountingChart ? 'In/Out by Day' : 'Events by Day'}</CardTitle>
                     </CardHeader>
                     <CardContent className="flex-1 min-h-[250px]">
                         {chartData.length > 0 ? (
@@ -1301,11 +2025,11 @@ const Reporting = () => {
                                         <XAxis dataKey="name" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
                                         <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} allowDecimals={false} />
                                         <RechartsTooltip cursor={{ fill: 'transparent' }}
+                                            formatter={(value, name) => [formatNumber(value), name]}
                                             contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }} />
                                         <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
-                                        <Bar dataKey="totalIn" name="Total In" fill="#22c55e" radius={[4, 4, 0, 0]} maxBarSize={40} />
-                                        <Bar dataKey="totalOut" name="Total Out" fill="#ef4444" radius={[4, 4, 0, 0]} maxBarSize={40} />
-                                        <Bar dataKey="maxOccupancy" name="Peak Occupancy" fill="#3b82f6" radius={[4, 4, 0, 0]} maxBarSize={40} />
+                                        <Bar dataKey="totalIn" name="In" fill="#22c55e" radius={[4, 4, 0, 0]} maxBarSize={40} />
+                                        <Bar dataKey="totalOut" name="Out" fill="#ef4444" radius={[4, 4, 0, 0]} maxBarSize={40} />
                                     </BarChart>
                                 ) : (
                                     <BarChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
@@ -1313,6 +2037,7 @@ const Reporting = () => {
                                         <XAxis dataKey="name" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
                                         <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} allowDecimals={false} />
                                         <RechartsTooltip cursor={{ fill: 'transparent' }}
+                                            formatter={(value, name) => [formatNumber(value), name]}
                                             contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }} />
                                         <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
                                         <Bar dataKey="violations" name="Events" fill="hsl(var(--destructive))" radius={[4, 4, 0, 0]} maxBarSize={40} />
@@ -1327,8 +2052,18 @@ const Reporting = () => {
                     </CardContent>
                 </Card>
 
-                {/* Occupancy Over Time */}
-                {showOccupancyChart && <OccupancyChart apiUrl={apiUrl} cameras={cameras} />}
+                <div className="space-y-1">
+                    <h2 className="text-lg font-semibold tracking-tight">Diagnostics</h2>
+                    <p className="text-sm text-muted-foreground">
+                        Raw counting records and operational details for validation and troubleshooting.
+                    </p>
+                </div>
+
+                {isPeopleCountingCameraView && peopleCountingSummary.resetCount > 0 && (
+                    <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-700">
+                        Counter resets were detected in the selected report range. Flow totals remain usable, but occupancy-related numbers may not be continuous across the full period.
+                    </div>
+                )}
 
                 {/* Log Table */}
                 <Card className="flex flex-col min-h-[350px] overflow-hidden">
@@ -1353,13 +2088,16 @@ const Reporting = () => {
                         </div>
                     </CardHeader>
                     <CardContent className="flex-1 p-0 overflow-auto">
-                        <table className="w-full text-sm text-left">
+                        <table className="w-full min-w-[980px] text-sm text-left">
                             <thead className="text-muted-foreground bg-muted/50 sticky top-0">
                                 <tr>
                                     <th className="px-4 py-3 font-medium">Timestamp</th>
                                     <th className="px-4 py-3 font-medium">Camera</th>
-                                    <th className="px-4 py-3 font-medium">Type</th>
-                                    <th className="px-4 py-3 font-medium">Details</th>
+                                    <th className="px-4 py-3 font-medium">Event Type</th>
+                                    <th className="px-4 py-3 font-medium">Direction</th>
+                                    <th className="px-4 py-3 font-medium text-right">In</th>
+                                    <th className="px-4 py-3 font-medium text-right">Out</th>
+                                    <th className="px-4 py-3 font-medium text-right">Occupancy</th>
                                     <th className="px-4 py-3 font-medium text-right">Action</th>
                                 </tr>
                             </thead>
@@ -1367,7 +2105,7 @@ const Reporting = () => {
                                 {paginatedRows.length > 0 ? paginatedRows.map(row => {
                                     if (row._isSnapshot) {
                                         return (
-                                            <tr key={row.id} className="hover:bg-muted/30 transition-colors cursor-pointer"
+                                            <tr key={row.id} className="group hover:bg-muted/30 transition-colors cursor-pointer"
                                                 onClick={() => setSelectedRecord(row)}>
                                                 <td className="px-4 py-3">{formatTimestamp(row.timestamp)}</td>
                                                 <td className="px-4 py-3">
@@ -1385,13 +2123,10 @@ const Reporting = () => {
                                                         Counting Snapshot
                                                     </div>
                                                 </td>
-                                                <td className="px-4 py-3 text-muted-foreground">
-                                                    <span className="inline-flex gap-3">
-                                                        <span className="text-green-500 font-medium">IN: {row.total_in}</span>
-                                                        <span className="text-red-500 font-medium">OUT: {row.total_out}</span>
-                                                        <span className="text-primary font-medium">Occupancy: {row.current_occupancy}</span>
-                                                    </span>
-                                                </td>
+                                                <td className="px-4 py-3 text-muted-foreground">Snapshot</td>
+                                                <td className="px-4 py-3 text-right font-medium text-green-600">{formatNumber(row.total_in)}</td>
+                                                <td className="px-4 py-3 text-right font-medium text-red-600">{formatNumber(row.total_out)}</td>
+                                                <td className="px-4 py-3 text-right font-medium text-blue-700">{formatNumber(row.current_occupancy)}</td>
                                                 <td className="px-4 py-3 text-right">
                                                     <Button variant="ghost" size="icon" className="h-8 w-8 opacity-0 group-hover:opacity-100 transition-opacity">
                                                         <Eye className="w-4 h-4" />
@@ -1403,6 +2138,9 @@ const Reporting = () => {
 
                                     const isCapacity = row.event_type === 'Capacity Exceeded';
                                     const dotColor = isCapacity ? 'bg-orange-500' : 'bg-red-500';
+                                    const eventDirection = row.details?.direction
+                                        ? String(row.details.direction).replace(/_/g, ' ')
+                                        : '-';
                                     return (
                                         <tr key={row.id} className="hover:bg-muted/30 transition-colors group cursor-pointer"
                                             onClick={() => setSelectedRecord(row)}>
@@ -1422,15 +2160,11 @@ const Reporting = () => {
                                                     {row.event_type}
                                                 </div>
                                             </td>
-                                            <td className="px-4 py-3 text-muted-foreground">
-                                                {isCapacity ? (
-                                                    <span>Occupancy: {row.details?.occupancy ?? '-'} / {row.details?.max_capacity ?? '-'}</span>
-                                                ) : (
-                                                    <span>
-                                                        {row.details?.label?.replace(/_/g, ' ') || '-'}
-                                                        {row.details?.confidence ? ` (${Math.round(row.details.confidence * 100)}%)` : ''}
-                                                    </span>
-                                                )}
+                                            <td className="px-4 py-3 text-muted-foreground">{eventDirection}</td>
+                                            <td className="px-4 py-3 text-right text-muted-foreground">-</td>
+                                            <td className="px-4 py-3 text-right text-muted-foreground">-</td>
+                                            <td className="px-4 py-3 text-right font-medium text-blue-700">
+                                                {row.details?.occupancy != null ? formatNumber(row.details.occupancy) : '-'}
                                             </td>
                                             <td className="px-4 py-3 text-right">
                                                 <Button variant="ghost" size="icon" className="h-8 w-8 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -1441,7 +2175,7 @@ const Reporting = () => {
                                     );
                                 }) : (
                                     <tr>
-                                        <td colSpan={5} className="px-4 py-8 text-center text-muted-foreground">
+                                        <td colSpan={8} className="px-4 py-8 text-center text-muted-foreground">
                                             {loading ? "Loading..." : "No records found."}
                                         </td>
                                     </tr>
@@ -1476,6 +2210,8 @@ const Reporting = () => {
                         </div>
                     </CardContent>
                 </Card>
+                    </>
+                )}
                     </>
                 )}
             </div>
