@@ -15,6 +15,10 @@ class DressCodePolicy(Base):
     confidence_threshold = Column(Float, nullable=False, default=0.8)
     # Whether the policy is active
     enabled = Column(Boolean, nullable=False, default=True)
+    # Whether the pants classifier should run
+    enable_pants_detection = Column(Boolean, nullable=False, default=True)
+    # Whether the slipper classifier should run
+    enable_slipper_detection = Column(Boolean, nullable=False, default=False)
 
     def __repr__(self) -> str:
         return f"<DressCodePolicy(id={self.id!r}, enabled={self.enabled})>"

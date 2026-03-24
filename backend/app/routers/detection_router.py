@@ -136,6 +136,10 @@ async def violation_persistence_loop():
                         details = {
                             "label": evt.get("label"),
                             "confidence": evt.get("confidence"),
+                            "classifications": evt.get("classifications"),
+                            "matched_violations": evt.get("matched_violations"),
+                            "lower_bbox": evt.get("lower_bbox"),
+                            "slipper_bbox": evt.get("slipper_bbox"),
                             "person_bbox": evt.get("person_bbox"),
                             "track_id": evt.get("track_id"),
                             "snapshot_path": evt.get("snapshot_path"),

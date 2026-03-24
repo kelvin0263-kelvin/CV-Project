@@ -24,6 +24,22 @@ training_data/
 
 backend/opencv_contrib_python-4.8.0.74-cp36-abi3-linux_x86_64.whl
 
+
+backend/yolo11l-pose.pt
+backend/yolo11m-pose.engine
+backend/yolo11m-pose.onnx
+backend/yolo26l-pose.engine
+backend/yolo26l-pose.onnx
+backend/yolov8l-pose.engine
+backend/yolov8l-pose.onnx
+backend/yolov8l-pose.pt
+backend/yolov8m-pose.engine
+backend/yolov8m-pose.onnx
+backend/yolov8m-pose.pt
+backend/yolo11m-pose.pt
+backend/yolov8n.pt
+
+
 scripts/yolo26m-pose.pt
 backend/yolo26l-pose.pt
 backend/yolo26m-pose.engine
@@ -39,3 +55,5 @@ backend/yolov8n.pt
 
 
 scripts/dataset_output
+scripts/prediction_runs
+scripts/training_runs

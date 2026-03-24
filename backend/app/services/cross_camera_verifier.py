@@ -488,7 +488,9 @@ def _close_expired_primary_event(
 
     primary_count = int(active_event.get(primary_count_key, 0) or 0)
     verifier_count = int(active_event.get(verifier_count_key, 0) or 0)
-    correction_delta = max(0, verifier_count - primary_count)
+    correction_delta = 0
+    if primary_count > 0:
+        correction_delta = max(0, verifier_count - primary_count)
     correction_offset_key = f"correction_offset_{direction}"
     if correction_delta > 0:
         pair_state[correction_offset_key] = int(pair_state.get(correction_offset_key, 0) or 0) + correction_delta

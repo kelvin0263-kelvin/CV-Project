@@ -76,20 +76,26 @@ os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
 
 # Fixed runtime tuning for the current project.
-POSE_MODEL_PT_PATH = os.path.join(BACKEND_ROOT, "yolo26m-pose.pt")
-POSE_MODEL_ENGINE_PATH = os.path.join(BACKEND_ROOT, "yolo26m-pose.engine")
+# POSE_MODEL_PT_PATH = os.path.join(BACKEND_ROOT, "yolov8l-pose.pt")
+POSE_MODEL_ENGINE_PATH = os.path.join(BACKEND_ROOT, "yolov8m-pose.engine")
+POSE_MODEL_PT_PATH = "yolov8m-pose.pt"
+# POSE_MODEL_ENGINE_PATH = ""
+
 TRACKER_CONFIG_PATH = os.path.join(BACKEND_ROOT, "botsort_custom.yaml")
 YOLO_DEVICE = None
-POSE_TRACK_IMGSZ = 736
+# POSE_TRACK_IMGSZ = (576,1024)
+POSE_TRACK_IMGSZ = (416,736)
 DETECTION_STRIDE = 1
 COUNTING_SNAPSHOT_HEARTBEAT_SEC = 300
-DRESSCODE_RECLASSIFY_FRAMES = 30
+DRESSCODE_RECLASSIFY_INTERVAL_SEC = 1.0
+DRESSCODE_VIOLATION_CONFIRMATIONS = 2
 PERF_LOG_INTERVAL_FRAMES = 30
 PERF_STAGE_LOGS = True
 MULTI_STREAM_BATCH_INFER = True
 BATCH_INFER_WINDOW_MS = 5
 BATCH_INFER_MAX_BATCH = 8
 BATCH_INFER_WAIT_MS = 1500
+BATCH_INFER_LOG_INTERVAL = 30
 ASYNC_CAPTURE_ENABLED = True
 ASYNC_CAPTURE_QUEUE_SIZE = 2
 ASYNC_CAPTURE_READ_TIMEOUT_MS = 1000
@@ -447,8 +453,6 @@ def _remap_boxes_from_roi(boxes_xyxy: np.ndarray, roi_meta: dict | None) -> np.n
 def _remap_boxes_with_scores_from_roi(boxes, roi_meta: dict | None) -> np.ndarray:
     if boxes is None:
         return boxes
-    if roi_meta is None:
-        return boxes
 
     if isinstance(boxes, Boxes):
         box_data = boxes.data
@@ -456,8 +460,9 @@ def _remap_boxes_with_scores_from_roi(boxes, roi_meta: dict | None) -> np.ndarra
             box_data = box_data.detach().cpu().numpy()
         else:
             box_data = np.array(box_data, copy=True)
-        box_data[..., [0, 2]] += float(roi_meta.get("offset_x", 0.0))
-        box_data[..., [1, 3]] += float(roi_meta.get("offset_y", 0.0))
+        if roi_meta is not None:
+            box_data[..., [0, 2]] += float(roi_meta.get("offset_x", 0.0))
+            box_data[..., [1, 3]] += float(roi_meta.get("offset_y", 0.0))
         return Boxes(box_data, boxes.orig_shape)
 
     if hasattr(boxes, "data"):
@@ -468,6 +473,8 @@ def _remap_boxes_with_scores_from_roi(boxes, roi_meta: dict | None) -> np.ndarra
         boxes = boxes.numpy()
     boxes = np.asarray(boxes)
     if boxes.size == 0:
+        return boxes
+    if roi_meta is None:
         return boxes
     remapped = boxes.copy()
     remapped[:, [0, 2]] += float(roi_meta.get("offset_x", 0.0))
@@ -783,7 +790,11 @@ class _BatchInferenceEngine:
         self._req_queue: queue.Queue = queue.Queue()
         self._trackers: dict[str, object] = {}
         self._tracker_lock = threading.Lock()
+        self._batch_cap_lock = threading.Lock()
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._engine_mode = _pose_model_uses_engine()
+        self._effective_max_batch = max(1, int(BATCH_INFER_MAX_BATCH))
+        self._processed_batches = 0
 
         tracker_cfg_raw = YAML.load(TRACKER_CONFIG_PATH)
         self._tracker_cfg = IterableSimpleNamespace(**tracker_cfg_raw)
@@ -796,8 +807,8 @@ class _BatchInferenceEngine:
         self._model = _load_pose_model()
         self._worker.start()
         print(
-            f"[BatchInfer] Ready: tracker={tracker_type}, window={BATCH_INFER_WINDOW_MS}ms, "
-            f"max_batch={BATCH_INFER_MAX_BATCH}"
+            f"[BatchInfer] Ready: tracker={tracker_type}, backend={'TensorRT' if self._engine_mode else 'PyTorch'}, "
+            f"window={BATCH_INFER_WINDOW_MS}ms, max_batch={self._effective_max_batch}"
         )
 
     def _get_tracker(self, stream_id: str):
@@ -861,7 +872,9 @@ class _BatchInferenceEngine:
 
             batch = [first]
             deadline = time.perf_counter() + batch_window_sec
-            while len(batch) < BATCH_INFER_MAX_BATCH:
+            with self._batch_cap_lock:
+                max_batch = self._effective_max_batch
+            while len(batch) < max_batch:
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0:
                     break
@@ -875,10 +888,7 @@ class _BatchInferenceEngine:
 
             self._process_batch(batch)
 
-    def _process_batch(self, batch: list[dict]):
-        detect_started_at = time.perf_counter()
-        images = [item.get("infer_img") if item.get("infer_img") is not None else item["img"] for item in batch]
-
+    def _predict_images(self, images: list[np.ndarray]):
         predict_kwargs = {
             "source": images,
             "verbose": False,
@@ -889,9 +899,46 @@ class _BatchInferenceEngine:
         }
         if YOLO_DEVICE:
             predict_kwargs["device"] = YOLO_DEVICE
+        return self._model.predict(**predict_kwargs)
+
+    def _predict_images_adaptive(self, images: list[np.ndarray]):
+        if not images:
+            return []
 
         try:
-            results = self._model.predict(**predict_kwargs)
+            return self._predict_images(images)
+        except Exception as e:
+            if not self._engine_mode or len(images) <= 1:
+                raise
+
+            next_cap = max(1, len(images) // 2)
+            with self._batch_cap_lock:
+                if next_cap < self._effective_max_batch:
+                    self._effective_max_batch = next_cap
+
+            print(
+                f"[BatchInfer] TensorRT batch={len(images)} failed ({e}). "
+                f"Retrying with smaller micro-batches; effective max batch now {self._effective_max_batch}."
+            )
+
+            midpoint = max(1, len(images) // 2)
+            left = self._predict_images_adaptive(images[:midpoint])
+            right = self._predict_images_adaptive(images[midpoint:])
+            return list(left) + list(right)
+
+    def _process_batch(self, batch: list[dict]):
+        detect_started_at = time.perf_counter()
+        images = [item.get("infer_img") if item.get("infer_img") is not None else item["img"] for item in batch]
+        self._processed_batches += 1
+        # if len(batch) > 1 or (self._processed_batches % BATCH_INFER_LOG_INTERVAL == 0):
+        #     print(
+        #         f"[BatchInfer] Running batch size={len(batch)} "
+        #         f"(backend={'TensorRT' if self._engine_mode else 'PyTorch'}, "
+        #         f"effective_max={self._effective_max_batch})"
+        #     )
+
+        try:
+            results = self._predict_images_adaptive(images)
         except Exception as e:
             print(f"[BatchInfer] Predict error: {e}")
             for req in batch:
@@ -935,6 +982,7 @@ class _BatchInferenceEngine:
             keypoints_with_conf = _remap_keypoints_from_roi(keypoints_with_conf, req.get("roi_meta"))
 
             track_state = req["track_state"]
+            classify_now_monotonic = time.monotonic()
             for row in tracked:
                 x1, y1, x2, y2, tid, _score, _cls, det_idx = row.tolist()
                 track_id = int(tid)
@@ -949,20 +997,17 @@ class _BatchInferenceEngine:
                     kp_row_fall = keypoints_with_conf[det_index]
 
                 cls_result = None
+                classification_fresh = False
                 if not req["skip_classification"]:
+                    enable_pants_detection, enable_slipper_detection = _get_classifier_flags()
                     cached = track_state.get(track_id)
                     if cached is not None:
-                        frames_since = req["frame_count"] - cached.get("last_classified_frame", 0)
-                        if (
-                            frames_since < DRESSCODE_RECLASSIFY_FRAMES
-                            and cached.get("label") is not None
-                            and cached.get("confidence") is not None
-                        ):
-                            cls_result = {
-                                "label": cached.get("label"),
-                                "confidence": cached.get("confidence"),
-                                "lower_bbox": cached.get("lower_bbox"),
-                            }
+                        if _should_reuse_cached_classification(cached, now_monotonic=classify_now_monotonic):
+                            cls_result = _get_cached_classification_for_enabled_models(
+                                cached,
+                                enable_pants=enable_pants_detection,
+                                enable_slipper=enable_slipper_detection,
+                            )
                     if cls_result is None:
                         classify_candidates.append(
                             {
@@ -980,6 +1025,9 @@ class _BatchInferenceEngine:
                         "label": cls_result["label"] if cls_result else None,
                         "confidence": cls_result["confidence"] if cls_result else None,
                         "lower_bbox": cls_result["lower_bbox"] if cls_result else None,
+                        "slipper_bbox": cls_result["slipper_bbox"] if cls_result else None,
+                        "classifications": list(cls_result.get("classifications") or []) if cls_result else [],
+                        "_classification_fresh": classification_fresh,
                         "violation": False,
                         "fall_pose": False,
                         "fall_detected": False,
@@ -993,6 +1041,8 @@ class _BatchInferenceEngine:
                     req["img"],
                     [{"bbox": item["bbox"], "keypoints": item["keypoints"]} for item in classify_candidates],
                     device=YOLO_DEVICE,
+                    enable_pants=enable_pants_detection,
+                    enable_slipper=enable_slipper_detection,
                 )
                 classify_ms = (time.perf_counter() - classify_started_at) * 1000.0
 
@@ -1003,6 +1053,9 @@ class _BatchInferenceEngine:
                     det["label"] = cls_result["label"]
                     det["confidence"] = cls_result["confidence"]
                     det["lower_bbox"] = cls_result.get("lower_bbox")
+                    det["slipper_bbox"] = cls_result.get("slipper_bbox")
+                    det["classifications"] = list(cls_result.get("classifications") or [])
+                    det["_classification_fresh"] = True
                     classified_count += 1
 
                     track_id = cand["track_id"]
@@ -1013,7 +1066,9 @@ class _BatchInferenceEngine:
                             "label": cls_result["label"],
                             "confidence": cls_result["confidence"],
                             "lower_bbox": cls_result.get("lower_bbox"),
-                            "last_classified_frame": req["frame_count"],
+                            "slipper_bbox": cls_result.get("slipper_bbox"),
+                            "classifications": list(cls_result.get("classifications") or []),
+                            "last_classified_at_monotonic": classify_now_monotonic,
                         }
                     )
 
@@ -1427,19 +1482,19 @@ def video_producer(
 
     local_model = None
     local_models_by_view: dict[str, YOLO] = {}
-    use_batch_infer = MULTI_STREAM_BATCH_INFER and not _pose_model_uses_engine()
-    if MULTI_STREAM_BATCH_INFER and not use_batch_infer:
-        print("[Producer] TensorRT engine detected; disabling shared multi-stream batching.")
+    use_batch_infer = MULTI_STREAM_BATCH_INFER
+    if use_batch_infer and _pose_model_uses_engine():
+        print("[Producer] TensorRT engine detected; enabling shared multi-stream batching.")
     # Ensure shared batch inference engine is ready once.
     if use_batch_infer:
         try:
             _get_batch_infer_engine()
         except Exception as e:
             print(f"[Producer] Failed to initialize batch inference engine: {e}")
-            cap.release()
-            _cleanup_producer_state(runtime_key, clear_frame_buffer=True)
-            return
-    else:
+            print("[Producer] Falling back to per-stream detector path.")
+            use_batch_infer = False
+
+    if not use_batch_infer:
         # Legacy per-stream detector path.
         print(f"[Producer] Loading YOLO model for runtime_key={runtime_key}, source={source_path}")
         try:
@@ -1551,7 +1606,7 @@ def video_producer(
             (detections_list, people_count, updated_track_state, perf_dict)
 
         Each detection dict:
-            {track_id, person_bbox, count_anchor, label, confidence, lower_bbox, violation, fall_pose, fall_detected}
+            {track_id, person_bbox, count_anchor, label, confidence, lower_bbox, slipper_bbox, classifications, violation, fall_pose, fall_detected}
         """
         infer_img, roi_meta = _prepare_detection_roi_image(img, detection_roi_areas)
 
@@ -1626,6 +1681,7 @@ def video_producer(
             classified_count = 0
             classify_ms = 0.0
             post_started_at = time.perf_counter()
+            classify_now_monotonic = time.monotonic()
 
             for i, box_coords in enumerate(boxes_xyxy):
                 track_id = int(track_ids[i]) if i < len(track_ids) and track_ids[i] is not None else None
@@ -1639,24 +1695,21 @@ def video_producer(
                 )
 
                 cls_result = None
+                classification_fresh = False
 
                 # Only run dress code classification when needed
                 if not skip_classification:
+                    enable_pants_detection, enable_slipper_detection = _get_classifier_flags()
                     # --- Per-track classification throttling ---
                     if track_id is not None and track_id in track_state:
                         cached = track_state[track_id]
-                        frames_since = frame_count - cached.get("last_classified_frame", 0)
-                        if (
-                            frames_since < DRESSCODE_RECLASSIFY_FRAMES
-                            and cached.get("label") is not None
-                            and cached.get("confidence") is not None
-                        ):
+                        if _should_reuse_cached_classification(cached, now_monotonic=classify_now_monotonic):
                             # Reuse cached label
-                            cls_result = {
-                                "label": cached.get("label"),
-                                "confidence": cached.get("confidence"),
-                                "lower_bbox": cached.get("lower_bbox"),
-                            }
+                            cls_result = _get_cached_classification_for_enabled_models(
+                                cached,
+                                enable_pants=enable_pants_detection,
+                                enable_slipper=enable_slipper_detection,
+                            )
 
                     # Queue for batch classification if no cached result.
                     if cls_result is None:
@@ -1674,6 +1727,9 @@ def video_producer(
                     "label": cls_result["label"] if cls_result else None,
                     "confidence": cls_result["confidence"] if cls_result else None,
                     "lower_bbox": cls_result["lower_bbox"] if cls_result else None,
+                    "slipper_bbox": cls_result["slipper_bbox"] if cls_result else None,
+                    "classifications": list(cls_result.get("classifications") or []) if cls_result else [],
+                    "_classification_fresh": classification_fresh,
                     "violation": False,  # Will be set by policy check later
                     "fall_pose": False,
                     "fall_detected": False,
@@ -1687,6 +1743,8 @@ def video_producer(
                     img,
                     [{"bbox": item["bbox"], "keypoints": item["keypoints"]} for item in classify_candidates],
                     device=YOLO_DEVICE,
+                    enable_pants=enable_pants_detection,
+                    enable_slipper=enable_slipper_detection,
                 )
                 classify_ms = (time.perf_counter() - classify_started_at) * 1000.0
 
@@ -1697,6 +1755,9 @@ def video_producer(
                     det["label"] = cls_result["label"]
                     det["confidence"] = cls_result["confidence"]
                     det["lower_bbox"] = cls_result.get("lower_bbox")
+                    det["slipper_bbox"] = cls_result.get("slipper_bbox")
+                    det["classifications"] = list(cls_result.get("classifications") or [])
+                    det["_classification_fresh"] = True
                     classified_count += 1
 
                     track_id = item["track_id"]
@@ -1707,7 +1768,9 @@ def video_producer(
                             "label": cls_result["label"],
                             "confidence": cls_result["confidence"],
                             "lower_bbox": cls_result.get("lower_bbox"),
-                            "last_classified_frame": frame_count,
+                            "slipper_bbox": cls_result.get("slipper_bbox"),
+                            "classifications": list(cls_result.get("classifications") or []),
+                            "last_classified_at_monotonic": classify_now_monotonic,
                         })
 
             total_post_ms = (time.perf_counter() - post_started_at) * 1000.0
@@ -1734,6 +1797,7 @@ def video_producer(
         for d in detections:
             sd = dict(d)
             sd.pop("keypoints_data", None)
+            sd.pop("_classification_fresh", None)
             if sd.get("person_bbox"):
                 b = sd["person_bbox"]
                 sd["person_bbox"] = [round(b[0]*sx), round(b[1]*sy), round(b[2]*sx), round(b[3]*sy)]
@@ -1746,6 +1810,9 @@ def video_producer(
             if sd.get("lower_bbox"):
                 b = sd["lower_bbox"]
                 sd["lower_bbox"] = [round(b[0]*sx), round(b[1]*sy), round(b[2]*sx), round(b[3]*sy)]
+            if sd.get("slipper_bbox"):
+                b = sd["slipper_bbox"]
+                sd["slipper_bbox"] = [round(b[0]*sx), round(b[1]*sy), round(b[2]*sx), round(b[3]*sy)]
             scaled.append(sd)
         return scaled
 
@@ -2117,7 +2184,11 @@ def video_producer(
 
         if run_detection_this_frame and view_key in all_views:
             needs_fall_detection = view_key in fall_views
-            skip_classification = view_key not in dresscode_views
+            enable_pants_detection, enable_slipper_detection = _get_classifier_flags()
+            skip_classification = (
+                view_key not in dresscode_views
+                or not (enable_pants_detection or enable_slipper_detection)
+            )
             detection_roi_areas = _get_source_detection_roi_areas(view_key)
             detections, people_count, track_state, perf = run_detection_and_classify(
                 img,
@@ -2420,6 +2491,8 @@ _current_policy = {
     "enabled_camera_ids": [],
     "restricted_labels": ["shorts"],
     "confidence_threshold": 0.8,
+    "enable_pants_detection": True,
+    "enable_slipper_detection": False,
     "detection_map": {},       # runtime_key -> set of view_keys
     "camera_id_map": {},       # "runtime_key||view_key" -> camera_id
 }
@@ -2431,8 +2504,12 @@ def update_policy(policy: dict):
     global _current_policy
     with _policy_lock:
         _current_policy = policy
-    print(f"[Policy] Updated: enabled_cameras={policy.get('enabled_camera_ids')}, "
-          f"detection_map keys={list(policy.get('detection_map', {}).keys())}")
+    print(
+        f"[Policy] Updated: enabled_cameras={policy.get('enabled_camera_ids')}, "
+        f"pants_enabled={policy.get('enable_pants_detection', True)}, "
+        f"slipper_enabled={policy.get('enable_slipper_detection', False)}, "
+        f"detection_map keys={list(policy.get('detection_map', {}).keys())}"
+    )
 
 
 def get_policy() -> dict:
@@ -2454,6 +2531,151 @@ def _get_camera_id(runtime_key: str, view_key: str) -> str | None:
     return camera_id_map.get(f"{runtime_key}||{view_key}")
 
 
+def _get_classifier_flags() -> tuple[bool, bool]:
+    policy = get_policy()
+    return (
+        bool(policy.get("enable_pants_detection", True)),
+        bool(policy.get("enable_slipper_detection", False)),
+    )
+
+
+def _should_reuse_cached_classification(cached: dict, *, now_monotonic: float) -> bool:
+    last_classified_at = cached.get("last_classified_at_monotonic")
+    if last_classified_at is None:
+        return False
+    if (now_monotonic - float(last_classified_at)) >= DRESSCODE_RECLASSIFY_INTERVAL_SEC:
+        return False
+    return bool(cached.get("label") is not None or cached.get("classifications"))
+
+
+def _get_cached_classification_for_enabled_models(cached: dict, *, enable_pants: bool, enable_slipper: bool) -> dict | None:
+    classifications = []
+    for item in list(cached.get("classifications") or []):
+        region = item.get("region")
+        if region == "lower_body" and enable_pants:
+            classifications.append(dict(item))
+        elif region == "footwear" and enable_slipper:
+            classifications.append(dict(item))
+
+    if not classifications:
+        label = cached.get("label")
+        confidence = cached.get("confidence")
+        if enable_pants and label is not None and confidence is not None:
+            classifications = [
+                {
+                    "label": label,
+                    "confidence": confidence,
+                    "region": "lower_body",
+                }
+            ]
+        else:
+            return None
+
+    primary = next(
+        (item for item in classifications if item.get("region") == "lower_body"),
+        classifications[0],
+    )
+    return {
+        "label": primary.get("label"),
+        "confidence": primary.get("confidence"),
+        "lower_bbox": cached.get("lower_bbox") if enable_pants else None,
+        "slipper_bbox": cached.get("slipper_bbox") if enable_slipper else None,
+        "classifications": classifications,
+    }
+
+
+def _collect_violation_classifications(det: dict, restricted: set[str], threshold: float) -> list[dict]:
+    classifications = list(det.get("classifications") or [])
+
+    if not classifications and det.get("label") is not None and det.get("confidence") is not None:
+        classifications = [
+            {
+                "label": det.get("label"),
+                "confidence": det.get("confidence"),
+                "region": "lower_body",
+            }
+        ]
+
+    candidates = []
+    for item in classifications:
+        label = item.get("label")
+        confidence = item.get("confidence")
+        if label is None or confidence is None:
+            continue
+        if label in restricted and confidence >= threshold:
+            candidates.append(dict(item))
+
+    return candidates
+
+
+def _select_display_violation(matched_violations: list[dict]) -> dict | None:
+    if not matched_violations:
+        return None
+    return max(
+        matched_violations,
+        key=lambda item: float(item.get("confidence", 0.0)),
+    )
+
+
+def _clear_violation_tracking(track_entry: dict) -> None:
+    track_entry.pop("violation_candidate_label", None)
+    track_entry.pop("violation_candidate_count", None)
+    track_entry.pop("confirmed_violation", None)
+    track_entry.pop("confirmed_matched_violations", None)
+    track_entry.pop("last_matched_violations", None)
+
+
+def _update_violation_confirmation_state(
+    track_entry: dict,
+    matched_violations: list[dict],
+    *,
+    classification_fresh: bool,
+) -> tuple[dict | None, list[dict]]:
+    if not matched_violations:
+        _clear_violation_tracking(track_entry)
+        return None, []
+
+    display_violation = _select_display_violation(matched_violations)
+    if display_violation is None:
+        _clear_violation_tracking(track_entry)
+        return None, []
+
+    track_entry["last_matched_violations"] = [dict(item) for item in matched_violations]
+
+    if classification_fresh:
+        display_label = display_violation.get("label")
+        if track_entry.get("violation_candidate_label") == display_label:
+            track_entry["violation_candidate_count"] = int(track_entry.get("violation_candidate_count", 0)) + 1
+        else:
+            track_entry["violation_candidate_label"] = display_label
+            track_entry["violation_candidate_count"] = 1
+
+        if int(track_entry.get("violation_candidate_count", 0)) >= DRESSCODE_VIOLATION_CONFIRMATIONS:
+            track_entry["confirmed_violation"] = dict(display_violation)
+            track_entry["confirmed_matched_violations"] = [dict(item) for item in matched_violations]
+
+    confirmed_violation = track_entry.get("confirmed_violation")
+    if confirmed_violation is None:
+        return None, []
+
+    confirmed_label = confirmed_violation.get("label")
+    if confirmed_label is None:
+        _clear_violation_tracking(track_entry)
+        return None, []
+
+    if not any(item.get("label") == confirmed_label for item in matched_violations):
+        _clear_violation_tracking(track_entry)
+        return None, []
+
+    latest_display = next(
+        (item for item in matched_violations if item.get("label") == confirmed_label),
+        confirmed_violation,
+    )
+    track_entry["confirmed_violation"] = dict(latest_display)
+    track_entry["confirmed_matched_violations"] = [dict(item) for item in matched_violations]
+    return dict(latest_display), [dict(item) for item in matched_violations]
+
+
 def _apply_policy_and_save(detections, track_state, frame, runtime_key, source_path, view_key=None):
     """
     Apply the current policy to mark violations and save snapshot evidence.
@@ -2467,11 +2689,33 @@ def _apply_policy_and_save(detections, track_state, frame, runtime_key, source_p
     camera_id = _get_camera_id(runtime_key, view_key) if view_key else None
 
     for det in detections:
-        label = det.get("label")
-        conf = det.get("confidence")
         track_id = det.get("track_id")
+        matched_violations = _collect_violation_classifications(det, restricted, threshold)
+        det["matched_violations"] = [dict(item) for item in matched_violations]
 
-        if label and conf and label in restricted and conf >= threshold:
+        track_entry = None
+        if track_id is not None:
+            if track_id not in track_state:
+                track_state[track_id] = {"violation_saved": False}
+            track_entry = track_state[track_id]
+
+        classification_fresh = bool(det.get("_classification_fresh", False))
+        if track_entry is not None:
+            violation_cls, confirmed_matches = _update_violation_confirmation_state(
+                track_entry,
+                matched_violations,
+                classification_fresh=classification_fresh,
+            )
+        else:
+            violation_cls = _select_display_violation(matched_violations)
+            confirmed_matches = [dict(item) for item in matched_violations] if violation_cls is not None else []
+
+        if violation_cls is not None:
+            label = violation_cls.get("label")
+            conf = violation_cls.get("confidence")
+            det["label"] = label
+            det["confidence"] = conf
+            det["matched_violations"] = confirmed_matches
             det["violation"] = True
 
             # Dedup: only save once per track
@@ -2495,6 +2739,10 @@ def _apply_policy_and_save(detections, track_state, frame, runtime_key, source_p
                         "event_type": "Dress Code Violation",
                         "label": label,
                         "confidence": conf,
+                        "classifications": det.get("classifications") or [],
+                        "matched_violations": det.get("matched_violations") or [],
+                        "lower_bbox": det.get("lower_bbox"),
+                        "slipper_bbox": det.get("slipper_bbox"),
                         "person_bbox": det["person_bbox"],
                         "snapshot_path": snapshot_path,
                     })

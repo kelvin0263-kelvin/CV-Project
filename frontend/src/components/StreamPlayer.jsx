@@ -264,7 +264,7 @@ const StreamPlayer = ({
                 drawDetections(detections);
 
                 // Forward detections to parent if callback provided
-                if (onDetections && detections.length > 0) {
+                if (onDetections) {
                     onDetections(detections);
                 }
 

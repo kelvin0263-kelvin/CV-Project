@@ -19,7 +19,6 @@ import uuid
 from datetime import datetime, timezone
 
 
-# DEBUG_COUNTING = os.getenv("DEBUG_COUNTING", "").strip().lower() in {"1", "true", "yes", "on"}
 DEBUG_COUNTING = False
 DEBUG_COUNTING_VERBOSE = os.getenv("DEBUG_COUNTING_VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"}
 _DEBUG_COUNTING_TRACK_ID_RAW = os.getenv("DEBUG_COUNTING_TRACK_ID", "").strip()
@@ -38,7 +37,7 @@ LINE_TYPE_FOOT_TRAFFIC = "foot_traffic"
 DEFAULT_DISAPPEAR_TIMEOUT = 0
 #time cooldown for a track id to trigger again the in count
 DEFAULT_COUNT_COOLDOWN = 4.0
-DEFAULT_LINE_SIDE_EPS = 0.002 #line tolerance
+DEFAULT_LINE_SIDE_EPS = 0.01 #line tolerance
 DEFAULT_FOOT_TRAFFIC_REARM_SIDE_EPS = 0.015
 DEFAULT_FOOT_TRAFFIC_RECOUNT_COOLDOWN = 0.75
 DEFAULT_FOOT_TRAFFIC_SEGMENT_ENDPOINT_TOL = 0.01
@@ -191,6 +190,7 @@ class PeopleCounter:
                 display_anchor = self._bbox_line_target_point(bbox, w, h, self.lines[0])
             else:
                 display_anchor = count_anchor
+            accumulation_anchor = self._bbox_frame_accumulation_point(bbox, w, h)
 
             det["count_anchor_norm"] = [round(count_anchor[0], 6), round(count_anchor[1], 6)]
             det["count_anchor"] = [round(count_anchor[0] * w), round(count_anchor[1] * h)]
@@ -208,7 +208,7 @@ class PeopleCounter:
             if tid in line_tracks_seen_this_update:
                 continue
 
-            if self._should_accumulate_track_frames(count_anchor):
+            if self._should_accumulate_track_frames(accumulation_anchor):
                 self._line_track_frame_totals[tid] = self._line_track_frame_totals.get(tid, 0) + 1
             line_tracks_seen_this_update.add(tid)
 
@@ -261,6 +261,7 @@ class PeopleCounter:
         self.total_out += line_out
         self._cleanup_foot_traffic_tracks(set(track_bboxes.keys()), now)
 
+        # Keep disappear-based IN fallback counts stable; do not auto-revert them on reappearance.
         self._process_count_reversions(set(track_bboxes.keys()))
 
         occupancy = max(0, self.total_in - self.total_out)
@@ -798,11 +799,52 @@ class PeopleCounter:
                     continue
 
                 in_active_zone = self._is_inside_active_zone(ts.last_right_point)
+                counted = False
+                if (
+                    count_event == LINE_EVENT_IN
+                    and in_active_zone
+                    and ts.last_in_side_value > DEFAULT_LINE_SIDE_EPS
+                    and ts.frame_count >= required_frames
+                    and self._can_count_in(track_id, now)
+                ):
+                    if self._register_count(track_id, "IN", "line_disappear", now):
+                        total_in += 1
+                        counted = True
+                        self._log_count_event(
+                            track_id,
+                            "IN",
+                            "line_disappear",
+                            point=ts.last_right_point,
+                            prev_point=ts.last_right_point,
+                            detail=(
+                                f"line={line_name} side={ts.last_in_side_value:.4f} "
+                                f"frames={ts.frame_count} elapsed={elapsed:.2f}s"
+                            ),
+                        )
+
                 if DEBUG_COUNTING:
-                    if count_event == LINE_EVENT_OUT:
+                    if counted:
+                        result = "counted"
+                        reason = "in_fallback_on_disappear"
+                    elif count_event == LINE_EVENT_OUT:
+                        result = "rejected"
                         reason = "out_lines_do_not_count_on_disappear"
+                    elif not in_active_zone:
+                        result = "rejected"
+                        reason = "last_point_outside_active_zone"
+                    elif ts.last_in_side_value <= DEFAULT_LINE_SIDE_EPS:
+                        result = "rejected"
+                        reason = "last_side_not_countable"
+                    elif ts.frame_count < required_frames:
+                        result = "rejected"
+                        reason = f"frames_below_min({ts.frame_count}<{required_frames})"
+                    elif not self._can_count_in(track_id, now):
+                        result = "rejected"
+                        reason = "in_count_cooldown_active"
                     else:
-                        reason = "in_lines_count_on_cross"
+                        result = "rejected"
+                        reason = "not_eligible"
+
                     print(
                         " ".join(
                             [
@@ -811,7 +853,7 @@ class PeopleCounter:
                                 f"line={line_name}",
                                 f"direction={count_event.upper()}",
                                 "source=line_disappear",
-                                "result=rejected",
+                                f"result={result}",
                                 f"reason={reason}",
                                 f"side_state={self._side_label(ts.last_in_side_value)}",
                                 f"side_value={ts.last_in_side_value:.4f}",
@@ -873,6 +915,7 @@ class PeopleCounter:
         )
         if direction == "IN":
             self._last_in_count_time[tid] = now
+            self._reset_track_frame_history(tid)
         return True
 
     def _can_count_in(self, track_id: int, now: float) -> bool:
@@ -896,8 +939,6 @@ class PeopleCounter:
     def _process_count_reversions(self, active_ids: set[int]):
         for track_id, record in self._counted_in_tracks.items():
             if record.uncounted:
-                continue
-            if record.source != "line_disappear":
                 continue
 
             if track_id in active_ids:
@@ -1052,7 +1093,7 @@ class PeopleCounter:
             dy = float(points[1][1]) - float(points[0][1])
             if abs(dy) >= abs(dx):
                 return ("left", "right")
-        return ("up", "down")
+        return ("down", "up")
 
     def _foot_traffic_allowed_direction(self, line_cfg: dict) -> str | None:
         configured_direction = str(line_cfg.get("direction") or "").strip().lower()
@@ -1275,6 +1316,21 @@ class PeopleCounter:
             return self._bbox_bottom_center_point(bbox, frame_w, frame_h)
         if self._line_count_event(line_cfg) == LINE_EVENT_OUT:
             return self._bbox_line_right_midlower_point(bbox, frame_w, frame_h)
+        return self._bbox_line_right_point(bbox, frame_w, frame_h)
+
+    def _bbox_frame_accumulation_point(
+        self,
+        bbox: list[float],
+        frame_w: int,
+        frame_h: int,
+    ) -> tuple[float, float]:
+        occupancy_lines = [
+            line_cfg
+            for line_cfg in self.lines
+            if self._line_type(line_cfg) == LINE_TYPE_OCCUPANCY and len(line_cfg.get("points", [])) >= 2
+        ]
+        if occupancy_lines:
+            return self._bbox_line_target_point(bbox, frame_w, frame_h, occupancy_lines[0])
         return self._bbox_line_right_point(bbox, frame_w, frame_h)
 
     def _line_count_event(self, line_cfg: dict) -> str:

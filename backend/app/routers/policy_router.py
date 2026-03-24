@@ -29,6 +29,8 @@ async def _get_or_create_policy(db: AsyncSession) -> DressCodePolicy:
             restricted_labels=["shorts"],
             confidence_threshold=0.8,
             enabled=True,
+            enable_pants_detection=True,
+            enable_slipper_detection=False,
         )
         db.add(policy)
         await db.flush()
@@ -69,6 +71,8 @@ async def _sync_policy_to_runtime(db: AsyncSession, policy: DressCodePolicy):
         "enabled_camera_ids": policy.enabled_camera_ids or [],
         "restricted_labels": policy.restricted_labels or ["shorts"],
         "confidence_threshold": policy.confidence_threshold or 0.8,
+        "enable_pants_detection": bool(policy.enable_pants_detection),
+        "enable_slipper_detection": bool(policy.enable_slipper_detection),
         "detection_map": detection_map,
         "camera_id_map": {f"{k[0]}||{k[1]}": v for k, v in camera_id_map.items()},
     })
@@ -119,6 +123,10 @@ async def update_policy_endpoint(
         policy.confidence_threshold = update.confidence_threshold
     if update.enabled is not None:
         policy.enabled = update.enabled
+    if update.enable_pants_detection is not None:
+        policy.enable_pants_detection = update.enable_pants_detection
+    if update.enable_slipper_detection is not None:
+        policy.enable_slipper_detection = update.enable_slipper_detection
 
     await db.flush()
     await db.refresh(policy)

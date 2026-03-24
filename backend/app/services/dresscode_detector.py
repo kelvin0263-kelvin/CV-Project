@@ -1,38 +1,77 @@
 """
 Dress Code Detector Service
 
-Loads the best.pt YOLO classification model and provides functions to:
+Loads the dress-code and slipper YOLO classification models and provides functions to:
 1. Crop lower-body regions from a frame using COCO pose keypoints
-2. Classify the crop (e.g., long_pants vs shorts)
+2. Crop lower-leg / footwear regions for slipper detection
+3. Classify the crops (e.g., long_pants vs shorts, slipper vs non_slipper)
 
 The cropping logic mirrors scripts/prepare_training_data.py exactly
 so that inference matches the training data distribution.
 """
 
 import os
+import sys
+import __main__
 
 import numpy as np
 import cv2
 from ultralytics import YOLO
 
-# ---------------------------------------------------------------------------
-# Load classification model once at module level
-# ---------------------------------------------------------------------------
 BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(BACKEND_ROOT)
 DRESSCODE_MODEL_PATH = os.getenv("DRESSCODE_MODEL_PATH", os.path.join(BACKEND_ROOT, "best.pt"))
+SLIPPER_MODEL_PATH = os.getenv("SLIPPER_MODEL_PATH", os.path.join(BACKEND_ROOT, "slipper-cls-best.pt"))
 
-print(f"[System] Loading Dress Code Classification Model ({DRESSCODE_MODEL_PATH})...")
-try:
-    dresscode_model = YOLO(DRESSCODE_MODEL_PATH)
-    dresscode_class_names = dresscode_model.names  # e.g. {0: 'long_pants', 1: 'shorts'}
-    print(f"[System] Dress code model loaded. Classes: {dresscode_class_names}")
-except Exception as e:
-    print(f"[System] Warning: Failed to load dress code model: {e}")
-    dresscode_model = None
-    dresscode_class_names = {}
+
+def _register_slipper_checkpoint_custom_classes() -> None:
+    """
+    The slipper checkpoint was trained with a custom resize/pad transform, so torch
+    needs the same class names available when the checkpoint is deserialized.
+    """
+    try:
+        if PROJECT_ROOT not in sys.path:
+            sys.path.insert(0, PROJECT_ROOT)
+        import scripts.train_yolo26_classifier as train_mod
+
+        __main__.ResizePadSquare = train_mod.ResizePadSquare
+        if getattr(train_mod, "SlipperClassificationDataset", None) is not None:
+            __main__.SlipperClassificationDataset = train_mod.SlipperClassificationDataset
+        if getattr(train_mod, "SlipperTrainer", None) is not None:
+            __main__.SlipperTrainer = train_mod.SlipperTrainer
+        if getattr(train_mod, "SlipperValidator", None) is not None:
+            __main__.SlipperValidator = train_mod.SlipperValidator
+    except Exception as e:
+        print(f"[System] Warning: Failed to register slipper checkpoint classes: {e}")
+
+
+def _load_classifier(model_path: str, *, description: str, register_custom_classes: bool = False):
+    print(f"[System] Loading {description} Classification Model ({model_path})...")
+    try:
+        if register_custom_classes:
+            _register_slipper_checkpoint_custom_classes()
+        model = YOLO(model_path)
+        class_names = model.names
+        print(f"[System] {description} model loaded. Classes: {class_names}")
+        return model, class_names
+    except Exception as e:
+        print(f"[System] Warning: Failed to load {description} model: {e}")
+        return None, {}
+
+
+dresscode_model, dresscode_class_names = _load_classifier(
+    DRESSCODE_MODEL_PATH,
+    description="Dress Code",
+)
+slipper_model, slipper_class_names = _load_classifier(
+    SLIPPER_MODEL_PATH,
+    description="Slipper",
+    register_custom_classes=True,
+)
 
 
 MIN_PERSON_HEIGHT = 160  # Minimum person bbox height in pixels (matches training quality)
+MIN_SLIPPER_CROP_SIZE = 96  # Matches the minimum size used in prepare_training_data.py
 
 
 def crop_lower_body(frame: np.ndarray, bbox, keypoints=None) -> tuple:
@@ -93,9 +132,112 @@ def crop_lower_body(frame: np.ndarray, bbox, keypoints=None) -> tuple:
     return crop, (nx1, ny1, nx2, ny2)
 
 
-def classify_lower_body(frame: np.ndarray, bbox, keypoints=None, device: str | None = None) -> dict | None:
+def crop_slipper_region(frame: np.ndarray, bbox, keypoints=None) -> tuple:
     """
-    Crop the lower body and classify it using best.pt.
+    Crop the legs/footwear region from a frame using pose keypoints.
+
+    Mirrors the training script legs crop:
+    - Requires pose keypoints to exist
+    - Uses knee_y = average(knee_left, knee_right) when available
+    - Falls back to 75% of the person box height when knee points are missing
+    - Crop = (x1, knee_y, x2, box_bottom)
+    - Requires the final crop to be at least MIN_SLIPPER_CROP_SIZE in both dimensions
+    """
+    h, w = frame.shape[:2]
+    px1, py1, px2, py2 = map(float, bbox)
+
+    person_h = py2 - py1
+    if person_h < MIN_PERSON_HEIGHT:
+        return None, None
+
+    if keypoints is None or len(keypoints) < 17:
+        return None, None
+
+    kps = keypoints
+    if kps[13][1] > 0 and kps[14][1] > 0:
+        knee_y = float(np.mean([kps[13][1], kps[14][1]]))
+    else:
+        knee_y = float(py1 + person_h * 0.75)
+
+    if knee_y >= py2:
+        return None, None
+
+    nx1 = max(0, int(px1))
+    ny1 = max(0, int(knee_y))
+    nx2 = min(w, int(px2))
+    ny2 = min(h, int(py2))
+
+    if nx2 <= nx1 or ny2 <= ny1:
+        return None, None
+
+    crop = frame[ny1:ny2, nx1:nx2]
+    if crop.size == 0:
+        return None, None
+    if crop.shape[0] < MIN_SLIPPER_CROP_SIZE or crop.shape[1] < MIN_SLIPPER_CROP_SIZE:
+        return None, None
+
+    return crop, (nx1, ny1, nx2, ny2)
+
+
+def _predict_batch(model, class_names: dict, crops: list[np.ndarray], device: str | None = None) -> list[dict | None]:
+    if model is None or not crops:
+        return [None] * len(crops)
+
+    classify_kwargs = {
+        "verbose": False,
+    }
+    if device:
+        classify_kwargs["device"] = device
+
+    try:
+        raw_results = model(crops, **classify_kwargs)
+    except Exception as e:
+        print(f"[DressCode] Batch classification error: {e}")
+        return [None] * len(crops)
+
+    parsed_results: list[dict | None] = []
+    for raw in raw_results:
+        if raw.probs is None:
+            parsed_results.append(None)
+            continue
+
+        top1_idx = int(raw.probs.top1)
+        top1_conf = float(raw.probs.top1conf)
+        label = class_names.get(top1_idx, f"class_{top1_idx}")
+        parsed_results.append(
+            {
+                "label": label,
+                "confidence": round(top1_conf, 3),
+            }
+        )
+
+    return parsed_results
+
+
+def _finalize_combined_result(entry: dict) -> dict | None:
+    classifications = entry.get("classifications") or []
+    if not classifications:
+        return None
+
+    primary = next(
+        (item for item in classifications if item.get("region") == "lower_body"),
+        classifications[0],
+    )
+    entry["label"] = primary.get("label")
+    entry["confidence"] = primary.get("confidence")
+    return entry
+
+
+def classify_lower_body(
+    frame: np.ndarray,
+    bbox,
+    keypoints=None,
+    device: str | None = None,
+    enable_pants: bool = True,
+    enable_slipper: bool = True,
+) -> dict | None:
+    """
+    Crop the lower body and/or footwear and classify them.
 
     Args:
         frame: Full-resolution frame
@@ -104,60 +246,34 @@ def classify_lower_body(frame: np.ndarray, bbox, keypoints=None, device: str | N
         device: CUDA device id
 
     Returns:
-        Dict with classification result, or None if classification failed:
+        Dict with combined classification result, or None if classification failed:
         {
             "label": "shorts",
             "confidence": 0.91,
-            "lower_bbox": [x1, y1, x2, y2]  # lower-body crop coordinates
+            "lower_bbox": [x1, y1, x2, y2],
+            "slipper_bbox": [x1, y1, x2, y2] | None,
+            "classifications": [
+                {"label": "shorts", "confidence": 0.91, "region": "lower_body"},
+                {"label": "slipper", "confidence": 0.84, "region": "footwear"},
+            ]
         }
     """
-    if dresscode_model is None:
-        return None
-
-    crop, lower_bbox = crop_lower_body(frame, bbox, keypoints)
-    if crop is None:
-        return None
-
-    # Skip if crop is too small for meaningful classification
-    if crop.shape[0] < 32 or crop.shape[1] < 32:
-        return None
-
-    try:
-        classify_kwargs = {
-            "verbose": False,
-        }
-        if device:
-            classify_kwargs["device"] = device
-
-        results = dresscode_model(crop, **classify_kwargs)
-
-        if not results or len(results) == 0:
-            return None
-
-        r = results[0]
-        # YOLO classification: r.probs contains class probabilities
-        if r.probs is None:
-            return None
-
-        top1_idx = int(r.probs.top1)
-        top1_conf = float(r.probs.top1conf)
-        label = dresscode_class_names.get(top1_idx, f"class_{top1_idx}")
-
-        return {
-            "label": label,
-            "confidence": round(top1_conf, 3),
-            "lower_bbox": list(map(int, lower_bbox)),
-        }
-
-    except Exception as e:
-        print(f"[DressCode] Classification error: {e}")
-        return None
+    results = classify_lower_body_batch(
+        frame,
+        [{"bbox": bbox, "keypoints": keypoints}],
+        device=device,
+        enable_pants=enable_pants,
+        enable_slipper=enable_slipper,
+    )
+    return results[0] if results else None
 
 
 def classify_lower_body_batch(
     frame: np.ndarray,
     bbox_keypoint_items: list[dict],
     device: str | None = None,
+    enable_pants: bool = True,
+    enable_slipper: bool = True,
 ) -> list[dict | None]:
     """
     Batch classify lower-body crops for one frame.
@@ -170,15 +286,21 @@ def classify_lower_body_batch(
     Returns:
         List aligned with input items. Each entry is classification dict or None.
     """
-    if dresscode_model is None:
+    if not enable_pants and not enable_slipper:
+        return [None] * len(bbox_keypoint_items)
+
+    if (dresscode_model is None or not enable_pants) and (slipper_model is None or not enable_slipper):
         return [None] * len(bbox_keypoint_items)
 
     if not bbox_keypoint_items:
         return []
 
-    pending_indices: list[int] = []
-    crops: list[np.ndarray] = []
+    lower_pending_indices: list[int] = []
+    lower_crops: list[np.ndarray] = []
     lower_bboxes: list[tuple[int, int, int, int]] = []
+    slipper_pending_indices: list[int] = []
+    slipper_crops: list[np.ndarray] = []
+    slipper_bboxes: list[tuple[int, int, int, int]] = []
     results: list[dict | None] = [None] * len(bbox_keypoint_items)
 
     for idx, item in enumerate(bbox_keypoint_items):
@@ -187,45 +309,66 @@ def classify_lower_body_batch(
         if bbox is None:
             continue
 
-        crop, lower_bbox = crop_lower_body(frame, bbox, keypoints)
-        if crop is None:
-            continue
-        if crop.shape[0] < 32 or crop.shape[1] < 32:
-            continue
-
-        pending_indices.append(idx)
-        crops.append(crop)
-        lower_bboxes.append(lower_bbox)
-
-    if not crops:
-        return results
-
-    classify_kwargs = {
-        "verbose": False,
-    }
-    if device:
-        classify_kwargs["device"] = device
-
-    try:
-        raw_results = dresscode_model(crops, **classify_kwargs)
-    except Exception as e:
-        print(f"[DressCode] Batch classification error: {e}")
-        return results
-
-    for batch_pos, raw in enumerate(raw_results):
-        if raw.probs is None:
-            continue
-
-        top1_idx = int(raw.probs.top1)
-        top1_conf = float(raw.probs.top1conf)
-        label = dresscode_class_names.get(top1_idx, f"class_{top1_idx}")
-
-        result_index = pending_indices[batch_pos]
-        results[result_index] = {
-            "label": label,
-            "confidence": round(top1_conf, 3),
-            "lower_bbox": list(map(int, lower_bboxes[batch_pos])),
+        entry = {
+            "label": None,
+            "confidence": None,
+            "lower_bbox": None,
+            "slipper_bbox": None,
+            "classifications": [],
         }
+        results[idx] = entry
+
+        lower_crop, lower_bbox = crop_lower_body(frame, bbox, keypoints)
+        if lower_crop is not None and dresscode_model is not None and enable_pants:
+            if lower_crop.shape[0] >= 32 and lower_crop.shape[1] >= 32:
+                lower_pending_indices.append(idx)
+                lower_crops.append(lower_crop)
+                lower_bboxes.append(lower_bbox)
+
+        slipper_crop, slipper_bbox = crop_slipper_region(frame, bbox, keypoints)
+        if slipper_crop is not None and slipper_model is not None and enable_slipper:
+            slipper_pending_indices.append(idx)
+            slipper_crops.append(slipper_crop)
+            slipper_bboxes.append(slipper_bbox)
+
+    lower_predictions = _predict_batch(dresscode_model, dresscode_class_names, lower_crops, device=device)
+    slipper_predictions = _predict_batch(slipper_model, slipper_class_names, slipper_crops, device=device)
+
+    for batch_pos, prediction in enumerate(lower_predictions):
+        if prediction is None:
+            continue
+        result_index = lower_pending_indices[batch_pos]
+        entry = results[result_index]
+        if entry is None:
+            continue
+        entry["lower_bbox"] = list(map(int, lower_bboxes[batch_pos]))
+        entry["classifications"].append(
+            {
+                "label": prediction["label"],
+                "confidence": prediction["confidence"],
+                "region": "lower_body",
+            }
+        )
+
+    for batch_pos, prediction in enumerate(slipper_predictions):
+        if prediction is None:
+            continue
+        result_index = slipper_pending_indices[batch_pos]
+        entry = results[result_index]
+        if entry is None:
+            continue
+        entry["slipper_bbox"] = list(map(int, slipper_bboxes[batch_pos]))
+        entry["classifications"].append(
+            {
+                "label": prediction["label"],
+                "confidence": prediction["confidence"],
+                "region": "footwear",
+            }
+        )
+
+    for idx, entry in enumerate(results):
+        finalized = _finalize_combined_result(entry) if entry is not None else None
+        results[idx] = finalized
 
     return results
 

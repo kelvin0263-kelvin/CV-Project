@@ -11,7 +11,7 @@ import argparse
 current_dir = os.path.dirname(os.path.abspath(__file__))
 backend_path = os.path.join(os.path.dirname(current_dir), 'backend')
 sys.path.append(backend_path)
-POSE_MODEL_PATH = os.path.join(backend_path, "yolo26s-pose.pt")
+POSE_MODEL_PATH = os.path.join(backend_path, "yolo26m-pose.pt")
 
 try:
     from DefishVideoCV import FisheyeMultiView
