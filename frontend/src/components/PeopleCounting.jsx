@@ -18,6 +18,7 @@ import { cn } from '../lib/utils';
 import { getApiBaseUrl, getWSUrl } from '../apiConfig';
 import StreamPlayer from './StreamPlayer';
 import CountingCanvas from './CountingCanvas';
+import ConfirmationDialog from './ConfirmationDialog';
 
 const EMPTY_BUILDING_SUMMARY = {
     enabled: true,
@@ -86,6 +87,13 @@ const getFootTrafficSummaryLabels = (lines) => {
     return { ...labels[0], mixed: false };
 };
 
+const sortCamerasAlphabetically = (cameraList) => [...cameraList].sort((left, right) => (
+    String(left?.name || '').localeCompare(String(right?.name || ''), undefined, {
+        numeric: true,
+        sensitivity: 'base',
+    })
+));
+
 const Toggle = ({ checked, onClick, disabled = false }) => (
     <button
         type="button"
@@ -130,7 +138,7 @@ const StatTile = ({ label, value, icon: Icon, tone = 'default', subtitle = null 
 };
 
 const SectionShell = ({ title, description = null, action = null, children }) => (
-    <Card className="border-border/70">
+    <Card className="border-slate-200/80 bg-white/95 shadow-sm">
         <CardHeader className="space-y-2 pb-3">
             <div className="flex items-start justify-between gap-3">
                 <div>
@@ -159,7 +167,6 @@ const PeopleCounting = () => {
     const [crossCameraPairId, setCrossCameraPairId] = useState('');
     const [crossCameraRole, setCrossCameraRole] = useState('none');
     const [verificationCameraId, setVerificationCameraId] = useState('');
-    const [verificationInwardThreshold, setVerificationInwardThreshold] = useState('0.02');
     const [drawingMode, setDrawingMode] = useState(null);
     const [countingData, setCountingData] = useState({});
     const [stats, setStats] = useState({ fps: 0, people_count: 0 });
@@ -174,6 +181,7 @@ const PeopleCounting = () => {
     const [buildingSummary, setBuildingSummary] = useState(EMPTY_BUILDING_SUMMARY);
     const [resettingBuilding, setResettingBuilding] = useState(false);
     const [resettingCamera, setResettingCamera] = useState(false);
+    const [confirmResetTarget, setConfirmResetTarget] = useState(null);
     const [activeTab, setActiveTab] = useState('setup');
 
     const resetCountingConfig = useCallback(() => {
@@ -186,7 +194,6 @@ const PeopleCounting = () => {
         setCrossCameraPairId('');
         setCrossCameraRole('none');
         setVerificationCameraId('');
-        setVerificationInwardThreshold('0.02');
         setDrawingMode(null);
     }, []);
 
@@ -195,7 +202,9 @@ const PeopleCounting = () => {
             try {
                 const res = await fetch(`${apiUrl}/api/cameras`);
                 const data = await res.json();
-                const enabledCameras = (Array.isArray(data) ? data : []).filter((camera) => camera.enabled);
+                const enabledCameras = sortCamerasAlphabetically(
+                    (Array.isArray(data) ? data : []).filter((camera) => camera.enabled)
+                );
                 setCameras(enabledCameras);
                 setSelectedCamera((currentCamera) => currentCamera || enabledCameras[0]?.id || '');
             } catch (err) {
@@ -242,7 +251,6 @@ const PeopleCounting = () => {
                 setCrossCameraPairId(data.cross_camera_pair_id || '');
                 setCrossCameraRole(data.cross_camera_role || 'none');
                 setVerificationCameraId(data.verification_camera_id || '');
-                setVerificationInwardThreshold(String(data.verification_inward_threshold ?? 0.02));
             } catch (err) {
                 console.error('Failed to fetch counting config:', err);
                 if (!cancelled) {
@@ -343,7 +351,6 @@ const PeopleCounting = () => {
                 cross_camera_pair_id: crossCameraEnabled ? crossCameraPairId.trim() : null,
                 cross_camera_role: effectiveCrossCameraRole,
                 verification_camera_id: crossCameraEnabled && effectiveCrossCameraRole === 'primary' ? verificationCameraId : null,
-                verification_inward_threshold: parseFloat(verificationInwardThreshold || '0.02') || 0.02,
                 lines,
                 frame_exclude_areas: validFrameExcludeAreas,
             };
@@ -369,7 +376,6 @@ const PeopleCounting = () => {
             setCrossCameraPairId(savedConfig.cross_camera_pair_id || '');
             setCrossCameraRole(savedConfig.cross_camera_role || 'none');
             setVerificationCameraId(savedConfig.verification_camera_id || '');
-            setVerificationInwardThreshold(String(savedConfig.verification_inward_threshold ?? 0.02));
 
             const buildingRes = await fetch(`${apiUrl}/api/building-counting-config`, {
                 method: 'PUT',
@@ -451,6 +457,14 @@ const PeopleCounting = () => {
         }
         setResettingCamera(false);
         setTimeout(() => setSaveMessage(''), 3000);
+    };
+
+    const openResetConfirmation = (target) => {
+        setConfirmResetTarget(target);
+    };
+
+    const closeResetConfirmation = () => {
+        setConfirmResetTarget(null);
     };
 
     const handleLineDrawn = useCallback(({ points, direction }) => {
@@ -800,10 +814,6 @@ const PeopleCounting = () => {
                                 </select>
                             </div>
                         )}
-                        <div className="space-y-2 sm:col-span-2">
-                            <label className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Inward Motion Threshold</label>
-                            <input type="number" step="0.005" min="0" className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm" value={verificationInwardThreshold} onChange={(e) => setVerificationInwardThreshold(e.target.value)} />
-                        </div>
                     </div>
                 )}
             </SectionShell>
@@ -843,7 +853,7 @@ const PeopleCounting = () => {
                         Building capacity exceeded.
                     </div>
                 )}
-                <Button variant="outline" size="sm" className="w-full" onClick={handleResetBuildingTotals} disabled={resettingBuilding}>
+                <Button variant="outline" size="sm" className="w-full" onClick={() => openResetConfirmation('building')} disabled={resettingBuilding}>
                     <RotateCcw className="mr-2 h-3.5 w-3.5" />
                     {resettingBuilding ? 'Resetting Building Totals...' : 'Reset Building Totals'}
                 </Button>
@@ -870,7 +880,7 @@ const PeopleCounting = () => {
 
     const settingsPanel = (
         <div className="order-2 space-y-4 xl:order-1">
-            <Card className="border-border/70 bg-gradient-to-br from-background via-background to-muted/40">
+            <Card className="border-slate-200/80 bg-white/95 shadow-sm">
                 <CardHeader className="pb-2">
                     <div className="space-y-1">
                         <CardTitle className="text-xl">Configuration</CardTitle>
@@ -878,7 +888,7 @@ const PeopleCounting = () => {
                     </div>
                 </CardHeader>
                 <CardContent className="space-y-5">
-                    <div className="rounded-3xl border border-border/70 bg-background/80 p-4">
+                    <div className="rounded-3xl border border-slate-200 bg-slate-50/70 p-4">
                         <div className="space-y-4">
                             <div className="space-y-2">
                                 <label className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Selected Camera</label>
@@ -890,7 +900,7 @@ const PeopleCounting = () => {
                                 </select>
                             </div>
 
-                            <div className="flex items-center justify-between rounded-2xl border border-border/70 bg-background px-4 py-3">
+                            <div className="flex items-center justify-between rounded-2xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
                                 <div>
                                     <div className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Counting</div>
                                     <div className="mt-1 text-sm font-medium">{enabled ? 'Enabled' : 'Disabled'}</div>
@@ -900,15 +910,15 @@ const PeopleCounting = () => {
                             </div>
 
                             <div className="grid grid-cols-3 gap-2">
-                                <div className="rounded-2xl border border-border/70 bg-background px-3 py-2">
+                                <div className="rounded-2xl border border-slate-200 bg-white px-3 py-2 shadow-sm">
                                     <div className="text-[10px] font-medium uppercase tracking-[0.16em] text-muted-foreground">Door Lines</div>
                                     <div className="mt-1 text-lg font-semibold">{occupancyLineCount}</div>
                                 </div>
-                                <div className="rounded-2xl border border-border/70 bg-background px-3 py-2">
+                                <div className="rounded-2xl border border-slate-200 bg-white px-3 py-2 shadow-sm">
                                     <div className="text-[10px] font-medium uppercase tracking-[0.16em] text-muted-foreground">FT Lines</div>
                                     <div className="mt-1 text-lg font-semibold">{footTrafficLineCount}</div>
                                 </div>
-                                <div className="rounded-2xl border border-border/70 bg-background px-3 py-2">
+                                <div className="rounded-2xl border border-slate-200 bg-white px-3 py-2 shadow-sm">
                                     <div className="text-[10px] font-medium uppercase tracking-[0.16em] text-muted-foreground">Zones</div>
                                     <div className="mt-1 text-lg font-semibold">{validFrameExcludeAreas.length}</div>
                                 </div>
@@ -932,7 +942,7 @@ const PeopleCounting = () => {
                                 onClick={() => setActiveTab(tab.id)}
                                 className={cn(
                                     'rounded-2xl border px-4 py-3 text-left text-sm transition-colors',
-                                    activeTab === tab.id ? 'border-primary bg-primary/10 text-foreground' : 'border-border/70 bg-background text-muted-foreground hover:text-foreground',
+                                    activeTab === tab.id ? 'border-primary bg-primary/10 text-foreground' : 'border-slate-200 bg-white text-muted-foreground hover:text-foreground',
                                 )}
                             >
                                 <div className="font-medium">{tab.label}</div>
@@ -952,7 +962,7 @@ const PeopleCounting = () => {
     const videoPanel = (
         <div className="order-1 space-y-4 xl:order-2 xl:sticky xl:top-6">
             {topSummary}
-            <Card className="overflow-hidden border-border/70 bg-black">
+            <Card className="overflow-hidden border-slate-200/80 bg-white/95 shadow-sm">
                 <CardHeader className="border-b border-white/10 bg-black/80 pb-3 text-white">
                     <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                         <div>
@@ -1021,29 +1031,54 @@ const PeopleCounting = () => {
     );
 
     return (
-        <div className="flex flex-col gap-6">
-            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-                <div>
-                    <h1 className="text-3xl font-bold tracking-tight">People Counting</h1>
-                    <p className="mt-1 text-sm text-muted-foreground">Redesigned so the live preview stays primary and the configuration stays focused.</p>
+        <div className="flex h-full flex-col gap-6 overflow-auto bg-[radial-gradient(circle_at_top_left,_rgba(59,130,246,0.08),_transparent_32%),linear-gradient(180deg,_rgba(248,250,252,0.95),_rgba(255,255,255,1))] p-6">
+            <ConfirmationDialog
+                open={Boolean(confirmResetTarget)}
+                title={confirmResetTarget === 'building' ? 'Reset Building Totals?' : 'Reset Camera Totals?'}
+                description={confirmResetTarget === 'building'
+                    ? 'This will clear the grouped building occupancy totals. Continue?'
+                    : 'This will clear the totals for the selected camera. Continue?'}
+                confirmLabel="Confirm Reset"
+                confirmVariant="destructive"
+                loading={resettingBuilding || resettingCamera}
+                loadingIcon={<RotateCcw className="mr-2 h-3.5 w-3.5 animate-spin" />}
+                onCancel={closeResetConfirmation}
+                onConfirm={async () => {
+                    const pendingTarget = confirmResetTarget;
+                    closeResetConfirmation();
+                    if (pendingTarget === 'building') {
+                        await handleResetBuildingTotals();
+                        return;
+                    }
+                    await handleResetSelectedCamera();
+                }}
+            />
+
+            <section className="relative overflow-hidden rounded-[28px] border border-slate-200/80 bg-white/90 p-6 shadow-sm backdrop-blur">
+                <div className="absolute inset-y-0 right-0 hidden w-72 bg-[radial-gradient(circle_at_center,_rgba(59,130,246,0.12),_transparent_60%)] lg:block" />
+                <div className="relative flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                    <div>
+                        <h1 className="text-3xl font-bold tracking-tight text-slate-950">People Counting</h1>
+                        <p className="mt-1 text-sm text-slate-600">Redesigned so the live preview stays primary and the configuration stays focused.</p>
+                    </div>
+                    <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end">
+                        {buildingCapacityExceeded && (
+                            <div className="flex items-center gap-2 rounded-2xl border border-red-500/30 bg-red-500/10 px-4 py-2 text-red-500">
+                                <AlertTriangle className="h-4 w-4" />
+                                <span className="text-sm font-medium">Building Capacity Exceeded</span>
+                            </div>
+                        )}
+                        <Button variant="outline" size="sm" onClick={() => openResetConfirmation('camera')} disabled={resettingCamera || !selectedCamera} className="border-slate-200 bg-white text-slate-700">
+                            <RotateCcw className="mr-2 h-3.5 w-3.5" />
+                            {resettingCamera ? 'Resetting...' : 'Reset Totals'}
+                        </Button>
+                        <Button size="sm" onClick={handleSave} disabled={saving || !selectedCamera} className="bg-blue-600 text-white hover:bg-blue-700">
+                            <Save className="mr-2 h-3.5 w-3.5" />
+                            {saving ? 'Saving...' : 'Save Changes'}
+                        </Button>
+                    </div>
                 </div>
-                <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end">
-                    {buildingCapacityExceeded && (
-                        <div className="flex items-center gap-2 rounded-2xl border border-red-500/30 bg-red-500/10 px-4 py-2 text-red-500">
-                            <AlertTriangle className="h-4 w-4" />
-                            <span className="text-sm font-medium">Building Capacity Exceeded</span>
-                        </div>
-                    )}
-                    <Button variant="outline" size="sm" onClick={handleResetSelectedCamera} disabled={resettingCamera || !selectedCamera}>
-                        <RotateCcw className="mr-2 h-3.5 w-3.5" />
-                        {resettingCamera ? 'Resetting...' : 'Reset Totals'}
-                    </Button>
-                    <Button size="sm" onClick={handleSave} disabled={saving || !selectedCamera}>
-                        <Save className="mr-2 h-3.5 w-3.5" />
-                        {saving ? 'Saving...' : 'Save Changes'}
-                    </Button>
-                </div>
-            </div>
+            </section>
             {saveMessage && (
                 <div className={cn('rounded-2xl border px-4 py-3 text-sm', saveMessage.startsWith('Error') ? 'border-red-500/30 bg-red-500/10 text-red-500' : 'border-green-500/30 bg-green-500/10 text-green-600')}>
                     {saveMessage}

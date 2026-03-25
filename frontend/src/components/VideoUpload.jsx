@@ -3,16 +3,19 @@ import { Link } from 'react-router-dom';
 import {
     CheckCircle2,
     Clapperboard,
+    Edit2,
     FolderUp,
     Loader2,
     Play,
     RefreshCw,
+    Save,
     Square,
     Trash2,
 } from 'lucide-react';
 import { getApiBaseUrl, getWSUrl } from '../apiConfig';
 import StreamPlayer from './StreamPlayer';
 import RoiEditorCanvas from './RoiEditorCanvas';
+import ConfirmationDialog from './ConfirmationDialog';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card';
 import { Button } from './ui/button';
 import { Checkbox } from './ui/checkbox';
@@ -36,10 +39,22 @@ const getUploadDisplayName = (item) => {
     return item?.file_name || '';
 };
 
-const VideoUpload = ({ embedded = false }) => {
+const buildUploadEditForm = (item) => {
+    const primaryCamera = item?.cameras?.[0] || {};
+    return {
+        name: getUploadDisplayName(item),
+        location: String(primaryCamera.location || ''),
+        sourcePath: String(item?.source_path || ''),
+        detectionRoi: primaryCamera?.detection_roi || null,
+    };
+};
+
+const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection = null, onActiveSectionChange = null }) => {
     const apiUrl = getApiBaseUrl();
     const previewContainerRef = useRef(null);
-    const [activeSection, setActiveSection] = useState('create');
+    const [internalActiveSection, setInternalActiveSection] = useState('create');
+    const activeSection = controlledActiveSection ?? internalActiveSection;
+    const setActiveSection = onActiveSectionChange ?? setInternalActiveSection;
 
     const [items, setItems] = useState([]);
     const [loadingItems, setLoadingItems] = useState(true);
@@ -61,6 +76,14 @@ const VideoUpload = ({ embedded = false }) => {
 
     const [isUploading, setIsUploading] = useState(false);
     const [busyAction, setBusyAction] = useState('');
+    const [isEditingSource, setIsEditingSource] = useState(false);
+    const [isSavingEdit, setIsSavingEdit] = useState(false);
+    const [editForm, setEditForm] = useState(() => buildUploadEditForm(null));
+    const [isDrawingEditRoi, setIsDrawingEditRoi] = useState(false);
+    const [editPreviewImage, setEditPreviewImage] = useState('');
+    const [editPreviewSize, setEditPreviewSize] = useState({ width: 640, height: 360 });
+    const [loadingEditPreview, setLoadingEditPreview] = useState(false);
+    const [confirmAction, setConfirmAction] = useState(null);
     const [message, setMessage] = useState(null);
 
     useEffect(() => {
@@ -164,6 +187,24 @@ const VideoUpload = ({ embedded = false }) => {
         [activeRuntimeKey, items],
     );
     const activeDisplayName = useMemo(() => getUploadDisplayName(activeItem), [activeItem]);
+    const sortedItems = useMemo(
+        () => [...items].sort((left, right) => (
+            getUploadDisplayName(left).localeCompare(getUploadDisplayName(right), undefined, {
+                numeric: true,
+                sensitivity: 'base',
+            })
+        )),
+        [items],
+    );
+
+    useEffect(() => {
+        setIsEditingSource(false);
+        setIsSavingEdit(false);
+        setIsDrawingEditRoi(false);
+        setEditPreviewImage('');
+        setEditPreviewSize({ width: 640, height: 360 });
+        setEditForm(buildUploadEditForm(activeItem));
+    }, [activeItem?.runtime_key]);
 
     useEffect(() => {
         let cancelled = false;
@@ -240,7 +281,7 @@ const VideoUpload = ({ embedded = false }) => {
     };
 
     const handleSelectAll = () => {
-        setSelectedRuntimeKeys(new Set(items.map((item) => item.runtime_key)));
+        setSelectedRuntimeKeys(new Set(sortedItems.map((item) => item.runtime_key)));
     };
 
     const handleClearSelection = () => {
@@ -249,6 +290,152 @@ const VideoUpload = ({ embedded = false }) => {
 
     const refreshUploads = () => {
         setRefreshTick((value) => value + 1);
+    };
+
+    const requestActionConfirmation = (action, runtimeKeysOverride = null) => {
+        const runtimeKeys = Array.isArray(runtimeKeysOverride)
+            ? runtimeKeysOverride
+            : Array.from(selectedRuntimeKeys);
+        if (!runtimeKeys.length) {
+            setMessage({ type: 'error', text: 'Select at least one uploaded video first.' });
+            return;
+        }
+
+        setConfirmAction({
+            action,
+            runtimeKeys,
+        });
+    };
+
+    const closeConfirmation = () => {
+        setConfirmAction(null);
+    };
+
+    const handleBeginEdit = () => {
+        if (!activeItem) {
+            return;
+        }
+        setEditForm(buildUploadEditForm(activeItem));
+        setIsEditingSource(true);
+        setIsDrawingEditRoi(false);
+        setMessage(null);
+    };
+
+    const handleCancelEdit = () => {
+        setEditForm(buildUploadEditForm(activeItem));
+        setIsEditingSource(false);
+        setIsDrawingEditRoi(false);
+    };
+
+    const handleEditFieldChange = (field) => (event) => {
+        setEditForm((current) => ({
+            ...current,
+            [field]: event.target.value,
+        }));
+    };
+
+    const handleClearEditRoi = () => {
+        setEditForm((current) => ({
+            ...current,
+            detectionRoi: null,
+        }));
+        setIsDrawingEditRoi(false);
+    };
+
+    useEffect(() => {
+        let cancelled = false;
+
+        const loadEditPreview = async () => {
+            if (!isEditingSource || !activeItem?.runtime_key) {
+                setLoadingEditPreview(false);
+                return;
+            }
+
+            setLoadingEditPreview(true);
+            try {
+                const res = await fetch(`${apiUrl}/api/upload-videos/preview`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ runtime_key: activeItem.runtime_key }),
+                });
+                const data = await res.json().catch(() => ({}));
+                if (cancelled) {
+                    return;
+                }
+                if (!res.ok || !data.preview_image) {
+                    throw new Error(data.detail || 'Preview unavailable.');
+                }
+                setEditPreviewImage(`data:image/jpeg;base64,${data.preview_image}`);
+                setEditPreviewSize({
+                    width: parseInt(data.frame_width, 10) || 640,
+                    height: parseInt(data.frame_height, 10) || 360,
+                });
+            } catch (error) {
+                if (!cancelled) {
+                    console.error('Failed to load uploaded edit preview:', error);
+                    setEditPreviewImage('');
+                    setEditPreviewSize({ width: 640, height: 360 });
+                }
+            } finally {
+                if (!cancelled) {
+                    setLoadingEditPreview(false);
+                }
+            }
+        };
+
+        loadEditPreview();
+        return () => {
+            cancelled = true;
+        };
+    }, [activeItem?.runtime_key, apiUrl, isEditingSource]);
+
+    const handleSaveEdit = async () => {
+        if (!activeItem) {
+            return;
+        }
+
+        const name = editForm.name.trim();
+        if (!name) {
+            setMessage({ type: 'error', text: 'Please enter a source name.' });
+            return;
+        }
+
+        setIsSavingEdit(true);
+        setMessage(null);
+        try {
+            const res = await fetch(`${apiUrl}/api/upload-videos`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    runtime_key: activeItem.runtime_key,
+                    name,
+                    location: editForm.location.trim(),
+                    detection_roi: editForm.detectionRoi?.points?.length >= 3 ? editForm.detectionRoi : null,
+                }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                throw new Error(data.detail || 'Failed to update uploaded source.');
+            }
+
+            if (data.item?.runtime_key) {
+                setItems((current) => current.map((item) => (
+                    item.runtime_key === data.item.runtime_key ? data.item : item
+                )));
+            } else {
+                refreshUploads();
+            }
+
+            setMessage({ type: 'success', text: 'Uploaded source updated successfully.' });
+            setIsEditingSource(false);
+        } catch (error) {
+            setMessage({
+                type: 'error',
+                text: error?.message || 'Failed to update uploaded source.',
+            });
+        } finally {
+            setIsSavingEdit(false);
+        }
     };
 
     const handleUpload = async () => {
@@ -326,10 +513,6 @@ const VideoUpload = ({ embedded = false }) => {
             return;
         }
 
-        if (action === 'delete' && !window.confirm(`Remove ${runtimeKeys.length} uploaded source(s)? This also deletes the uploaded video file.`)) {
-            return;
-        }
-
         setBusyAction(action);
         setMessage(null);
         try {
@@ -369,6 +552,27 @@ const VideoUpload = ({ embedded = false }) => {
 
     return (
         <div className="flex flex-col gap-6">
+            <ConfirmationDialog
+                open={Boolean(confirmAction)}
+                title={confirmAction?.action === 'stop' ? 'Stop Selected Uploads?' : 'Remove Selected Uploads?'}
+                description={confirmAction?.action === 'stop'
+                    ? `Stop ${confirmAction?.runtimeKeys?.length || 0} uploaded source(s)? You can start them again later.`
+                    : `Remove ${confirmAction?.runtimeKeys?.length || 0} uploaded source(s)? This also deletes the uploaded video file.`}
+                confirmLabel={confirmAction?.action === 'stop' ? 'Confirm Stop' : 'Confirm Remove'}
+                confirmVariant={confirmAction?.action === 'delete' ? 'destructive' : 'secondary'}
+                loading={busyAction === confirmAction?.action}
+                loadingIcon={<Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                onCancel={closeConfirmation}
+                onConfirm={async () => {
+                    if (!confirmAction) {
+                        return;
+                    }
+                    const pendingAction = confirmAction;
+                    closeConfirmation();
+                    await runAction(pendingAction.action, pendingAction.runtimeKeys);
+                }}
+            />
+
             {!embedded && (
                 <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
                     <div>
@@ -395,22 +599,24 @@ const VideoUpload = ({ embedded = false }) => {
             )}
 
             <div className="space-y-4">
-                <div className="flex flex-wrap gap-2">
-                    <Button
-                        type="button"
-                        variant={activeSection === 'create' ? 'default' : 'outline'}
-                        onClick={() => setActiveSection('create')}
-                    >
-                        Create Upload Source
-                    </Button>
-                    <Button
-                        type="button"
-                        variant={activeSection === 'sources' ? 'default' : 'outline'}
-                        onClick={() => setActiveSection('sources')}
-                    >
-                        Uploaded Sources
-                    </Button>
-                </div>
+                {!embedded && (
+                    <div className="flex flex-wrap gap-2">
+                        <Button
+                            type="button"
+                            variant={activeSection === 'create' ? 'default' : 'outline'}
+                            onClick={() => setActiveSection('create')}
+                        >
+                            Create Upload Source
+                        </Button>
+                        <Button
+                            type="button"
+                            variant={activeSection === 'sources' ? 'default' : 'outline'}
+                            onClick={() => setActiveSection('sources')}
+                        >
+                            Uploaded Sources
+                        </Button>
+                    </div>
+                )}
 
                 {activeSection === 'create' && (
                 <Card className="w-full border-border/60">
@@ -575,11 +781,11 @@ const VideoUpload = ({ embedded = false }) => {
                                     {busyAction === 'start' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Play className="mr-2 h-4 w-4" />}
                                     Start Selected
                                 </Button>
-                                <Button variant="secondary" onClick={() => runAction('stop')} disabled={!selectedCount || busyAction === 'start' || busyAction === 'delete'}>
+                                <Button variant="secondary" onClick={() => requestActionConfirmation('stop')} disabled={!selectedCount || busyAction === 'start' || busyAction === 'delete'}>
                                     {busyAction === 'stop' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Square className="mr-2 h-4 w-4" />}
                                     Stop Selected
                                 </Button>
-                                <Button variant="destructive" onClick={() => runAction('delete')} disabled={!selectedCount || busyAction === 'start' || busyAction === 'stop'}>
+                                <Button variant="destructive" onClick={() => requestActionConfirmation('delete')} disabled={!selectedCount || busyAction === 'start' || busyAction === 'stop'}>
                                     {busyAction === 'delete' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Trash2 className="mr-2 h-4 w-4" />}
                                     Remove Selected
                                 </Button>
@@ -610,8 +816,8 @@ const VideoUpload = ({ embedded = false }) => {
                                 </div>
                             ) : (
                                 <div className="grid gap-4 xl:grid-cols-[minmax(0,380px)_minmax(0,1fr)]">
-                                    <div className="space-y-3">
-                                        {items.map((item) => {
+                                    <div className="max-h-[100vh] space-y-3 overflow-y-auto pr-2">
+                                        {sortedItems.map((item) => {
                                             const isSelected = selectedRuntimeKeys.has(item.runtime_key);
                                             const isActive = activeItem?.runtime_key === item.runtime_key;
                                             const isRunning = Boolean(item.producer_running);
@@ -674,6 +880,16 @@ const VideoUpload = ({ embedded = false }) => {
                                                         </div>
                                                     </div>
                                                     <div className="flex items-center gap-2">
+                                                        <Button
+                                                            type="button"
+                                                            variant="outline"
+                                                            size="sm"
+                                                            onClick={handleBeginEdit}
+                                                            disabled={isSavingEdit}
+                                                        >
+                                                            <Edit2 className="mr-2 h-4 w-4" />
+                                                            Edit
+                                                        </Button>
                                                         <span
                                                             className={cn(
                                                                 'rounded-full px-3 py-1 text-xs font-medium',
@@ -687,6 +903,130 @@ const VideoUpload = ({ embedded = false }) => {
                                                     </div>
                                                 </div>
 
+                                                {isEditingSource && (
+                                                    <div className="rounded-xl border p-4">
+                                                        <div className="grid gap-4 md:grid-cols-2">
+                                                            <div className="space-y-2">
+                                                                <Label htmlFor="edit-upload-name">Source Name</Label>
+                                                                <input
+                                                                    id="edit-upload-name"
+                                                                    type="text"
+                                                                    value={editForm.name}
+                                                                    onChange={handleEditFieldChange('name')}
+                                                                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                                                    placeholder="e.g. Warehouse Test Video"
+                                                                />
+                                                            </div>
+                                                            <div className="space-y-2">
+                                                                <Label htmlFor="edit-upload-location">Location</Label>
+                                                                <input
+                                                                    id="edit-upload-location"
+                                                                    type="text"
+                                                                    value={editForm.location}
+                                                                    onChange={handleEditFieldChange('location')}
+                                                                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                                                    placeholder="e.g. Building A"
+                                                                />
+                                                            </div>
+                                                        </div>
+                                                        <div className="mt-4 space-y-2">
+                                                            <Label htmlFor="edit-upload-path">Source Path</Label>
+                                                            <input
+                                                                id="edit-upload-path"
+                                                                type="text"
+                                                                value={editForm.sourcePath}
+                                                                readOnly
+                                                                className="flex h-10 w-full rounded-md border border-input bg-muted px-3 py-2 text-sm text-muted-foreground"
+                                                            />
+                                                            <p className="text-xs text-muted-foreground">
+                                                                This path is visible for reference, but uploaded video files cannot be changed after creation.
+                                                            </p>
+                                                        </div>
+                                                        <div className="mt-4 space-y-3">
+                                                            <div className="flex items-center justify-between">
+                                                                <Label>Detection ROI</Label>
+                                                                <div className="flex gap-2">
+                                                                    <Button
+                                                                        type="button"
+                                                                        variant={isDrawingEditRoi ? 'default' : 'outline'}
+                                                                        size="sm"
+                                                                        onClick={() => setIsDrawingEditRoi((prev) => !prev)}
+                                                                        disabled={loadingEditPreview || !editPreviewImage}
+                                                                    >
+                                                                        {isDrawingEditRoi ? 'Stop Drawing' : 'Draw ROI'}
+                                                                    </Button>
+                                                                    <Button
+                                                                        type="button"
+                                                                        variant="outline"
+                                                                        size="sm"
+                                                                        onClick={handleClearEditRoi}
+                                                                        disabled={!editForm.detectionRoi}
+                                                                    >
+                                                                        Clear ROI
+                                                                    </Button>
+                                                                </div>
+                                                            </div>
+                                                            <div ref={previewContainerRef} className="relative aspect-video overflow-hidden rounded-md bg-black">
+                                                                {editPreviewImage ? (
+                                                                    <img
+                                                                        src={editPreviewImage}
+                                                                        alt={`${activeDisplayName} edit preview`}
+                                                                        className="h-full w-full object-contain"
+                                                                    />
+                                                                ) : (
+                                                                    <div className="flex h-full w-full items-center justify-center text-sm text-muted-foreground">
+                                                                        {loadingEditPreview ? 'Loading preview...' : 'Preview unavailable for ROI editing.'}
+                                                                    </div>
+                                                                )}
+                                                                {editPreviewImage && (
+                                                                    <RoiEditorCanvas
+                                                                        roi={editForm.detectionRoi}
+                                                                        drawingEnabled={isDrawingEditRoi}
+                                                                        onChange={(nextRoi) => {
+                                                                            setEditForm((current) => ({
+                                                                                ...current,
+                                                                                detectionRoi: nextRoi,
+                                                                            }));
+                                                                            setIsDrawingEditRoi(false);
+                                                                        }}
+                                                                        containerRef={previewContainerRef}
+                                                                        mediaWidth={editPreviewSize.width}
+                                                                        mediaHeight={editPreviewSize.height}
+                                                                        label="Detection ROI"
+                                                                    />
+                                                                )}
+                                                            </div>
+                                                            <p className="text-xs text-muted-foreground">
+                                                                ROI changes are allowed here and will apply to this uploaded source. Clear ROI to use the full frame again.
+                                                            </p>
+                                                        </div>
+                                                        <div className="mt-4 flex justify-end gap-2">
+                                                            <Button
+                                                                type="button"
+                                                                variant="ghost"
+                                                                onClick={handleCancelEdit}
+                                                                disabled={isSavingEdit}
+                                                            >
+                                                                Cancel
+                                                            </Button>
+                                                            <Button
+                                                                type="button"
+                                                                onClick={handleSaveEdit}
+                                                                disabled={isSavingEdit}
+                                                            >
+                                                                {isSavingEdit ? (
+                                                                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                                                ) : (
+                                                                    <Save className="mr-2 h-4 w-4" />
+                                                                )}
+                                                                Save Changes
+                                                            </Button>
+                                                        </div>
+                                                    </div>
+                                                )}
+
+                                                {!isEditingSource && (
+                                                    <>
                                                     <div className="grid gap-3 md:grid-cols-3">
                                                         <div className="rounded-lg border p-3">
                                                             <div className="text-xs uppercase tracking-wide text-muted-foreground">Source Path</div>
@@ -723,27 +1063,29 @@ const VideoUpload = ({ embedded = false }) => {
                                                         </div>
                                                     </div>
 
-                                                <div className="overflow-hidden rounded-xl border bg-black">
-                                                    <div className="aspect-video">
-                                                        {activeItem.producer_running ? (
-                                                            <StreamPlayer
-                                                                wsUrl={getWSUrl(`/ws/${activeItem.primary_camera_id}`)}
-                                                                className="h-full w-full"
-                                                                    alt={activeDisplayName}
-                                                            />
-                                                        ) : runtimePreviewImage ? (
-                                                            <img
-                                                                src={runtimePreviewImage}
-                                                                    alt={`${activeDisplayName} preview`}
-                                                                className="h-full w-full object-contain"
-                                                            />
-                                                        ) : (
-                                                            <div className="flex h-full w-full items-center justify-center text-sm text-muted-foreground">
-                                                                {loadingRuntimePreview ? 'Loading preview...' : 'Preview unavailable. Start the upload to inspect the live frame.'}
-                                                            </div>
-                                                        )}
+                                                    <div className="overflow-hidden rounded-xl border bg-black">
+                                                        <div className="aspect-video">
+                                                            {activeItem.producer_running ? (
+                                                                <StreamPlayer
+                                                                    wsUrl={getWSUrl(`/ws/${activeItem.primary_camera_id}`)}
+                                                                    className="h-full w-full"
+                                                                        alt={activeDisplayName}
+                                                                />
+                                                            ) : runtimePreviewImage ? (
+                                                                <img
+                                                                    src={runtimePreviewImage}
+                                                                        alt={`${activeDisplayName} preview`}
+                                                                    className="h-full w-full object-contain"
+                                                                />
+                                                            ) : (
+                                                                <div className="flex h-full w-full items-center justify-center text-sm text-muted-foreground">
+                                                                    {loadingRuntimePreview ? 'Loading preview...' : 'Preview unavailable. Start the upload to inspect the live frame.'}
+                                                                </div>
+                                                            )}
+                                                        </div>
                                                     </div>
-                                                </div>
+                                                    </>
+                                                )}
                                             </>
                                         ) : (
                                             <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">

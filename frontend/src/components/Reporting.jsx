@@ -108,6 +108,9 @@ const formatDateOnlyLocal = (date) => {
 };
 
 const formatNumber = (value) => new Intl.NumberFormat('en-US').format(Number(value || 0));
+const REPORT_SURFACE_CARD_CLASS = 'border-slate-200/80 bg-white/95 shadow-sm';
+const REPORT_INPUT_CLASS = 'border-slate-200 bg-white';
+const REPORT_SECTION_HEADER_CLASS = 'rounded-[24px] border border-slate-200/80 bg-white/95 px-6 py-5 shadow-sm';
 
 const createDefaultCustomRange = () => {
     const now = new Date();
@@ -115,6 +118,22 @@ const createDefaultCustomRange = () => {
     return {
         start: formatDateTimeLocal(oneDayAgo),
         end: formatDateTimeLocal(now),
+    };
+};
+
+const createCustomRangeFromBounds = (startMs, endMs) => {
+    const fallback = createDefaultCustomRange();
+    if (startMs == null || endMs == null) return fallback;
+
+    const start = new Date(startMs);
+    const end = new Date(endMs);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) {
+        return fallback;
+    }
+
+    return {
+        start: formatDateTimeLocal(start),
+        end: formatDateTimeLocal(end),
     };
 };
 
@@ -134,13 +153,13 @@ const getQuickRangeDateBounds = (quickRange, customStartDate, customEndDate) => 
     }
 
     const end = new Date();
-    end.setHours(0, 0, 0, 0);
 
     const start = new Date(end);
     if (quickRange === 'today') {
+        start.setHours(0, 0, 0, 0);
         return {
-            startDate: formatDateOnlyLocal(start),
-            endDate: formatDateOnlyLocal(end),
+            startDate: formatDateTimeLocal(start),
+            endDate: formatDateTimeLocal(end),
         };
     }
     if (quickRange === '7d') {
@@ -148,16 +167,17 @@ const getQuickRangeDateBounds = (quickRange, customStartDate, customEndDate) => 
     } else if (quickRange === '30d') {
         start.setDate(start.getDate() - 29);
     }
+    start.setHours(0, 0, 0, 0);
 
     return {
-        startDate: formatDateOnlyLocal(start),
-        endDate: formatDateOnlyLocal(end),
+        startDate: formatDateTimeLocal(start),
+        endDate: formatDateTimeLocal(end),
     };
 };
 
 const getDateRangeBounds = (startDate, endDate) => {
-    const startMs = startDate ? new Date(`${startDate}T00:00:00`).getTime() : null;
-    const endMs = endDate ? new Date(`${endDate}T23:59:59.999`).getTime() : null;
+    const startMs = startDate ? new Date(startDate).getTime() : null;
+    const endMs = endDate ? new Date(endDate).getTime() : null;
     return { startMs, endMs };
 };
 
@@ -454,6 +474,321 @@ const aggregateTrafficAnalytics = (rows, { startMs = null, endMs = null, bucket 
     };
 };
 
+const aggregateBuildingFlow = (rows, { startMs = null, endMs = null, bucket = '1d' } = {}) => {
+    const sortedRows = [...rows].sort((a, b) => (a.tsMs ?? 0) - (b.tsMs ?? 0));
+    const bucketMap = new Map();
+    let totalIn = 0;
+    let totalOut = 0;
+    let peakOccupancy = 0;
+    let latestSnapshot = null;
+    let resetCount = 0;
+    let previousRow = null;
+
+    sortedRows.forEach((row) => {
+        if (!row?.tsMs) return;
+        if (startMs != null && row.tsMs < startMs) {
+            previousRow = row;
+            return;
+        }
+        if (endMs != null && row.tsMs > endMs) {
+            return;
+        }
+
+        const currentIn = Number(row.raw_in ?? 0);
+        const currentOut = Number(row.raw_out ?? 0);
+        const previousIn = Number(previousRow?.raw_in ?? 0);
+        const previousOut = Number(previousRow?.raw_out ?? 0);
+        const resetDetected = previousRow && (currentIn < previousIn || currentOut < previousOut);
+        const deltaIn = previousRow
+            ? Math.max(0, resetDetected ? currentIn : (currentIn - previousIn))
+            : Math.max(0, currentIn);
+        const deltaOut = previousRow
+            ? Math.max(0, resetDetected ? currentOut : (currentOut - previousOut))
+            : Math.max(0, currentOut);
+
+        if (resetDetected) {
+            resetCount += 1;
+        }
+
+        totalIn += deltaIn;
+        totalOut += deltaOut;
+        peakOccupancy = Math.max(peakOccupancy, Number(row.occupancy ?? 0));
+        if (!latestSnapshot || row.tsMs > latestSnapshot.tsMs) {
+            latestSnapshot = row;
+        }
+
+        const bucketStartMs = getBucketStartMs(row.tsMs, bucket);
+        const bucketEntry = bucketMap.get(bucketStartMs) || {
+            tsMs: bucketStartMs,
+            label: formatFlowBucketTick(bucketStartMs, bucket),
+            fullLabel: formatFlowBucketRange(bucketStartMs, bucket),
+            in: 0,
+            out: 0,
+            totalTraffic: 0,
+            occupancy: 0,
+            rawOccupancy: 0,
+            peakOccupancy: 0,
+        };
+
+        bucketEntry.in += deltaIn;
+        bucketEntry.out += deltaOut;
+        bucketEntry.totalTraffic += deltaIn + deltaOut;
+        bucketEntry.occupancy = Number(row.occupancy ?? bucketEntry.occupancy ?? 0);
+        bucketEntry.rawOccupancy = Number(row.raw_occupancy ?? bucketEntry.rawOccupancy ?? 0);
+        bucketEntry.peakOccupancy = Math.max(bucketEntry.peakOccupancy, Number(row.occupancy ?? 0));
+        bucketMap.set(bucketStartMs, bucketEntry);
+        previousRow = row;
+    });
+
+    const series = Array.from(bucketMap.values()).sort((a, b) => a.tsMs - b.tsMs);
+    const peakPeriod = series.reduce((best, point) => {
+        if (!best || point.totalTraffic > best.totalTraffic) return point;
+        return best;
+    }, null);
+
+    return {
+        series,
+        totalIn,
+        totalOut,
+        totalTraffic: totalIn + totalOut,
+        peakOccupancy,
+        estimatedOccupancy: Number(latestSnapshot?.occupancy ?? 0),
+        peakPeriodLabel: peakPeriod?.fullLabel || '-',
+        resetCount,
+    };
+};
+
+const aggregateBuildingEntranceContribution = (rows, { startMs = null, endMs = null } = {}) => {
+    const sortedRows = [...rows].sort((a, b) => (a.tsMs ?? 0) - (b.tsMs ?? 0));
+    const entranceMap = new Map();
+    let previousRow = null;
+
+    sortedRows.forEach((row) => {
+        if (!row?.tsMs) return;
+        if (startMs != null && row.tsMs < startMs) {
+            previousRow = row;
+            return;
+        }
+        if (endMs != null && row.tsMs > endMs) {
+            return;
+        }
+
+        const currentSummaries = row.entrance_summaries || {};
+        const previousSummaries = previousRow?.entrance_summaries || {};
+        const entranceIds = new Set([
+            ...Object.keys(previousSummaries),
+            ...Object.keys(currentSummaries),
+        ]);
+
+        entranceIds.forEach((entranceId) => {
+            const current = currentSummaries[entranceId] || {};
+            const previous = previousSummaries[entranceId] || {};
+            const currentIn = Number(current.total_in ?? 0);
+            const currentOut = Number(current.total_out ?? 0);
+            const previousIn = Number(previous.total_in ?? 0);
+            const previousOut = Number(previous.total_out ?? 0);
+            const resetDetected = previousRow && (currentIn < previousIn || currentOut < previousOut);
+            const deltaIn = previousRow
+                ? Math.max(0, resetDetected ? currentIn : (currentIn - previousIn))
+                : Math.max(0, currentIn);
+            const deltaOut = previousRow
+                ? Math.max(0, resetDetected ? currentOut : (currentOut - previousOut))
+                : Math.max(0, currentOut);
+
+            const existing = entranceMap.get(entranceId) || {
+                name: entranceId,
+                totalIn: 0,
+                totalOut: 0,
+                totalTraffic: 0,
+                currentOccupancy: 0,
+                cameraCount: 0,
+            };
+
+            existing.totalIn += deltaIn;
+            existing.totalOut += deltaOut;
+            existing.totalTraffic += deltaIn + deltaOut;
+            existing.currentOccupancy = Number(current.occupancy ?? existing.currentOccupancy ?? 0);
+            existing.cameraCount = Array.isArray(current.camera_ids)
+                ? current.camera_ids.length
+                : existing.cameraCount;
+            entranceMap.set(entranceId, existing);
+        });
+
+        previousRow = row;
+    });
+
+    const rawEntries = Array.from(entranceMap.values());
+    const totalTraffic = rawEntries.reduce((sum, entry) => sum + Number(entry.totalTraffic || 0), 0);
+    const entries = rawEntries
+        .map((entry) => ({
+            ...entry,
+            share: totalTraffic > 0 ? (Number(entry.totalTraffic || 0) / totalTraffic) * 100 : 0,
+        }))
+        .sort((a, b) => {
+            const trafficDelta = Number(b.totalTraffic || 0) - Number(a.totalTraffic || 0);
+            if (trafficDelta !== 0) return trafficDelta;
+            return String(a.name || '').localeCompare(String(b.name || ''));
+        });
+
+    return {
+        entries,
+        totalTraffic,
+        totalIn: entries.reduce((sum, entry) => sum + Number(entry.totalIn || 0), 0),
+        totalOut: entries.reduce((sum, entry) => sum + Number(entry.totalOut || 0), 0),
+        busiestEntrance: entries[0] || null,
+    };
+};
+
+const formatPercent = (value) => `${Number(value || 0).toFixed(1)}%`;
+
+const getPeakTwoHourLabel = (events) => {
+    const byWindow = new Map();
+
+    events.forEach((evt) => {
+        const ts = parseApiTimestamp(evt.timestamp);
+        if (!ts) return;
+        const bucketHour = Math.floor(ts.getHours() / 2) * 2;
+        byWindow.set(bucketHour, (byWindow.get(bucketHour) || 0) + 1);
+    });
+
+    let bestHour = null;
+    let bestCount = -1;
+    byWindow.forEach((count, hour) => {
+        if (count > bestCount) {
+            bestHour = hour;
+            bestCount = count;
+        }
+    });
+
+    if (bestHour == null) return '-';
+
+    const start = new Date();
+    start.setHours(bestHour, 0, 0, 0);
+    const end = new Date(start);
+    end.setHours(bestHour + 2, 0, 0, 0);
+
+    return `${start.toLocaleTimeString('en-US', { hour: 'numeric' })} - ${end.toLocaleTimeString('en-US', { hour: 'numeric' })}`;
+};
+
+const normalizeDressCodeSubtype = (label) => {
+    const normalized = String(label || '').trim().toLowerCase();
+    if (!normalized) return 'Others';
+    if (normalized.includes('slipper')) return 'Slippers';
+    if (normalized.includes('short')) return 'Shorts';
+    return 'Others';
+};
+
+const aggregateDressCodeAnalytics = (events, snapshots, { startMs = null, endMs = null, bucket = null } = {}) => {
+    const relevantEvents = events.filter((evt) => evt.event_type === 'Dress Code Violation');
+    const trafficBucket = bucket || getAdaptiveFlowBucket('custom', startMs, endMs);
+    const trafficSummary = aggregateTrafficAnalytics(snapshots, {
+        startMs,
+        endMs,
+        bucket: trafficBucket,
+    });
+    const violationBucketMap = new Map();
+    const violationBreakdownMap = new Map([
+        ['Slippers', 0],
+        ['Shorts', 0],
+        ['Others', 0],
+    ]);
+    const violatorKeys = new Set();
+
+    relevantEvents.forEach((evt) => {
+        const ts = parseApiTimestamp(evt.timestamp);
+        if (!ts) return;
+        const tsMs = ts.getTime();
+        const bucketStartMs = getBucketStartMs(tsMs, trafficBucket);
+        const subtype = normalizeDressCodeSubtype(evt.details?.label);
+        const violationKey = evt.details?.track_id != null
+            ? `${evt.camera_id || 'unknown'}:${evt.details.track_id}`
+            : `${evt.camera_id || 'unknown'}:${evt.id}`;
+
+        violatorKeys.add(violationKey);
+        violationBreakdownMap.set(subtype, (violationBreakdownMap.get(subtype) || 0) + 1);
+
+        const bucketEntry = violationBucketMap.get(bucketStartMs) || {
+            tsMs: bucketStartMs,
+            label: formatFlowBucketTick(bucketStartMs, trafficBucket),
+            fullLabel: formatFlowBucketRange(bucketStartMs, trafficBucket),
+            violations: 0,
+        };
+        bucketEntry.violations += 1;
+        violationBucketMap.set(bucketStartMs, bucketEntry);
+    });
+
+    const trafficByBucket = new Map(trafficSummary.series.map((point) => [point.tsMs, point]));
+    const mergedRateSeries = Array.from(new Set([
+        ...trafficSummary.series.map((point) => point.tsMs),
+        ...violationBucketMap.keys(),
+    ]))
+        .sort((a, b) => a - b)
+        .map((tsMs) => {
+            const trafficPoint = trafficByBucket.get(tsMs);
+            const violationPoint = violationBucketMap.get(tsMs);
+            const trafficCount = Number(trafficPoint?.totalFootTraffic ?? 0);
+            const violations = Number(violationPoint?.violations ?? 0);
+            return {
+                tsMs,
+                label: formatFlowBucketTick(tsMs, trafficBucket),
+                fullLabel: formatFlowBucketRange(tsMs, trafficBucket),
+                violations,
+                totalFootTraffic: trafficCount,
+                violationRate: trafficCount > 0 ? (violations / trafficCount) * 100 : 0,
+            };
+        });
+
+    const totalViolations = relevantEvents.length;
+    const totalTrafficBase = Number(trafficSummary.totalFootTraffic || 0);
+    const violationRate = totalTrafficBase > 0 ? (totalViolations / totalTrafficBase) * 100 : 0;
+    const peakRatePoint = mergedRateSeries.reduce((best, point) => {
+        if (point.totalFootTraffic <= 0) return best;
+        if (!best || point.violationRate > best.violationRate) return point;
+        return best;
+    }, null);
+
+    const breakdown = ['Slippers', 'Shorts', 'Others'].map((name) => {
+        const count = Number(violationBreakdownMap.get(name) || 0);
+        return {
+            name,
+            count,
+            percentage: totalViolations > 0 ? (count / totalViolations) * 100 : 0,
+        };
+    });
+
+    return {
+        totalViolations,
+        uniqueViolators: violatorKeys.size,
+        violationRate,
+        peakViolationTimeLabel: getPeakTwoHourLabel(relevantEvents),
+        peakConversionLabel: peakRatePoint?.fullLabel || '-',
+        breakdown,
+        rateSeries: mergedRateSeries,
+        trafficSummary,
+    };
+};
+
+const aggregateFallDetectionAnalytics = (events) => {
+    const fallEvents = events
+        .filter((evt) => evt.event_type === 'Fall Detected')
+        .sort((a, b) => getTimestampMs(b.timestamp) - getTimestampMs(a.timestamp));
+
+    const affectedCameraIds = new Set(
+        fallEvents
+            .map((evt) => evt.camera_id)
+            .filter(Boolean),
+    );
+
+    const latestEvent = fallEvents[0] || null;
+
+    return {
+        totalFalls: fallEvents.length,
+        affectedCameraCount: affectedCameraIds.size,
+        latestEventLabel: latestEvent ? formatTimestamp(latestEvent.timestamp) : '-',
+        peakFallTimeLabel: getPeakTwoHourLabel(fallEvents),
+    };
+};
+
 const getOccupancyTickLabel = (date, rangeKey) => {
     if (rangeKey === '1h' || rangeKey === '6h' || rangeKey === '24h') {
         return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
@@ -654,7 +989,7 @@ const FlowTrendPanel = ({ snapshots, cameraLabel }) => {
     const ChartComponent = isDailyView ? ComposedChart : ComposedChart;
 
     return (
-        <Card className="flex flex-col min-h-[420px]">
+        <Card className={cn(REPORT_SURFACE_CARD_CLASS, "flex flex-col min-h-[420px]")}>
             <CardHeader className="space-y-3">
                 <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
                     <div>
@@ -722,7 +1057,7 @@ const FlowTrendPanel = ({ snapshots, cameraLabel }) => {
 
                 {flowSummary.resetCount > 0 && (
                     <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700">
-                        {flowSummary.resetCount} counter reset{flowSummary.resetCount !== 1 ? 's were' : ' was'} detected in this trend range. Flow totals are derived from deltas, while occupancy should be treated as an estimate.
+                        {flowSummary.resetCount} counter reset{flowSummary.resetCount !== 1 ? 's were' : ' was'} detected in this trend range. Flow totals are rebuilt from changes between saved snapshots, so occupancy should be treated as an estimate.
                     </div>
                 )}
             </CardHeader>
@@ -818,7 +1153,7 @@ const TrafficAnalyticsPanel = ({ snapshots, cameraLabel, startMs, endMs, isAllCa
 
     return (
         <div className="space-y-6">
-            <div className="space-y-1">
+            <div className={cn(REPORT_SECTION_HEADER_CLASS, "space-y-1")}>
                 <h2 className="text-lg font-semibold tracking-tight">Traffic Analytics</h2>
                 <p className="text-sm text-muted-foreground">
                     Foot-traffic and conversion reporting for {cameraLabel}.
@@ -833,7 +1168,7 @@ const TrafficAnalyticsPanel = ({ snapshots, cameraLabel, startMs, endMs, isAllCa
 
             {trafficSummary.resetCount > 0 && (
                 <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-700">
-                    Traffic counter resets were detected in the selected report range. Foot-traffic and capture-rate trends are reconstructed from snapshot deltas.
+                    Traffic counter resets were detected in the selected report range. Foot-traffic and capture-rate trends are rebuilt from changes between saved snapshots.
                 </div>
             )}
 
@@ -869,7 +1204,7 @@ const TrafficAnalyticsPanel = ({ snapshots, cameraLabel, startMs, endMs, isAllCa
             </div>
 
             <div className="grid gap-6 xl:grid-cols-2">
-                <Card className="flex flex-col min-h-[360px]">
+                <Card className={cn(REPORT_SURFACE_CARD_CLASS, "flex flex-col min-h-[360px]")}>
                     <CardHeader>
                         <CardTitle>Left/Right Traffic Over Time</CardTitle>
                     </CardHeader>
@@ -908,7 +1243,7 @@ const TrafficAnalyticsPanel = ({ snapshots, cameraLabel, startMs, endMs, isAllCa
                     </CardContent>
                 </Card>
 
-                <Card className="flex flex-col min-h-[360px]">
+                <Card className={cn(REPORT_SURFACE_CARD_CLASS, "flex flex-col min-h-[360px]")}>
                     <CardHeader>
                         <CardTitle>Left/Right Traffic by Day</CardTitle>
                     </CardHeader>
@@ -970,7 +1305,7 @@ const TrafficAnalyticsPanel = ({ snapshots, cameraLabel, startMs, endMs, isAllCa
             </div>
 
             <div className="grid gap-6 xl:grid-cols-2">
-                <Card className="flex flex-col min-h-[360px]">
+                <Card className={cn(REPORT_SURFACE_CARD_CLASS, "flex flex-col min-h-[360px]")}>
                     <CardHeader>
                         <CardTitle>Capture Rate Over Time</CardTitle>
                     </CardHeader>
@@ -999,7 +1334,7 @@ const TrafficAnalyticsPanel = ({ snapshots, cameraLabel, startMs, endMs, isAllCa
                     </CardContent>
                 </Card>
 
-                <Card className="flex flex-col min-h-[360px]">
+                <Card className={cn(REPORT_SURFACE_CARD_CLASS, "flex flex-col min-h-[360px]")}>
                     <CardHeader>
                         <CardTitle>Foot Traffic vs Entries Over Time</CardTitle>
                     </CardHeader>
@@ -1030,42 +1365,257 @@ const TrafficAnalyticsPanel = ({ snapshots, cameraLabel, startMs, endMs, isAllCa
                 </Card>
             </div>
 
-            <Card className="flex flex-col min-h-[360px]">
+            <Card className={cn(REPORT_SURFACE_CARD_CLASS, "flex flex-col min-h-[360px]")}>
                 <CardHeader>
                     <CardTitle>Capture Rate by Day</CardTitle>
                 </CardHeader>
                 <CardContent className="flex-1 min-h-[260px]">
-                    {dailyTrafficSeries.length > 0 ? (
-                        <ResponsiveContainer width="100%" height="100%">
-                            <BarChart data={dailyTrafficSeries} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-                                <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
-                                <XAxis dataKey="label" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
-                                <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} domain={[0, 100]} tickFormatter={(value) => `${value}%`} />
-                                <RechartsTooltip
-                                    cursor={{ fill: 'transparent' }}
-                                    formatter={(value, name) => [`${Number(value).toFixed(1)}%`, name]}
-                                    contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
-                                />
-                                <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
-                                <Bar dataKey="captureRate" name="Capture Rate" fill="#4f46e5" radius={[4, 4, 0, 0]} maxBarSize={36} />
-                            </BarChart>
-                        </ResponsiveContainer>
-                    ) : (
-                        <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
-                            No daily capture-rate data available
-                        </div>
-                    )}
+                    <div className="h-[260px]">
+                        {dailyTrafficSeries.length > 0 ? (
+                            <ResponsiveContainer width="100%" height="100%">
+                                <BarChart data={dailyTrafficSeries} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                                    <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
+                                    <XAxis dataKey="label" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
+                                    <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} domain={[0, 100]} tickFormatter={(value) => `${value}%`} />
+                                    <RechartsTooltip
+                                        cursor={{ fill: 'transparent' }}
+                                        formatter={(value, name) => [`${Number(value).toFixed(1)}%`, name]}
+                                        contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
+                                    />
+                                    <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
+                                    <Bar dataKey="captureRate" name="Capture Rate" fill="#4f46e5" radius={[4, 4, 0, 0]} maxBarSize={36} />
+                                </BarChart>
+                            </ResponsiveContainer>
+                        ) : (
+                            <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
+                                No daily capture-rate data available
+                            </div>
+                        )}
+                    </div>
                 </CardContent>
             </Card>
         </div>
     );
 };
 
-const BuildingOccupancyPanel = ({ apiUrl, startDate, endDate, refreshToken, visible }) => {
+const DressCodeAnalyticsPanel = ({ events, snapshots, cameraLabel, startMs, endMs, isAllCameras }) => {
+    const initialCustomRange = useMemo(
+        () => createCustomRangeFromBounds(startMs, endMs),
+        [startMs, endMs],
+    );
+    const [timeRange, setTimeRange] = useState('24h');
+    const [customStart, setCustomStart] = useState(initialCustomRange.start);
+    const [customEnd, setCustomEnd] = useState(initialCustomRange.end);
+    const [selectedBucket, setSelectedBucket] = useState('auto');
+
+    useEffect(() => {
+        setCustomStart(initialCustomRange.start);
+        setCustomEnd(initialCustomRange.end);
+    }, [initialCustomRange.end, initialCustomRange.start]);
+
+    const chartRangeBounds = useMemo(
+        () => getHistoryRangeBounds(timeRange, customStart, customEnd, endMs ?? Date.now()),
+        [timeRange, customStart, customEnd, endMs],
+    );
+    const effectiveBucket = useMemo(() => (
+        selectedBucket === 'auto'
+            ? getAdaptiveFlowBucket(timeRange, chartRangeBounds.startMs, chartRangeBounds.endMs)
+            : selectedBucket
+    ), [selectedBucket, timeRange, chartRangeBounds.startMs, chartRangeBounds.endMs]);
+    const analytics = useMemo(() => aggregateDressCodeAnalytics(events, snapshots, {
+        startMs,
+        endMs,
+    }), [endMs, events, snapshots, startMs]);
+    const chartAnalytics = useMemo(() => {
+        if (!chartRangeBounds.valid) {
+            return {
+                ...analytics,
+                rateSeries: [],
+            };
+        }
+
+        return aggregateDressCodeAnalytics(events, snapshots, {
+            startMs: chartRangeBounds.startMs,
+            endMs: chartRangeBounds.endMs,
+            bucket: effectiveBucket,
+        });
+    }, [analytics, chartRangeBounds.endMs, chartRangeBounds.startMs, chartRangeBounds.valid, effectiveBucket, events, snapshots]);
+
+    return (
+        <div className="space-y-6">
+            <div className={cn(REPORT_SECTION_HEADER_CLASS, "space-y-1")}>
+                <h2 className="text-lg font-semibold tracking-tight">Dress Code Reporting</h2>
+                <p className="text-sm text-muted-foreground">
+                    Violation summary and rate trends for {cameraLabel}.
+                </p>
+            </div>
+
+            {isAllCameras && (
+                <div className="rounded-md border border-blue-500/20 bg-blue-500/5 px-4 py-3 text-sm text-blue-700">
+                    Combined dress code analytics are being shown across all selected cameras. Choose a single camera for the clearest camera-level view.
+                </div>
+            )}
+
+            <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+                <div className="rounded-xl border border-red-500/20 bg-red-500/10 p-4">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <AlertTriangle className="h-4 w-4 text-red-600" />
+                        Total Violations
+                    </div>
+                    <div className="mt-2 text-3xl font-bold text-red-600">{formatNumber(analytics.totalViolations)}</div>
+                </div>
+                <div className="rounded-xl border border-slate-300 bg-slate-50 p-4">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <Users className="h-4 w-4 text-slate-700" />
+                        Unique Violators
+                    </div>
+                    <div className="mt-2 text-3xl font-bold text-slate-800">{formatNumber(analytics.uniqueViolators)}</div>
+                </div>
+                <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-4">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <TrendingUp className="h-4 w-4 text-amber-600" />
+                        Violation Rate
+                    </div>
+                    <div className="mt-2 text-3xl font-bold text-amber-700">{formatPercent(analytics.violationRate)}</div>
+                </div>
+                <div className="rounded-xl border border-indigo-500/20 bg-indigo-500/10 p-4">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <Clock3 className="h-4 w-4 text-indigo-600" />
+                        Peak Violation Time
+                    </div>
+                    <div className="mt-2 text-lg font-semibold text-indigo-700">{analytics.peakViolationTimeLabel}</div>
+                </div>
+            </div>
+
+            <div className="grid gap-6 xl:grid-cols-2">
+                <Card className={cn(REPORT_SURFACE_CARD_CLASS, "flex flex-col min-h-[360px]")}>
+                    <CardHeader>
+                        <CardTitle>Violation Breakdown</CardTitle>
+                    </CardHeader>
+                    <CardContent className="flex-1 min-h-[260px]">
+                        {analytics.breakdown.some((item) => item.count > 0) ? (
+                            <ResponsiveContainer width="100%" height="100%">
+                                <BarChart
+                                    data={analytics.breakdown}
+                                    layout="vertical"
+                                    margin={{ top: 10, right: 20, left: 20, bottom: 0 }}
+                                >
+                                    <CartesianGrid strokeDasharray="3 3" className="stroke-muted" horizontal={false} />
+                                    <XAxis type="number" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} tickFormatter={(value) => `${value}%`} domain={[0, 100]} />
+                                    <YAxis type="category" dataKey="name" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} width={80} />
+                                    <RechartsTooltip
+                                        cursor={{ fill: 'transparent' }}
+                                        formatter={(value, name, item) => [`${Number(value).toFixed(1)}% (${formatNumber(item?.payload?.count)})`, name]}
+                                        contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
+                                    />
+                                    <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
+                                    <Bar dataKey="percentage" name="Share of Violations" fill="#ef4444" radius={[0, 4, 4, 0]} />
+                                </BarChart>
+                            </ResponsiveContainer>
+                        ) : (
+                            <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
+                                No dress code violations found for the selected report range
+                            </div>
+                        )}
+                    </CardContent>
+                </Card>
+
+                <Card className={cn(REPORT_SURFACE_CARD_CLASS, "flex flex-col min-h-[360px]")}>
+                    <CardHeader className="space-y-3">
+                        <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+                            <div>
+                                <CardTitle>Violation Rate Over Time</CardTitle>
+                                {/* <p className="mt-1 text-sm text-muted-foreground">
+                                    Explore violation spikes across shorter or longer time windows with {effectiveBucket === '15m' ? '15-minute' : effectiveBucket === '1h' ? 'hourly' : 'daily'} grouping.
+                                </p> */}
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2">
+                                <span className="text-xs font-medium text-muted-foreground">Range</span>
+                                <select
+                                    className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                                    value={timeRange}
+                                    onChange={(e) => setTimeRange(e.target.value)}
+                                >
+                                    <option value="1h">Last 1 hour</option>
+                                    <option value="6h">Last 6 hours</option>
+                                    <option value="24h">Last 24 hours</option>
+                                    <option value="7d">Last 7 days</option>
+                                    <option value="30d">Last 30 days</option>
+                                    <option value="all">All data</option>
+                                    <option value="custom">Custom range</option>
+                                </select>
+                                <span className="text-xs font-medium text-muted-foreground">Grouping</span>
+                                <select
+                                    className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                                    value={selectedBucket}
+                                    onChange={(e) => setSelectedBucket(e.target.value)}
+                                >
+                                    <option value="auto">Auto</option>
+                                    <option value="15m">15 min</option>
+                                    <option value="1h">Hourly</option>
+                                    <option value="1d">Daily</option>
+                                </select>
+                            </div>
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                            Range controls how much history is shown. Grouping controls whether the trend is combined into 15-minute, hourly, or daily points.
+                        </p>
+                        {timeRange === 'custom' && (
+                            <div className="flex flex-wrap items-center gap-2">
+                                <input
+                                    type="datetime-local"
+                                    value={customStart}
+                                    onChange={(e) => setCustomStart(e.target.value)}
+                                    className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                                />
+                                <span className="text-xs text-muted-foreground">to</span>
+                                <input
+                                    type="datetime-local"
+                                    value={customEnd}
+                                    onChange={(e) => setCustomEnd(e.target.value)}
+                                    className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                                />
+                            </div>
+                        )}
+                    </CardHeader>
+                    <CardContent className="flex-1 min-h-[260px]">
+                        {chartAnalytics.rateSeries.length > 0 ? (
+                            <ResponsiveContainer width="100%" height="100%">
+                                <LineChart data={chartAnalytics.rateSeries} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                                    <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
+                                    <XAxis dataKey="label" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
+                                    <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} tickFormatter={(value) => `${value}%`} domain={[0, 'auto']} />
+                                    <RechartsTooltip
+                                        cursor={{ strokeDasharray: '3 3' }}
+                                        labelFormatter={(_, payload) => payload?.[0]?.payload?.fullLabel || ''}
+                                        formatter={(value, name) => [name === 'Violation Rate' ? formatPercent(value) : formatNumber(value), name]}
+                                        contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
+                                    />
+                                    <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
+                                    <Bar dataKey="violations" name="Violations" fill="#fca5a5" radius={[4, 4, 0, 0]} maxBarSize={26} />
+                                    <Line type="monotone" dataKey="violationRate" name="Violation Rate" stroke="#dc2626" strokeWidth={2.5} dot={false} />
+                                </LineChart>
+                            </ResponsiveContainer>
+                        ) : (
+                            <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
+                                {chartRangeBounds.valid
+                                    ? 'No violation-rate trend data available for the selected range'
+                                    : 'Choose a valid custom date/time range to view violation rate'}
+                            </div>
+                        )}
+                    </CardContent>
+                </Card>
+            </div>
+        </div>
+    );
+};
+
+const BuildingOccupancyPanel = ({ apiUrl, reportStartMs, reportEndMs, refreshToken, visible }) => {
     const [buildingSummary, setBuildingSummary] = useState(EMPTY_BUILDING_SUMMARY);
     const [buildingHistory, setBuildingHistory] = useState([]);
     const [loading, setLoading] = useState(false);
     const [timeRange, setTimeRange] = useState('24h');
+    const [selectedBucket, setSelectedBucket] = useState('auto');
     const [customStart, setCustomStart] = useState(() => createDefaultCustomRange().start);
     const [customEnd, setCustomEnd] = useState(() => createDefaultCustomRange().end);
     const [rangeNowMs, setRangeNowMs] = useState(() => Date.now());
@@ -1159,7 +1709,7 @@ const BuildingOccupancyPanel = ({ apiUrl, startDate, endDate, refreshToken, visi
         return () => clearInterval(intervalId);
     }, [visible]);
 
-    const filteredHistory = useMemo(() => {
+    const panelRangeBounds = useMemo(() => {
         let rangeStartMs = null;
         let rangeEndMs = rangeNowMs;
 
@@ -1167,7 +1717,7 @@ const BuildingOccupancyPanel = ({ apiUrl, startDate, endDate, refreshToken, visi
             const customStartMs = new Date(customStart).getTime();
             const customEndMs = new Date(customEnd).getTime();
             if (Number.isNaN(customStartMs) || Number.isNaN(customEndMs) || customStartMs > customEndMs) {
-                return [];
+                return { valid: false, startMs: null, endMs: null };
             }
             rangeStartMs = customStartMs;
             rangeEndMs = customEndMs;
@@ -1175,16 +1725,27 @@ const BuildingOccupancyPanel = ({ apiUrl, startDate, endDate, refreshToken, visi
             rangeStartMs = rangeNowMs - OCCUPANCY_RANGE_LOOKBACK_MS[timeRange];
         }
 
+        if (reportStartMs !== null) {
+            rangeStartMs = rangeStartMs == null ? reportStartMs : Math.max(rangeStartMs, reportStartMs);
+        }
+        if (reportEndMs !== null) {
+            rangeEndMs = Math.min(rangeEndMs, reportEndMs);
+        }
+        if (rangeStartMs != null && rangeEndMs != null && rangeStartMs > rangeEndMs) {
+            return { valid: false, startMs: null, endMs: null };
+        }
+
+        return { valid: true, startMs: rangeStartMs, endMs: rangeEndMs };
+    }, [customEnd, customStart, rangeNowMs, reportEndMs, reportStartMs, timeRange]);
+
+    const filteredHistory = useMemo(() => {
+        if (!panelRangeBounds.valid) return [];
         return buildingHistory.filter((row) => {
-            const dayIso = getTimestampIsoDate(row.timestamp);
-            if (!dayIso) return false;
-            if (startDate && dayIso < startDate) return false;
-            if (endDate && dayIso > endDate) return false;
-            if (rangeStartMs !== null && row.tsMs < rangeStartMs) return false;
-            if (rangeEndMs !== null && row.tsMs > rangeEndMs) return false;
+            if (panelRangeBounds.startMs !== null && row.tsMs < panelRangeBounds.startMs) return false;
+            if (panelRangeBounds.endMs !== null && row.tsMs > panelRangeBounds.endMs) return false;
             return true;
         });
-    }, [buildingHistory, startDate, endDate, timeRange, customStart, customEnd, rangeNowMs]);
+    }, [buildingHistory, panelRangeBounds]);
 
     const historyRangeKey = useMemo(() => {
         if (filteredHistory.length < 2) return '24h';
@@ -1202,7 +1763,16 @@ const BuildingOccupancyPanel = ({ apiUrl, startDate, endDate, refreshToken, visi
             rawOccupancy: row.raw_occupancy,
         }));
     }, [filteredHistory, historyRangeKey]);
-    const brushContextKey = `${timeRange}|${customStart}|${customEnd}|${startDate}|${endDate}`;
+
+    const effectiveBucket = useMemo(() => {
+        if (selectedBucket !== 'auto') return selectedBucket;
+        return getAdaptiveFlowBucket(
+            timeRange,
+            panelRangeBounds.startMs,
+            panelRangeBounds.endMs ?? rangeNowMs,
+        );
+    }, [panelRangeBounds.endMs, panelRangeBounds.startMs, rangeNowMs, selectedBucket, timeRange]);
+    const brushContextKey = `${timeRange}|${customStart}|${customEnd}|${reportStartMs}|${reportEndMs}`;
     const activeBrushWindow = useMemo(() => (
         brushWindow.key === brushContextKey
             ? brushWindow
@@ -1242,75 +1812,143 @@ const BuildingOccupancyPanel = ({ apiUrl, startDate, endDate, refreshToken, visi
         });
     }, [brushContextKey, chartData]);
 
-    const entranceEntries = useMemo(
-        () => Object.entries(buildingSummary.entrance_summaries ?? {}),
-        [buildingSummary.entrance_summaries],
+    const flowSummary = useMemo(() => {
+        if (!panelRangeBounds.valid) {
+            return {
+                series: [],
+                totalIn: 0,
+                totalOut: 0,
+                totalTraffic: 0,
+                peakOccupancy: 0,
+                estimatedOccupancy: 0,
+                peakPeriodLabel: '-',
+                resetCount: 0,
+            };
+        }
+
+        return aggregateBuildingFlow(buildingHistory, {
+            startMs: panelRangeBounds.startMs,
+            endMs: panelRangeBounds.endMs,
+            bucket: effectiveBucket,
+        });
+    }, [buildingHistory, effectiveBucket, panelRangeBounds]);
+
+    const todaySummary = useMemo(() => {
+        const todayStart = new Date();
+        todayStart.setHours(0, 0, 0, 0);
+        return aggregateBuildingFlow(buildingHistory, {
+            startMs: todayStart.getTime(),
+            endMs: rangeNowMs,
+            bucket: '1h',
+        });
+    }, [buildingHistory, rangeNowMs]);
+
+    const entranceContribution = useMemo(() => {
+        const aggregated = aggregateBuildingEntranceContribution(buildingHistory, {
+            startMs: panelRangeBounds.valid ? panelRangeBounds.startMs : null,
+            endMs: panelRangeBounds.valid ? panelRangeBounds.endMs : null,
+        });
+        if (aggregated.entries.length > 0) {
+            return aggregated;
+        }
+
+        const liveEntries = Object.entries(buildingSummary.entrance_summaries ?? {})
+            .map(([entranceId, entrance]) => ({
+                name: entranceId,
+                totalIn: Number(entrance?.total_in ?? 0),
+                totalOut: Number(entrance?.total_out ?? 0),
+                totalTraffic: Number(entrance?.total_in ?? 0) + Number(entrance?.total_out ?? 0),
+                currentOccupancy: Number(entrance?.occupancy ?? 0),
+                cameraCount: Array.isArray(entrance?.camera_ids) ? entrance.camera_ids.length : 0,
+            }))
+            .sort((a, b) => Number(b.totalTraffic || 0) - Number(a.totalTraffic || 0));
+        const totalTraffic = liveEntries.reduce((sum, entry) => sum + Number(entry.totalTraffic || 0), 0);
+        const entries = liveEntries.map((entry) => ({
+            ...entry,
+            share: totalTraffic > 0 ? (Number(entry.totalTraffic || 0) / totalTraffic) * 100 : 0,
+        }));
+
+        return {
+            entries,
+            totalTraffic,
+            totalIn: entries.reduce((sum, entry) => sum + Number(entry.totalIn || 0), 0),
+            totalOut: entries.reduce((sum, entry) => sum + Number(entry.totalOut || 0), 0),
+            busiestEntrance: entries[0] || null,
+        };
+    }, [buildingHistory, buildingSummary.entrance_summaries, panelRangeBounds]);
+
+    const capacityUtilization = buildingSummary.max_capacity
+        ? (Number(buildingSummary.occupancy ?? 0) / Number(buildingSummary.max_capacity)) * 100
+        : null;
+    const capacityUtilizationLabel = capacityUtilization == null
+        ? 'Capacity not configured'
+        : `${Math.round(capacityUtilization)}% Capacity Utilization`;
+    const peakOccupancyValue = Math.max(
+        Number(buildingSummary.occupancy ?? 0),
+        Number(flowSummary.peakOccupancy ?? 0),
     );
+    const occupancyChartRangeLabel = timeRange === 'custom'
+        ? 'Custom range'
+        : timeRange === 'all'
+            ? 'All time'
+            : timeRange === '1h'
+                ? 'Last 1 hour'
+                : timeRange === '6h'
+                    ? 'Last 6 hours'
+                    : timeRange === '24h'
+                        ? 'Last 24 hours'
+                        : timeRange === '7d'
+                            ? 'Last 7 days'
+                            : 'Last 30 days';
+    const isDailyFlowView = effectiveBucket === '1d';
 
     if (!visible) return null;
 
     return (
-        <Card className="flex flex-col min-h-[420px]">
-            <CardHeader className="space-y-3">
-                <CardTitle className="flex items-center gap-2">
-                    <Building2 className="w-4 h-4" />
-                    Building Occupancy
-                </CardTitle>
-                <div className="text-sm text-muted-foreground">
-                    Live building occupancy is shown from the current runtime summary. The chart below uses persisted building snapshots.
-                </div>
-            </CardHeader>
-            <CardContent className="space-y-4">
-                <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
-                    <div className={cn("rounded-lg border p-4", buildingSummary.capacity_exceeded ? 'border-red-500/30 bg-red-500/10' : 'border-primary/20 bg-primary/10')}>
-                        <div className="text-xs text-muted-foreground">Current Occupancy</div>
-                        <div className={cn("mt-1 text-2xl font-bold", buildingSummary.capacity_exceeded ? 'text-red-600' : 'text-primary')}>{buildingSummary.occupancy ?? 0}</div>
+        <div className="space-y-6">
+            <Card className={cn(REPORT_SURFACE_CARD_CLASS, "flex flex-col")}>
+                <CardHeader className="space-y-4">
+                    <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
+                        <div>
+                            <CardTitle className="flex items-center gap-2">
+                                <Building2 className="w-4 h-4" />
+                                Building View
+                            </CardTitle>
+                            <p className="mt-1 text-sm text-muted-foreground">
+                                Building-wide occupancy, throughput, and entrance contribution from persisted counting snapshots.
+                            </p>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                            <span className="text-xs font-medium text-muted-foreground">Range</span>
+                            <select
+                                value={timeRange}
+                                onChange={(e) => setTimeRange(e.target.value)}
+                                className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                            >
+                                <option value="1h">Last 1 hour</option>
+                                <option value="6h">Last 6 hours</option>
+                                <option value="24h">Last 24 hours</option>
+                                <option value="7d">Last 7 days</option>
+                                <option value="30d">Last 30 days</option>
+                                <option value="all">All time</option>
+                                <option value="custom">Custom range</option>
+                            </select>
+                            <span className="text-xs font-medium text-muted-foreground">Grouping</span>
+                            <select
+                                value={selectedBucket}
+                                onChange={(e) => setSelectedBucket(e.target.value)}
+                                className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                            >
+                                <option value="auto">Auto</option>
+                                <option value="15m">15 min</option>
+                                <option value="1h">Hourly</option>
+                                <option value="1d">Daily</option>
+                            </select>
+                        </div>
                     </div>
-                    <div className="rounded-lg border border-green-500/20 bg-green-500/10 p-4">
-                        <div className="text-xs text-muted-foreground">Building In</div>
-                        <div className="mt-1 text-2xl font-bold text-green-600">{buildingSummary.raw_in ?? 0}</div>
-                    </div>
-                    <div className="rounded-lg border border-red-500/20 bg-red-500/10 p-4">
-                        <div className="text-xs text-muted-foreground">Building Out</div>
-                        <div className="mt-1 text-2xl font-bold text-red-600">{buildingSummary.raw_out ?? 0}</div>
-                    </div>
-                    <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 p-4">
-                        <div className="text-xs text-muted-foreground">Manual Offset</div>
-                        <div className="mt-1 text-2xl font-bold text-amber-600">{buildingSummary.manual_offset ?? 0}</div>
-                    </div>
-                    <div className="rounded-lg border border-slate-300 bg-slate-50 p-4">
-                        <div className="text-xs text-muted-foreground">Building Max Capacity</div>
-                        <div className="mt-1 text-2xl font-bold text-slate-700">{buildingSummary.max_capacity ?? '-'}</div>
-                    </div>
-                </div>
 
-                <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
-                    <span>Building counting: {buildingSummary.enabled ? 'Enabled' : 'Disabled'}</span>
-                    <span>Active cameras: {buildingSummary.active_camera_count ?? 0}</span>
-                    <span>Raw occupancy: {buildingSummary.raw_occupancy ?? 0}</span>
-                </div>
-                {buildingSummary.capacity_exceeded && (
-                    <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600">
-                        Building capacity exceeded.
-                    </div>
-                )}
-
-                <div className="flex flex-wrap items-center gap-2">
-                    <select
-                        value={timeRange}
-                        onChange={(e) => setTimeRange(e.target.value)}
-                        className="h-8 rounded-md border border-input bg-background px-2 text-xs"
-                    >
-                        <option value="1h">Last 1 hour</option>
-                        <option value="6h">Last 6 hours</option>
-                        <option value="24h">Last 24 hours</option>
-                        <option value="7d">Last 7 days</option>
-                        <option value="30d">Last 30 days</option>
-                        <option value="all">All time</option>
-                        <option value="custom">Custom range</option>
-                    </select>
                     {timeRange === 'custom' && (
-                        <>
+                        <div className="flex flex-wrap items-center gap-2">
                             <input
                                 type="datetime-local"
                                 value={customStart}
@@ -1324,71 +1962,327 @@ const BuildingOccupancyPanel = ({ apiUrl, startDate, endDate, refreshToken, visi
                                 onChange={(e) => setCustomEnd(e.target.value)}
                                 className="h-8 rounded-md border border-input bg-background px-2 text-xs"
                             />
-                        </>
-                    )}
-                </div>
-
-                <div className="h-[260px]">
-                    {chartData.length > 0 ? (
-                        <ResponsiveContainer width="100%" height="100%">
-                            <LineChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 20 }}>
-                                <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
-                                <XAxis
-                                    type="number"
-                                    dataKey="tsMs"
-                                    domain={['dataMin', 'dataMax']}
-                                    tickFormatter={(value) => getOccupancyTickLabel(new Date(value), historyRangeKey)}
-                                    className="text-xs text-muted-foreground"
-                                    tickLine={false}
-                                    axisLine={false}
-                                />
-                                <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} allowDecimals={false} />
-                                <RechartsTooltip
-                                    cursor={{ strokeDasharray: '3 3' }}
-                                    labelFormatter={(value, payload) => payload?.[0]?.payload?.fullTime || formatTimestamp(value)}
-                                    contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
-                                />
-                                <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
-                                <Line type="linear" dataKey="occupancy" name="Occupancy" stroke="#2563eb" strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
-                                <Line type="linear" dataKey="rawOccupancy" name="Raw Occupancy" stroke="#94a3b8" strokeWidth={2} dot={false} activeDot={{ r: 4 }} strokeDasharray="6 4" />
-                                <Brush
-                                    dataKey="time"
-                                    height={22}
-                                    stroke="#2563eb"
-                                    travellerWidth={8}
-                                    startIndex={brushIndices.startIndex}
-                                    endIndex={brushIndices.endIndex}
-                                    onChange={handleBrushChange}
-                                />
-                            </LineChart>
-                        </ResponsiveContainer>
-                    ) : (
-                        <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-                            {loading ? 'Loading building history...' : 'No building occupancy history available for the selected date range'}
                         </div>
                     )}
-                </div>
 
-                {entranceEntries.length > 0 && (
-                    <div className="space-y-2">
-                        <div className="text-sm font-medium">Entrance Breakdown</div>
-                        <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-                            {entranceEntries.map(([entranceId, entrance]) => (
-                                <div key={entranceId} className="rounded-lg border bg-muted/20 p-3">
-                                    <div className="font-medium">{entranceId}</div>
-                                    <div className="mt-1 text-xs text-muted-foreground">Cameras: {(entrance.camera_ids || []).length}</div>
-                                    <div className="mt-2 flex items-center gap-3 text-xs">
-                                        <span className="text-green-600">IN: {entrance.total_in ?? 0}</span>
-                                        <span className="text-red-600">OUT: {entrance.total_out ?? 0}</span>
-                                        <span className="text-primary">NOW: {entrance.occupancy ?? 0}</span>
+                    <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+                        <span>Building counting: {buildingSummary.enabled ? 'Enabled' : 'Disabled'}</span>
+                        <span>Active cameras: {buildingSummary.active_camera_count ?? 0}</span>
+                        <span>Raw occupancy: {buildingSummary.raw_occupancy ?? 0}</span>
+                        <span>Manual offset: {buildingSummary.manual_offset ?? 0}</span>
+                    </div>
+
+                    {buildingSummary.capacity_exceeded && (
+                        <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600">
+                            Building capacity exceeded.
+                        </div>
+                    )}
+                </CardHeader>
+                <CardContent>
+                    <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+                        <div className={cn(
+                            'rounded-xl border p-4',
+                            buildingSummary.capacity_exceeded ? 'border-red-500/30 bg-red-500/10' : 'border-primary/20 bg-primary/10',
+                        )}>
+                            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                <Users className={cn('h-4 w-4', buildingSummary.capacity_exceeded ? 'text-red-600' : 'text-primary')} />
+                                Current Occupancy
+                            </div>
+                            <div className={cn('mt-2 text-3xl font-bold', buildingSummary.capacity_exceeded ? 'text-red-600' : 'text-primary')}>
+                                {formatNumber(buildingSummary.occupancy)}
+                            </div>
+                            <div className="mt-1 text-xs text-muted-foreground">{capacityUtilizationLabel}</div>
+                        </div>
+
+                        <div className="rounded-xl border border-green-500/20 bg-green-500/10 p-4">
+                            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                <ArrowDownToLine className="h-4 w-4 text-green-600" />
+                                Today IN
+                            </div>
+                            <div className="mt-2 text-3xl font-bold text-green-600">{formatNumber(todaySummary.totalIn)}</div>
+                            <div className="mt-1 text-xs text-muted-foreground">Since local midnight</div>
+                        </div>
+
+                        <div className="rounded-xl border border-red-500/20 bg-red-500/10 p-4">
+                            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                <ArrowUpFromLine className="h-4 w-4 text-red-600" />
+                                Today OUT
+                            </div>
+                            <div className="mt-2 text-3xl font-bold text-red-600">{formatNumber(todaySummary.totalOut)}</div>
+                            <div className="mt-1 text-xs text-muted-foreground">Since local midnight</div>
+                        </div>
+
+                        <div className="rounded-xl border border-blue-500/20 bg-blue-500/10 p-4">
+                            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                <TrendingUp className="h-4 w-4 text-blue-600" />
+                                Peak Occupancy
+                            </div>
+                            <div className="mt-2 text-3xl font-bold text-blue-700">{formatNumber(peakOccupancyValue)}</div>
+                            <div className="mt-1 text-xs text-muted-foreground">{flowSummary.peakPeriodLabel}</div>
+                        </div>
+
+                        <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-4">
+                            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                <Target className="h-4 w-4 text-amber-600" />
+                                Busiest Entrance
+                            </div>
+                            <div className="mt-2 text-xl font-bold text-amber-700">
+                                {entranceContribution.busiestEntrance?.name || '-'}
+                            </div>
+                            <div className="mt-1 text-xs text-muted-foreground">
+                                {entranceContribution.busiestEntrance
+                                    ? `${formatNumber(entranceContribution.busiestEntrance.totalTraffic)} traffic | ${formatPercent(entranceContribution.busiestEntrance.share)}`
+                                    : 'No entrance flow in range'}
+                            </div>
+                        </div>
+                    </div>
+                </CardContent>
+            </Card>
+
+            <Card className={cn(REPORT_SURFACE_CARD_CLASS, "flex flex-col min-h-[420px]")}>
+                <CardHeader className="space-y-2">
+                    <CardTitle>Building Occupancy</CardTitle>
+                    <p className="text-sm text-muted-foreground">
+                        Current occupancy trend across {occupancyChartRangeLabel.toLowerCase()}.
+                    </p>
+                </CardHeader>
+                <CardContent className="flex-1">
+                    <div className="h-[320px]">
+                        {chartData.length > 0 ? (
+                            <ResponsiveContainer width="100%" height="100%">
+                                <LineChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 20 }}>
+                                    <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
+                                    <XAxis
+                                        type="number"
+                                        dataKey="tsMs"
+                                        domain={['dataMin', 'dataMax']}
+                                        tickFormatter={(value) => getOccupancyTickLabel(new Date(value), historyRangeKey)}
+                                        className="text-xs text-muted-foreground"
+                                        tickLine={false}
+                                        axisLine={false}
+                                    />
+                                    <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} allowDecimals={false} />
+                                    <RechartsTooltip
+                                        cursor={{ strokeDasharray: '3 3' }}
+                                        labelFormatter={(value, payload) => payload?.[0]?.payload?.fullTime || formatTimestamp(value)}
+                                        formatter={(value, name) => [formatNumber(value), name]}
+                                        contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
+                                    />
+                                    <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
+                                    <Line type="linear" dataKey="occupancy" name="Occupancy" stroke="#2563eb" strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
+                                    <Line type="linear" dataKey="rawOccupancy" name="Raw Occupancy" stroke="#94a3b8" strokeWidth={2} dot={false} activeDot={{ r: 4 }} strokeDasharray="6 4" />
+                                    <Brush
+                                        dataKey="time"
+                                        height={22}
+                                        stroke="#2563eb"
+                                        travellerWidth={8}
+                                        startIndex={brushIndices.startIndex}
+                                        endIndex={brushIndices.endIndex}
+                                        onChange={handleBrushChange}
+                                    />
+                                </LineChart>
+                            </ResponsiveContainer>
+                        ) : (
+                            <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                                {loading
+                                    ? 'Loading building history...'
+                                    : panelRangeBounds.valid
+                                        ? 'No building occupancy history available for the selected date range'
+                                        : 'Choose a valid custom date/time range to view occupancy'}
+                            </div>
+                        )}
+                    </div>
+                </CardContent>
+            </Card>
+
+            <Card className={cn(REPORT_SURFACE_CARD_CLASS, "flex flex-col min-h-[420px]")}>
+                <CardHeader className="space-y-3">
+                    <div>
+                        <CardTitle className="flex items-center gap-2">
+                            <TrendingUp className="w-4 h-4" />
+                            In/Out Over Time
+                        </CardTitle>
+                        <p className="mt-1 text-sm text-muted-foreground">
+                            Building-level flow trend with adaptive {effectiveBucket === '15m' ? '15-minute' : effectiveBucket === '1h' ? 'hourly' : 'daily'} buckets.
+                        </p>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                        This matches the people-counting camera report pattern, but uses the merged building snapshot history.
+                    </p>
+                    {flowSummary.resetCount > 0 && (
+                        <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700">
+                            {flowSummary.resetCount} building counter reset{flowSummary.resetCount !== 1 ? 's were' : ' was'} detected in this trend range. Flow totals are derived from deltas, while occupancy should be treated as an estimate.
+                        </div>
+                    )}
+                </CardHeader>
+                <CardContent className="flex-1">
+                    <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+                        <div className="rounded-xl border border-green-500/20 bg-green-500/10 p-4">
+                            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                <ArrowDownToLine className="h-4 w-4 text-green-600" />
+                                Range IN
+                            </div>
+                            <div className="mt-2 text-3xl font-bold text-green-600">{formatNumber(flowSummary.totalIn)}</div>
+                        </div>
+                        <div className="rounded-xl border border-red-500/20 bg-red-500/10 p-4">
+                            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                <ArrowUpFromLine className="h-4 w-4 text-red-600" />
+                                Range OUT
+                            </div>
+                            <div className="mt-2 text-3xl font-bold text-red-600">{formatNumber(flowSummary.totalOut)}</div>
+                        </div>
+                        <div className="rounded-xl border border-slate-300 bg-slate-50 p-4">
+                            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                <Activity className="h-4 w-4 text-slate-700" />
+                                Total Traffic
+                            </div>
+                            <div className="mt-2 text-3xl font-bold text-slate-800">{formatNumber(flowSummary.totalTraffic)}</div>
+                        </div>
+                        <div className="rounded-xl border border-indigo-500/20 bg-indigo-500/10 p-4">
+                            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                <Clock3 className="h-4 w-4 text-indigo-600" />
+                                Peak Period
+                            </div>
+                            <div className="mt-2 text-lg font-semibold text-indigo-700">{flowSummary.peakPeriodLabel}</div>
+                        </div>
+                    </div>
+
+                    <div className="mt-6 h-[300px]">
+                        {flowSummary.series.length > 0 ? (
+                            <ResponsiveContainer width="100%" height="100%">
+                                <ComposedChart data={flowSummary.series} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                                    <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
+                                    <XAxis dataKey="label" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
+                                    <YAxis
+                                        yAxisId="flow"
+                                        className="text-xs text-muted-foreground"
+                                        tickLine={false}
+                                        axisLine={false}
+                                        allowDecimals={false}
+                                    />
+                                    <YAxis
+                                        yAxisId="occupancy"
+                                        orientation="right"
+                                        className="text-xs text-muted-foreground"
+                                        tickLine={false}
+                                        axisLine={false}
+                                        allowDecimals={false}
+                                    />
+                                    <RechartsTooltip
+                                        cursor={{ strokeDasharray: '3 3' }}
+                                        labelFormatter={(_, payload) => payload?.[0]?.payload?.fullLabel || ''}
+                                        formatter={(value, name) => [formatNumber(value), name]}
+                                        contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
+                                    />
+                                    <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
+                                    {isDailyFlowView ? (
+                                        <>
+                                            <Bar yAxisId="flow" dataKey="in" name="In" fill="#22c55e" radius={[4, 4, 0, 0]} maxBarSize={36} />
+                                            <Bar yAxisId="flow" dataKey="out" name="Out" fill="#ef4444" radius={[4, 4, 0, 0]} maxBarSize={36} />
+                                        </>
+                                    ) : (
+                                        <>
+                                            <Line yAxisId="flow" type="monotone" dataKey="in" name="In" stroke="#22c55e" strokeWidth={2.5} dot={false} />
+                                            <Line yAxisId="flow" type="monotone" dataKey="out" name="Out" stroke="#ef4444" strokeWidth={2.5} dot={false} />
+                                        </>
+                                    )}
+                                    <Line
+                                        yAxisId="occupancy"
+                                        type="monotone"
+                                        dataKey="occupancy"
+                                        name="Occupancy"
+                                        stroke="#2563eb"
+                                        strokeWidth={2}
+                                        dot={false}
+                                        strokeDasharray="6 4"
+                                    />
+                                </ComposedChart>
+                            </ResponsiveContainer>
+                        ) : (
+                            <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                                {panelRangeBounds.valid
+                                    ? 'No building flow data available for the selected trend range'
+                                    : 'Choose a valid custom date/time range to view flow'}
+                            </div>
+                        )}
+                    </div>
+                </CardContent>
+            </Card>
+
+            <Card className={cn(REPORT_SURFACE_CARD_CLASS, "flex flex-col min-h-[400px]")}>
+                <CardHeader className="space-y-2">
+                    <CardTitle>Entrance Contribution</CardTitle>
+                    <p className="text-sm text-muted-foreground">
+                        Entrance-level share of building traffic for the selected range.
+                    </p>
+                </CardHeader>
+                <CardContent className="grid gap-6 xl:grid-cols-[minmax(0,1.5fr)_320px]">
+                    <div className="h-[320px]">
+                        {entranceContribution.entries.length > 0 ? (
+                            <ResponsiveContainer width="100%" height="100%">
+                                <BarChart
+                                    data={entranceContribution.entries}
+                                    layout="vertical"
+                                    margin={{ top: 10, right: 20, left: 20, bottom: 0 }}
+                                >
+                                    <CartesianGrid strokeDasharray="3 3" className="stroke-muted" horizontal={false} />
+                                    <XAxis type="number" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} allowDecimals={false} />
+                                    <YAxis
+                                        type="category"
+                                        dataKey="name"
+                                        width={110}
+                                        className="text-xs text-muted-foreground"
+                                        tickLine={false}
+                                        axisLine={false}
+                                    />
+                                    <RechartsTooltip
+                                        formatter={(value, name) => [formatNumber(value), name]}
+                                        labelFormatter={(value) => `${value}`}
+                                        contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
+                                    />
+                                    <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
+                                    <Bar dataKey="totalIn" name="In" fill="#22c55e" radius={[0, 4, 4, 0]} maxBarSize={24} />
+                                    <Bar dataKey="totalOut" name="Out" fill="#ef4444" radius={[0, 4, 4, 0]} maxBarSize={24} />
+                                </BarChart>
+                            </ResponsiveContainer>
+                        ) : (
+                            <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                                No entrance contribution data available for the selected range
+                            </div>
+                        )}
+                    </div>
+
+                    <div className="space-y-3">
+                        <div className="rounded-xl border border-muted bg-muted/20 p-4">
+                            <div className="text-xs uppercase tracking-wide text-muted-foreground">Busiest Entrance</div>
+                            <div className="mt-2 text-2xl font-bold">{entranceContribution.busiestEntrance?.name || '-'}</div>
+                            <div className="mt-1 text-sm text-muted-foreground">
+                                {entranceContribution.busiestEntrance
+                                    ? `${formatNumber(entranceContribution.busiestEntrance.totalTraffic)} total movements`
+                                    : 'No building entrance activity yet'}
+                            </div>
+                        </div>
+
+                        <div className="space-y-2">
+                            {entranceContribution.entries.slice(0, 5).map((entry) => (
+                                <div key={entry.name} className="rounded-xl border p-3">
+                                    <div className="flex items-center justify-between gap-3">
+                                        <div className="font-medium">{entry.name}</div>
+                                        <div className="text-sm text-muted-foreground">{formatPercent(entry.share)}</div>
+                                    </div>
+                                    <div className="mt-2 flex flex-wrap items-center gap-3 text-xs">
+                                        <span className="text-green-600">IN: {formatNumber(entry.totalIn)}</span>
+                                        <span className="text-red-600">OUT: {formatNumber(entry.totalOut)}</span>
+                                        <span className="text-primary">NOW: {formatNumber(entry.currentOccupancy)}</span>
+                                        <span className="text-muted-foreground">Cameras: {entry.cameraCount}</span>
                                     </div>
                                 </div>
                             ))}
                         </div>
                     </div>
-                )}
-            </CardContent>
-        </Card>
+                </CardContent>
+            </Card>
+        </div>
     );
 };
 
@@ -1396,11 +2290,11 @@ const BuildingAlertsPanel = ({ rows, onSelectRecord, loading, visible }) => {
     if (!visible) return null;
 
     return (
-        <Card className="flex flex-col min-h-[320px] overflow-hidden">
+        <Card className={cn(REPORT_SURFACE_CARD_CLASS, "flex flex-col min-h-[320px] overflow-hidden")}>
             <CardHeader>
                 <CardTitle className="flex items-center gap-2">
                     <AlertTriangle className="w-4 h-4 text-red-500" />
-                    Recent Building Alerts
+                    Recent Alert Log
                 </CardTitle>
             </CardHeader>
             <CardContent className="flex-1 p-0 overflow-auto">
@@ -1408,7 +2302,7 @@ const BuildingAlertsPanel = ({ rows, onSelectRecord, loading, visible }) => {
                     <thead className="text-muted-foreground bg-muted/50 sticky top-0">
                         <tr>
                             <th className="px-4 py-3 font-medium">Timestamp</th>
-                            <th className="px-4 py-3 font-medium">Scope</th>
+                            <th className="px-4 py-3 font-medium">Alert</th>
                             <th className="px-4 py-3 font-medium">Details</th>
                             <th className="px-4 py-3 font-medium text-right">Action</th>
                         </tr>
@@ -1424,7 +2318,7 @@ const BuildingAlertsPanel = ({ rows, onSelectRecord, loading, visible }) => {
                                 <td className="px-4 py-3">
                                     <span className="inline-flex items-center gap-2 rounded-full border border-red-200 bg-red-50 px-2 py-1 text-xs font-medium text-red-700">
                                         <span className="h-1.5 w-1.5 rounded-full bg-red-500" />
-                                        Building
+                                        Capacity Exceeded
                                     </span>
                                 </td>
                                 <td className="px-4 py-3 text-muted-foreground">
@@ -1450,6 +2344,199 @@ const BuildingAlertsPanel = ({ rows, onSelectRecord, loading, visible }) => {
     );
 };
 
+const AllOverviewPanel = ({ events, snapshots, startMs, endMs, cameraOptions, cameraFilter }) => {
+    const summaryBucket = useMemo(() => {
+        const nowMs = Date.now();
+        const effectiveEndMs = endMs ?? nowMs;
+        const effectiveStartMs = startMs ?? Math.max(0, effectiveEndMs - OCCUPANCY_RANGE_LOOKBACK_MS['7d']);
+        return getAdaptiveFlowBucket('custom', effectiveStartMs, effectiveEndMs);
+    }, [endMs, startMs]);
+
+    const peopleSummary = useMemo(() => aggregateCountingFlow(snapshots, {
+        startMs,
+        endMs,
+        bucket: summaryBucket,
+    }), [endMs, snapshots, startMs, summaryBucket]);
+
+    const trafficSummary = useMemo(() => aggregateTrafficAnalytics(snapshots, {
+        startMs,
+        endMs,
+        bucket: summaryBucket,
+    }), [endMs, snapshots, startMs, summaryBucket]);
+
+    const dressCodeSummary = useMemo(() => aggregateDressCodeAnalytics(events, snapshots, {
+        startMs,
+        endMs,
+        bucket: summaryBucket,
+    }), [endMs, events, snapshots, startMs, summaryBucket]);
+
+    const fallSummary = useMemo(() => aggregateFallDetectionAnalytics(
+        events.filter((evt) => {
+            const tsMs = getTimestampMs(evt.timestamp);
+            if (!tsMs) return false;
+            if (startMs != null && tsMs < startMs) return false;
+            if (endMs != null && tsMs > endMs) return false;
+            return true;
+        }),
+    ), [endMs, events, startMs]);
+
+    const eventCounts = useMemo(() => {
+        const dressCodeViolations = events.filter((evt) => evt.event_type === 'Dress Code Violation').length;
+        const fallDetections = events.filter((evt) => evt.event_type === 'Fall Detected').length;
+        const capacityAlerts = events.filter((evt) => evt.event_type === 'Capacity Exceeded').length;
+        return {
+            dressCodeViolations,
+            fallDetections,
+            capacityAlerts,
+            totalDetections: events.length,
+            criticalAlerts: fallDetections + capacityAlerts,
+        };
+    }, [events]);
+
+    const topDressCodeSubtype = dressCodeSummary.breakdown.reduce((best, item) => {
+        if (!best || Number(item.count || 0) > Number(best.count || 0)) return item;
+        return best;
+    }, null);
+
+    const camerasInScope = cameraFilter === 'all'
+        ? cameraOptions.length
+        : (cameraFilter ? 1 : 0);
+
+    return (
+        <div className="space-y-6">
+            <div className={cn(REPORT_SECTION_HEADER_CLASS, "space-y-1")}>
+                <h2 className="text-lg font-semibold tracking-tight">Overview Dashboard</h2>
+                <p className="text-sm text-muted-foreground">
+                    Cross-module summary for people counting, dress code, and fall detection in the selected report range.
+                </p>
+            </div>
+
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+                <div className="rounded-xl border border-slate-300 bg-slate-50 p-4">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <Activity className="h-4 w-4 text-slate-700" />
+                        Total Detection Events
+                    </div>
+                    <div className="mt-2 text-3xl font-bold text-slate-800">{formatNumber(eventCounts.totalDetections)}</div>
+                </div>
+                <div className="rounded-xl border border-primary/20 bg-primary/10 p-4">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <Users className="h-4 w-4 text-primary" />
+                        Current Occupancy
+                    </div>
+                    <div className="mt-2 text-3xl font-bold text-primary">{formatNumber(peopleSummary.estimatedOccupancy)}</div>
+                </div>
+                <div className="rounded-xl border border-green-500/20 bg-green-500/10 p-4">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <TrendingUp className="h-4 w-4 text-green-600" />
+                        Total Traffic
+                    </div>
+                    <div className="mt-2 text-3xl font-bold text-green-600">{formatNumber(peopleSummary.totalTraffic)}</div>
+                </div>
+                <div className="rounded-xl border border-blue-500/20 bg-blue-500/10 p-4">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <Building2 className="h-4 w-4 text-blue-600" />
+                        Cameras In Scope
+                    </div>
+                    <div className="mt-2 text-3xl font-bold text-blue-700">{formatNumber(camerasInScope)}</div>
+                </div>
+                <div className="rounded-xl border border-red-500/20 bg-red-500/10 p-4">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <AlertTriangle className="h-4 w-4 text-red-600" />
+                        Critical Alerts
+                    </div>
+                    <div className="mt-2 text-3xl font-bold text-red-600">{formatNumber(eventCounts.criticalAlerts)}</div>
+                </div>
+            </div>
+
+            <Card className={cn(REPORT_SURFACE_CARD_CLASS, "flex flex-col")}>
+                <CardHeader className="space-y-2">
+                    <CardTitle>People Counting Summary</CardTitle>
+                    <p className="text-sm text-muted-foreground">
+                        Aggregated occupancy and movement metrics across the selected people-counting scope.
+                    </p>
+                </CardHeader>
+                <CardContent className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                    <div className="rounded-xl border border-primary/20 bg-primary/10 p-4">
+                        <div className="text-sm text-muted-foreground">Capture Rate</div>
+                        <div className="mt-2 text-3xl font-bold text-primary">{formatPercent(trafficSummary.captureRate)}</div>
+                    </div>
+                    <div className="rounded-xl border border-green-500/20 bg-green-500/10 p-4">
+                        <div className="text-sm text-muted-foreground">Total In</div>
+                        <div className="mt-2 text-3xl font-bold text-green-600">{formatNumber(peopleSummary.totalIn)}</div>
+                    </div>
+                    <div className="rounded-xl border border-red-500/20 bg-red-500/10 p-4">
+                        <div className="text-sm text-muted-foreground">Total Out</div>
+                        <div className="mt-2 text-3xl font-bold text-red-600">{formatNumber(peopleSummary.totalOut)}</div>
+                    </div>
+                    <div className="rounded-xl border border-blue-500/20 bg-blue-500/10 p-4">
+                        <div className="text-sm text-muted-foreground">Peak Occupancy</div>
+                        <div className="mt-2 text-3xl font-bold text-blue-700">{formatNumber(peopleSummary.peakOccupancy)}</div>
+                        <div className="mt-1 text-xs text-muted-foreground">{peopleSummary.peakPeriodLabel}</div>
+                    </div>
+                </CardContent>
+            </Card>
+
+            <Card className={cn(REPORT_SURFACE_CARD_CLASS, "flex flex-col")}>
+                <CardHeader className="space-y-2">
+                    <CardTitle>Dress Code Summary</CardTitle>
+                    <p className="text-sm text-muted-foreground">
+                        Violation totals and rate summary for the selected camera scope.
+                    </p>
+                </CardHeader>
+                <CardContent className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                    <div className="rounded-xl border border-red-500/20 bg-red-500/10 p-4">
+                        <div className="text-sm text-muted-foreground">Total Violations</div>
+                        <div className="mt-2 text-3xl font-bold text-red-600">{formatNumber(dressCodeSummary.totalViolations)}</div>
+                    </div>
+                    <div className="rounded-xl border border-slate-300 bg-slate-50 p-4">
+                        <div className="text-sm text-muted-foreground">Unique Violators</div>
+                        <div className="mt-2 text-3xl font-bold text-slate-800">{formatNumber(dressCodeSummary.uniqueViolators)}</div>
+                    </div>
+                    <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-4">
+                        <div className="text-sm text-muted-foreground">Violation Rate</div>
+                        <div className="mt-2 text-3xl font-bold text-amber-700">{formatPercent(dressCodeSummary.violationRate)}</div>
+                    </div>
+                    <div className="rounded-xl border border-indigo-500/20 bg-indigo-500/10 p-4">
+                        <div className="text-sm text-muted-foreground">Top Violation</div>
+                        <div className="mt-2 text-2xl font-bold text-indigo-700">{topDressCodeSubtype?.name || '-'}</div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                            {topDressCodeSubtype ? `${formatNumber(topDressCodeSubtype.count)} event(s)` : 'No violations in range'}
+                        </div>
+                    </div>
+                </CardContent>
+            </Card>
+
+            <Card className={cn(REPORT_SURFACE_CARD_CLASS, "flex flex-col")}>
+                <CardHeader className="space-y-2">
+                    <CardTitle>Fall Detection Summary</CardTitle>
+                    <p className="text-sm text-muted-foreground">
+                        Fall alerts detected in the selected report range.
+                    </p>
+                </CardHeader>
+                <CardContent className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                    <div className="rounded-xl border border-red-500/20 bg-red-500/10 p-4">
+                        <div className="text-sm text-muted-foreground">Total Falls</div>
+                        <div className="mt-2 text-3xl font-bold text-red-600">{formatNumber(fallSummary.totalFalls)}</div>
+                    </div>
+                    <div className="rounded-xl border border-blue-500/20 bg-blue-500/10 p-4">
+                        <div className="text-sm text-muted-foreground">Cameras Triggered</div>
+                        <div className="mt-2 text-3xl font-bold text-blue-700">{formatNumber(fallSummary.affectedCameraCount)}</div>
+                    </div>
+                    <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-4">
+                        <div className="text-sm text-muted-foreground">Peak Detection Time</div>
+                        <div className="mt-2 text-lg font-semibold text-amber-700">{fallSummary.peakFallTimeLabel}</div>
+                    </div>
+                    <div className="rounded-xl border border-slate-300 bg-slate-50 p-4">
+                        <div className="text-sm text-muted-foreground">Latest Detection</div>
+                        <div className="mt-2 text-sm font-semibold text-slate-800">{fallSummary.latestEventLabel}</div>
+                    </div>
+                </CardContent>
+            </Card>
+        </div>
+    );
+};
+
 // --- Main Reporting Component ---
 const Reporting = () => {
     const apiUrl = getApiBaseUrl();
@@ -1462,8 +2549,14 @@ const Reporting = () => {
     const [selectedPeopleCountingView, setSelectedPeopleCountingView] = useState('building');
     const [selectedCameraFilter, setSelectedCameraFilter] = useState('all');
     const [selectedQuickRange, setSelectedQuickRange] = useState('7d');
-    const [startDate, setStartDate] = useState(() => formatDateOnlyLocal(new Date(Date.now() - (6 * 24 * 60 * 60 * 1000))));
-    const [endDate, setEndDate] = useState(() => formatDateOnlyLocal(new Date()));
+    const [startDate, setStartDate] = useState(() => {
+        const bounds = getQuickRangeDateBounds('7d', '', '');
+        return bounds.startDate;
+    });
+    const [endDate, setEndDate] = useState(() => {
+        const bounds = getQuickRangeDateBounds('7d', '', '');
+        return bounds.endDate;
+    });
     const [selectedRecord, setSelectedRecord] = useState(null);
     const [showExportModal, setShowExportModal] = useState(false);
     const [currentPage, setCurrentPage] = useState(1);
@@ -1509,7 +2602,7 @@ const Reporting = () => {
 
     // Fetch counting snapshots when People Counting category is selected
     const fetchCountingSnapshots = useCallback(async () => {
-        if (selectedCategory !== 'People Counting' && selectedCategory !== 'All') {
+        if (selectedCategory !== 'People Counting' && selectedCategory !== 'Dress Code' && selectedCategory !== 'All') {
             setCountingSnapshots([]);
             return;
         }
@@ -1594,17 +2687,14 @@ const Reporting = () => {
     const effectiveStartDate = effectiveDateRange.startDate;
     const effectiveEndDate = effectiveDateRange.endDate;
     const isCustomQuickRange = selectedQuickRange === 'custom';
+    const reportingDateBounds = getDateRangeBounds(effectiveStartDate, effectiveEndDate);
 
     // Date filter helper
     const dateFilter = (timestamp) => {
-        const dayIso = getTimestampIsoDate(timestamp);
-        if (!dayIso) return false;
-        if (effectiveStartDate) {
-            if (dayIso < effectiveStartDate) return false;
-        }
-        if (effectiveEndDate) {
-            if (dayIso > effectiveEndDate) return false;
-        }
+        const tsMs = getTimestampMs(timestamp);
+        if (!tsMs) return false;
+        if (reportingDateBounds.startMs !== null && tsMs < reportingDateBounds.startMs) return false;
+        if (reportingDateBounds.endMs !== null && tsMs > reportingDateBounds.endMs) return false;
         return true;
     };
     const cameraFilter = (cameraId) => selectedCameraFilter === 'all' || cameraId === selectedCameraFilter;
@@ -1621,14 +2711,15 @@ const Reporting = () => {
     const filteredSnapshots = countingSnapshots
         .map(s => ({ ...s, camera_name: s.camera_name || cameraNameById[s.camera_id] || s.camera_id }))
         .filter(s => dateFilter(s.timestamp) && cameraFilter(s.camera_id));
+    const isOverviewCategory = selectedCategory === 'All';
     const isPeopleCountingCategory = selectedCategory === 'People Counting';
+    const isDressCodeCategory = selectedCategory === 'Dress Code';
     const isPeopleCountingBuildingView = isPeopleCountingCategory && selectedPeopleCountingView === 'building';
     const isPeopleCountingCameraView = isPeopleCountingCategory && selectedPeopleCountingView === 'camera';
     const isPeopleCountingTrafficView = isPeopleCountingCategory && selectedPeopleCountingView === 'traffic';
     const selectedCountingSnapshots = countingSnapshots
         .map(s => ({ ...s, camera_name: s.camera_name || cameraNameById[s.camera_id] || s.camera_id }))
         .filter(s => cameraFilter(s.camera_id));
-    const reportingDateBounds = getDateRangeBounds(effectiveStartDate, effectiveEndDate);
     const selectedCameraMeta = selectedCameraFilter === 'all'
         ? null
         : cameraOptions.find((cam) => cam.id === selectedCameraFilter);
@@ -1675,19 +2766,7 @@ const Reporting = () => {
             return [...eventRows, ...snapshotRows].sort((a, b) => getTimestampMs(b.timestamp) - getTimestampMs(a.timestamp));
         }
         if (selectedCategory === 'All') {
-            const snapshotRows = filteredSnapshots.map(s => ({
-                id: s.id,
-                timestamp: s.timestamp,
-                event_type: 'Counting Snapshot',
-                camera_id: s.camera_id,
-                camera_name: s.camera_name,
-                total_in: s.total_in,
-                total_out: s.total_out,
-                current_occupancy: s.current_occupancy,
-                _isSnapshot: true,
-            }));
-            const eventRows = filteredEvents.map(e => ({ ...e, _isSnapshot: false }));
-            return [...eventRows, ...snapshotRows].sort((a, b) => getTimestampMs(b.timestamp) - getTimestampMs(a.timestamp));
+            return filteredEvents.map(e => ({ ...e, _isSnapshot: false }));
         }
         // Detection-only categories
         return filteredEvents.map(e => ({ ...e, _isSnapshot: false }));
@@ -1715,7 +2794,8 @@ const Reporting = () => {
     })();
 
     const isPeopleCountingChart = isPeopleCountingCategory;
-    const showStandardReportSections = !isPeopleCountingBuildingView && !isPeopleCountingTrafficView;
+    const showStandardReportSections = !isOverviewCategory && !isPeopleCountingBuildingView && !isPeopleCountingTrafficView;
+    const showLogTable = showStandardReportSections || isOverviewCategory;
     const totalDisplayRows = displayRows.length;
     const totalPages = Math.max(1, Math.ceil(totalDisplayRows / rowsPerPage));
     const pageStartIndex = (currentPage - 1) * rowsPerPage;
@@ -1779,23 +2859,31 @@ const Reporting = () => {
     };
 
     return (
-        <div className="flex flex-col h-full bg-background p-6 gap-6 overflow-hidden">
+        <div className="flex h-full flex-col gap-6 overflow-auto bg-[radial-gradient(circle_at_top_left,_rgba(59,130,246,0.08),_transparent_32%),linear-gradient(180deg,_rgba(248,250,252,0.95),_rgba(255,255,255,1))] p-6">
             {/* Header */}
-            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 shrink-0">
-                <h1 className="text-3xl font-bold tracking-tight">Reporting Dashboard</h1>
-                <div className="flex items-center gap-2">
-                    <Button variant="outline" onClick={() => { fetchEvents(); fetchCountingSnapshots(); setRefreshToken((value) => value + 1); }} disabled={loading} className="gap-2">
-                        <RefreshCw className={cn("w-4 h-4", loading && "animate-spin")} /> Refresh
-                    </Button>
-                    <Button onClick={() => setShowExportModal(true)} className="gap-2" disabled={isPeopleCountingBuildingView}>
-                        <Download className="w-4 h-4" /> Export Report
-                    </Button>
+            <section className="relative shrink-0 overflow-hidden rounded-[28px] border border-slate-200/80 bg-white/90 p-6 shadow-sm backdrop-blur">
+                <div className="pointer-events-none absolute right-[-100px] top-[-120px] h-64 w-64 rounded-full bg-blue-100/60 blur-3xl" />
+                <div className="relative flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                    <h1 className="text-3xl font-bold tracking-tight">Reporting Dashboard</h1>
+                    <div className="flex items-center gap-2">
+                        <Button
+                            variant="outline"
+                            onClick={() => { fetchEvents(); fetchCountingSnapshots(); setRefreshToken((value) => value + 1); }}
+                            disabled={loading}
+                            className="gap-2 border-slate-200 bg-white"
+                        >
+                            <RefreshCw className={cn("w-4 h-4", loading && "animate-spin")} /> Refresh
+                        </Button>
+                        <Button onClick={() => setShowExportModal(true)} className="gap-2" disabled={isPeopleCountingBuildingView}>
+                            <Download className="w-4 h-4" /> Export Report
+                        </Button>
+                    </div>
                 </div>
-            </div>
+            </section>
 
             {/* Filter Bar */}
-            <Card className="shrink-0">
-                <CardContent className="space-y-4 p-4">
+            <Card className={cn(REPORT_SURFACE_CARD_CLASS, "shrink-0 rounded-[28px]")}>
+                <CardContent className="space-y-4 p-5 md:p-6">
                     <div className={cn(
                         "grid gap-4",
                         isPeopleCountingCategory
@@ -1804,11 +2892,11 @@ const Reporting = () => {
                     )}>
                         <div className="space-y-2">
                             <label className="text-sm font-medium">Report Category</label>
-                            <div className="flex bg-muted rounded-md p-1 h-10 items-center">
+                            <div className="flex h-10 items-center rounded-xl border border-slate-200 bg-slate-100/80 p-1">
                                 {['All', 'Dress Code', 'Fall Detection', 'People Counting'].map(cat => (
                                     <button key={cat} onClick={() => handleCategoryChange(cat)}
                                         className={cn("px-3 py-1.5 text-sm font-medium rounded-sm transition-all flex-1 whitespace-nowrap",
-                                            selectedCategory === cat ? "bg-background shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground")}>
+                                            selectedCategory === cat ? "rounded-lg bg-white shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground")}>
                                         {cat}
                                     </button>
                                 ))}
@@ -1818,7 +2906,7 @@ const Reporting = () => {
                         {isPeopleCountingCategory && (
                             <div className="space-y-2">
                                 <label className="text-sm font-medium">People Counting View</label>
-                                <div className="flex bg-muted rounded-md p-1 h-10 items-center">
+                                <div className="flex h-10 items-center rounded-xl border border-slate-200 bg-slate-100/80 p-1">
                                     {[
                                         { id: 'building', label: 'Building' },
                                         { id: 'camera', label: 'Camera' },
@@ -1830,7 +2918,7 @@ const Reporting = () => {
                                             className={cn(
                                                 "px-3 py-1.5 text-sm font-medium rounded-sm transition-all flex-1 whitespace-nowrap",
                                                 selectedPeopleCountingView === view.id
-                                                    ? "bg-background shadow-sm text-foreground"
+                                                    ? "rounded-lg bg-white shadow-sm text-foreground"
                                                     : "text-muted-foreground hover:text-foreground",
                                             )}
                                         >
@@ -1851,7 +2939,7 @@ const Reporting = () => {
                         <div className="space-y-2">
                             <label className="text-sm font-medium">Quick Range</label>
                             <select
-                                className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                className={cn("h-10 w-full rounded-md border px-3 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring", REPORT_INPUT_CLASS)}
                                 value={selectedQuickRange}
                                 onChange={(e) => setSelectedQuickRange(e.target.value)}
                             >
@@ -1864,28 +2952,28 @@ const Reporting = () => {
                         </div>
 
                         <div className={cn("space-y-2 transition-opacity", !isCustomQuickRange && "opacity-50")}>
-                            <label className="text-sm font-medium">Start Date</label>
+                            <label className="text-sm font-medium">Start Date & Time</label>
                             <div className="relative">
                                 <Calendar className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
                                 <input
-                                    type="date"
+                                    type="datetime-local"
                                     disabled={!isCustomQuickRange}
-                                    className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 pl-9 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:bg-muted/30"
-                                    value={startDate}
+                                    className={cn("h-10 w-full rounded-md border px-3 py-2 pl-9 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:bg-muted/30", REPORT_INPUT_CLASS)}
+                                    value={isCustomQuickRange ? startDate : effectiveStartDate}
                                     onChange={(e) => setStartDate(e.target.value)}
                                 />
                             </div>
                         </div>
 
                         <div className={cn("space-y-2 transition-opacity", !isCustomQuickRange && "opacity-50")}>
-                            <label className="text-sm font-medium">End Date</label>
+                            <label className="text-sm font-medium">End Date & Time</label>
                             <div className="relative">
                                 <Calendar className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
                                 <input
-                                    type="date"
+                                    type="datetime-local"
                                     disabled={!isCustomQuickRange}
-                                    className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 pl-9 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:bg-muted/30"
-                                    value={endDate}
+                                    className={cn("h-10 w-full rounded-md border px-3 py-2 pl-9 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:bg-muted/30", REPORT_INPUT_CLASS)}
+                                    value={isCustomQuickRange ? endDate : effectiveEndDate}
                                     onChange={(e) => setEndDate(e.target.value)}
                                 />
                             </div>
@@ -1895,7 +2983,7 @@ const Reporting = () => {
                             <div className="space-y-2">
                                 <label className="text-sm font-medium">Camera</label>
                                 <select
-                                    className="h-10 w-full min-w-[220px] rounded-md border border-input bg-background px-3 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                    className={cn("h-10 w-full min-w-[220px] rounded-md border px-3 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring", REPORT_INPUT_CLASS)}
                                     value={selectedCameraFilter}
                                     onChange={(e) => setSelectedCameraFilter(e.target.value)}
                                 >
@@ -1908,7 +2996,9 @@ const Reporting = () => {
                         )}
 
                         <div className="text-sm text-muted-foreground xl:justify-self-end xl:self-end pb-2">
-                            {isPeopleCountingBuildingView
+                            {isOverviewCategory
+                                ? 'Overview dashboard'
+                                : isPeopleCountingBuildingView
                                 ? 'Building-level occupancy view'
                                 : `${totalDisplayRows} record${totalDisplayRows !== 1 ? 's' : ''} found`}
                         </div>
@@ -1918,12 +3008,23 @@ const Reporting = () => {
 
             {/* Charts & Log */}
             <div className="flex-1 overflow-y-auto grid grid-cols-1 gap-6 min-h-0">
+                {isOverviewCategory && (
+                    <AllOverviewPanel
+                        events={filteredEvents}
+                        snapshots={filteredSnapshots}
+                        startMs={reportingDateBounds.startMs}
+                        endMs={reportingDateBounds.endMs}
+                        cameraOptions={cameraOptions}
+                        cameraFilter={selectedCameraFilter}
+                    />
+                )}
+
                 <BuildingOccupancyPanel
                     apiUrl={apiUrl}
-                    startDate={effectiveStartDate}
-                    endDate={effectiveEndDate}
+                    reportStartMs={reportingDateBounds.startMs}
+                    reportEndMs={reportingDateBounds.endMs}
                     refreshToken={refreshToken}
-                    visible={selectedCategory === 'All' || isPeopleCountingBuildingView}
+                    visible={isPeopleCountingBuildingView}
                 />
 
                 <BuildingAlertsPanel
@@ -1933,11 +3034,22 @@ const Reporting = () => {
                     visible={isPeopleCountingBuildingView}
                 />
 
+                {isDressCodeCategory && (
+                    <DressCodeAnalyticsPanel
+                        events={filteredEvents}
+                        snapshots={filteredSnapshots}
+                        cameraLabel={selectedCameraLabel}
+                        startMs={reportingDateBounds.startMs}
+                        endMs={reportingDateBounds.endMs}
+                        isAllCameras={selectedCameraFilter === 'all'}
+                    />
+                )}
+
                 {!isPeopleCountingBuildingView && (
                     <>
                         {isPeopleCountingCameraView && (
                             <>
-                                <div className="space-y-1">
+                                <div className={cn(REPORT_SECTION_HEADER_CLASS, "space-y-1")}>
                                     <h2 className="text-lg font-semibold tracking-tight">Reporting</h2>
                                     <p className="text-sm text-muted-foreground">
                                         Camera-focused flow reporting for {selectedCameraLabel}.
@@ -1989,7 +3101,7 @@ const Reporting = () => {
                                     <div className="rounded-xl border border-indigo-500/20 bg-indigo-500/10 p-4">
                                         <div className="flex items-center gap-2 text-sm text-muted-foreground">
                                             <TrendingUp className="h-4 w-4 text-indigo-600" />
-                                            Estimated Occupancy
+                                            Current Occupancy
                                         </div>
                                         <div className="mt-2 text-3xl font-bold text-indigo-700">{formatNumber(peopleCountingSummary.estimatedOccupancy)}</div>
                                     </div>
@@ -2011,62 +3123,51 @@ const Reporting = () => {
 
                 {showStandardReportSections && (
                     <>
-                {/* Events / Counting by Day Chart */}
-                <Card className="flex flex-col min-h-[350px]">
-                    <CardHeader>
-                        <CardTitle>{isPeopleCountingChart ? 'In/Out by Day' : 'Events by Day'}</CardTitle>
-                    </CardHeader>
-                    <CardContent className="flex-1 min-h-[250px]">
-                        {chartData.length > 0 ? (
-                            <ResponsiveContainer width="100%" height="100%">
-                                {isPeopleCountingChart ? (
-                                    <BarChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-                                        <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
-                                        <XAxis dataKey="name" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
-                                        <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} allowDecimals={false} />
-                                        <RechartsTooltip cursor={{ fill: 'transparent' }}
-                                            formatter={(value, name) => [formatNumber(value), name]}
-                                            contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }} />
-                                        <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
-                                        <Bar dataKey="totalIn" name="In" fill="#22c55e" radius={[4, 4, 0, 0]} maxBarSize={40} />
-                                        <Bar dataKey="totalOut" name="Out" fill="#ef4444" radius={[4, 4, 0, 0]} maxBarSize={40} />
-                                    </BarChart>
+                        {/* Events / Counting by Day Chart */}
+                        <Card className={cn(REPORT_SURFACE_CARD_CLASS, "flex flex-col min-h-[350px]")}>
+                            <CardHeader>
+                                <CardTitle>{isPeopleCountingChart ? 'In/Out by Day' : 'Events by Day'}</CardTitle>
+                            </CardHeader>
+                            <CardContent className="flex-1 min-h-[250px]">
+                                {chartData.length > 0 ? (
+                                    <ResponsiveContainer width="100%" height="100%">
+                                        {isPeopleCountingChart ? (
+                                            <BarChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                                                <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
+                                                <XAxis dataKey="name" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
+                                                <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} allowDecimals={false} />
+                                                <RechartsTooltip cursor={{ fill: 'transparent' }}
+                                                    formatter={(value, name) => [formatNumber(value), name]}
+                                                    contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }} />
+                                                <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
+                                                <Bar dataKey="totalIn" name="In" fill="#22c55e" radius={[4, 4, 0, 0]} maxBarSize={40} />
+                                                <Bar dataKey="totalOut" name="Out" fill="#ef4444" radius={[4, 4, 0, 0]} maxBarSize={40} />
+                                            </BarChart>
+                                        ) : (
+                                            <BarChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                                                <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
+                                                <XAxis dataKey="name" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
+                                                <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} allowDecimals={false} />
+                                                <RechartsTooltip cursor={{ fill: 'transparent' }}
+                                                    formatter={(value, name) => [formatNumber(value), name]}
+                                                    contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }} />
+                                                <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
+                                                <Bar dataKey="violations" name="Events" fill="hsl(var(--destructive))" radius={[4, 4, 0, 0]} maxBarSize={40} />
+                                            </BarChart>
+                                        )}
+                                    </ResponsiveContainer>
                                 ) : (
-                                    <BarChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-                                        <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
-                                        <XAxis dataKey="name" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
-                                        <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} allowDecimals={false} />
-                                        <RechartsTooltip cursor={{ fill: 'transparent' }}
-                                            formatter={(value, name) => [formatNumber(value), name]}
-                                            contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }} />
-                                        <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
-                                        <Bar dataKey="violations" name="Events" fill="hsl(var(--destructive))" radius={[4, 4, 0, 0]} maxBarSize={40} />
-                                    </BarChart>
+                                    <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
+                                        No data to display
+                                    </div>
                                 )}
-                            </ResponsiveContainer>
-                        ) : (
-                            <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
-                                No data to display
-                            </div>
-                        )}
-                    </CardContent>
-                </Card>
-
-                <div className="space-y-1">
-                    <h2 className="text-lg font-semibold tracking-tight">Diagnostics</h2>
-                    <p className="text-sm text-muted-foreground">
-                        Raw counting records and operational details for validation and troubleshooting.
-                    </p>
-                </div>
-
-                {isPeopleCountingCameraView && peopleCountingSummary.resetCount > 0 && (
-                    <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-700">
-                        Counter resets were detected in the selected report range. Flow totals remain usable, but occupancy-related numbers may not be continuous across the full period.
-                    </div>
+                            </CardContent>
+                        </Card>
+                    </>
                 )}
 
-                {/* Log Table */}
-                <Card className="flex flex-col min-h-[350px] overflow-hidden">
+                {showLogTable && (
+                <Card className={cn(REPORT_SURFACE_CARD_CLASS, "flex flex-col min-h-[350px] overflow-hidden")}>
                     <CardHeader className="flex flex-row items-center justify-between gap-4">
                         <CardTitle>
                             {selectedCategory === 'People Counting' ? 'Counting Log' : 'Detection Event Logs'}
@@ -2094,7 +3195,7 @@ const Reporting = () => {
                                     <th className="px-4 py-3 font-medium">Timestamp</th>
                                     <th className="px-4 py-3 font-medium">Camera</th>
                                     <th className="px-4 py-3 font-medium">Event Type</th>
-                                    <th className="px-4 py-3 font-medium">Direction</th>
+                                    <th className="px-4 py-3 font-medium">Subtype</th>
                                     <th className="px-4 py-3 font-medium text-right">In</th>
                                     <th className="px-4 py-3 font-medium text-right">Out</th>
                                     <th className="px-4 py-3 font-medium text-right">Occupancy</th>
@@ -2138,9 +3239,9 @@ const Reporting = () => {
 
                                     const isCapacity = row.event_type === 'Capacity Exceeded';
                                     const dotColor = isCapacity ? 'bg-orange-500' : 'bg-red-500';
-                                    const eventDirection = row.details?.direction
-                                        ? String(row.details.direction).replace(/_/g, ' ')
-                                        : '-';
+                                    const eventSubtype = row.details?.label
+                                        ? String(row.details.label).replace(/_/g, ' ')
+                                        : (isCapacity ? 'Capacity alert' : '-');
                                     return (
                                         <tr key={row.id} className="hover:bg-muted/30 transition-colors group cursor-pointer"
                                             onClick={() => setSelectedRecord(row)}>
@@ -2160,7 +3261,7 @@ const Reporting = () => {
                                                     {row.event_type}
                                                 </div>
                                             </td>
-                                            <td className="px-4 py-3 text-muted-foreground">{eventDirection}</td>
+                                            <td className="px-4 py-3 text-muted-foreground">{eventSubtype}</td>
                                             <td className="px-4 py-3 text-right text-muted-foreground">-</td>
                                             <td className="px-4 py-3 text-right text-muted-foreground">-</td>
                                             <td className="px-4 py-3 text-right font-medium text-blue-700">
@@ -2210,7 +3311,6 @@ const Reporting = () => {
                         </div>
                     </CardContent>
                 </Card>
-                    </>
                 )}
                     </>
                 )}

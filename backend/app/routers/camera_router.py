@@ -90,6 +90,13 @@ class UploadPreviewRequest(BaseModel):
     camera_id: str | None = None
 
 
+class UploadVideoUpdateRequest(BaseModel):
+    runtime_key: str
+    name: str
+    location: str = ""
+    detection_roi: dict[str, Any] | None = None
+
+
 FISHEYE_VIEW_CONFIGS = [
     {"angle_z": 0, "angle_up": 35, "zoom": 80},
     {"angle_z": 45, "angle_up": 35, "zoom": 80},
@@ -102,6 +109,14 @@ FISHEYE_VIEW_CONFIGS = [
 ]
 
 FISHEYE_UPLOAD_NAME_PATTERN = re.compile(r"^(?P<prefix>.+?)\s-\sView\s\d+\s*\([^)]*\)$")
+
+
+def _build_uploaded_camera_name(base_name: str, view_index: int, is_fisheye: bool) -> str:
+    normalized_base_name = (base_name or "").strip() or "Uploaded Camera"
+    if not is_fisheye or view_index < 0:
+        return normalized_base_name
+    angle = view_index * 45
+    return f"{normalized_base_name} - View {view_index + 1} ({angle}°)"
 
 
 def _normalize_detection_roi(raw_roi: dict | None) -> dict | None:
@@ -973,6 +988,10 @@ async def update_camera(camera_id: str, camera: CameraCreate, db: AsyncSession =
     old_runtime_key = _get_runtime_key(stream_config) if stream_config is not None else None
 
     source_path = (camera.source_path or "").strip() or None
+    if old_source_path and _is_uploaded_source_path(old_source_path):
+        if source_path and source_path != old_source_path:
+            raise HTTPException(status_code=400, detail="Uploaded video path cannot be changed.")
+        source_path = old_source_path
     if camera.type.upper().startswith(("RTSP", "NETWORK")) and not source_path:
         raise HTTPException(status_code=400, detail="Stream camera requires a source_path.")
 
@@ -1236,6 +1255,47 @@ async def list_uploaded_videos(db: AsyncSession = Depends(get_db)):
         )
     ]
     return {"items": items}
+
+
+@router.put("/api/upload-videos")
+async def update_uploaded_video(
+    payload: UploadVideoUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    runtime_key = (payload.runtime_key or "").strip()
+    if not runtime_key:
+        raise HTTPException(status_code=400, detail="runtime_key is required.")
+
+    rows = await _get_uploaded_runtime_rows(db, [runtime_key])
+    if not rows:
+        raise HTTPException(status_code=404, detail="Uploaded video source not found.")
+
+    normalized_name = (payload.name or "").strip()
+    if not normalized_name:
+        raise HTTPException(status_code=400, detail="name is required.")
+
+    normalized_location = (payload.location or "").strip()
+    first_stream = rows[0][1]
+    is_fisheye = bool(first_stream.is_fisheye)
+
+    for camera, stream_config in rows:
+        camera.name = _build_uploaded_camera_name(
+            normalized_name,
+            int(stream_config.view_index if stream_config.view_index is not None else -1),
+            is_fisheye,
+        )
+        camera.location = normalized_location
+        stream_config.detection_roi = _normalize_detection_roi(payload.detection_roi)
+
+    await db.flush()
+    await _sync_runtime_state(db)
+
+    camera_ids = [camera.id for camera, _ in rows]
+    tags_map = await _derive_analysis_tags_by_camera(db, camera_ids)
+    return {
+        "status": "updated",
+        "item": _build_upload_runtime_payload(runtime_key, rows, tags_map),
+    }
 
 
 @router.post("/api/upload-videos/start")

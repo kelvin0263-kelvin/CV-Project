@@ -59,6 +59,8 @@ const parseResolutionString = (resolution) => {
     return { width: 640, height: 360 };
 };
 
+const SYSTEM_SURFACE_CARD_CLASS = 'border-slate-200/80 bg-white/95 shadow-sm';
+
 const SystemConfiguration = () => {
     const apiUrl = getApiBaseUrl();
     const previewContainerRef = useRef(null);
@@ -68,6 +70,7 @@ const SystemConfiguration = () => {
         searchParams.get('tab') === 'uploads' ? 'uploads' : 'streams'
     );
     const [activeStreamTab, setActiveStreamTab] = useState('added');
+    const [activeUploadTab, setActiveUploadTab] = useState('create');
     const [isAddMode, setIsAddMode] = useState(false);
     const [isEditMode, setIsEditMode] = useState(false);
     const [selectedCamera, setSelectedCamera] = useState(null);
@@ -517,45 +520,50 @@ const SystemConfiguration = () => {
 
 
     return (
-        <div className="flex flex-col h-full bg-background text-foreground">
-            <div className="flex items-center justify-between mb-6">
-                <h1 className="text-2xl font-bold">System Configuration</h1>
-            </div>
-
-            <div className="flex flex-1 flex-col h-full overflow-hidden">
-                {/* Toolbar */}
-                <div className="flex items-center justify-between mb-4">
-                    <div className="flex gap-2">
-                        <Button
-                            type="button"
-                            onClick={handleShowStreams}
-                            variant={activeManagementTab === 'streams' ? 'default' : 'outline'}
-                        >
-                            Live Stream Camera
-                        </Button>
-                        <Button
-                            type="button"
-                            onClick={handleShowUploads}
-                            variant={activeManagementTab === 'uploads' ? 'default' : 'outline'}
-                        >
-                            Upload Video
-                        </Button>
-                    </div>
-                    <div className="text-sm text-muted-foreground">
-                        {activeManagementTab === 'streams'
-                            ? `${cameras.length} Live Sources Configured`
-                            : 'Manage uploaded video sources'}
-                    </div>
+        <div className="flex h-full flex-col gap-6 overflow-auto bg-[radial-gradient(circle_at_top_left,_rgba(59,130,246,0.08),_transparent_32%),linear-gradient(180deg,_rgba(248,250,252,0.95),_rgba(255,255,255,1))] p-6 text-foreground">
+            <section className="relative overflow-hidden rounded-[28px] border border-slate-200/80 bg-white/90 p-6 shadow-sm backdrop-blur">
+                <div className="pointer-events-none absolute right-[-100px] top-[-120px] h-64 w-64 rounded-full bg-blue-100/60 blur-3xl" />
+                <div className="relative flex items-center justify-between">
+                    <h1 className="text-2xl font-bold">System Configuration</h1>
                 </div>
+            </section>
 
-                {/* Content */}
-                <div className="flex-1 overflow-auto pr-2">
+            <div className="flex flex-1 flex-col overflow-hidden">
+                {/* Toolbar */}
+                <section className={cn(SYSTEM_SURFACE_CARD_CLASS, "mb-4 rounded-[28px] p-5 md:p-6")}>
+                    <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                        <div className="flex gap-2">
+                            <Button
+                                type="button"
+                                onClick={handleShowStreams}
+                                variant={activeManagementTab === 'streams' ? 'default' : 'outline'}
+                                className={cn(activeManagementTab !== 'streams' && "border-slate-200 bg-white")}
+                            >
+                                Live Stream Camera
+                            </Button>
+                            <Button
+                                type="button"
+                                onClick={handleShowUploads}
+                                variant={activeManagementTab === 'uploads' ? 'default' : 'outline'}
+                                className={cn(activeManagementTab !== 'uploads' && "border-slate-200 bg-white")}
+                            >
+                                Upload Video
+                            </Button>
+                        </div>
+                        <div className="text-sm text-muted-foreground">
+                            {activeManagementTab === 'streams'
+                                ? `${cameras.length} Live Sources Configured`
+                                : 'Manage uploaded video sources'}
+                        </div>
+                    </div>
+
                     {activeManagementTab === 'streams' && (
-                        <div className="mb-4 flex gap-2">
+                        <div className="mt-4 flex gap-2">
                             <Button
                                 type="button"
                                 onClick={handleShowAddedStreams}
                                 variant={activeStreamTab === 'added' && !isAddMode && !isEditMode ? 'default' : 'outline'}
+                                className={cn(activeStreamTab !== 'added' || isAddMode || isEditMode ? "border-slate-200 bg-white" : undefined)}
                             >
                                 Added Stream Camera
                             </Button>
@@ -571,15 +579,43 @@ const SystemConfiguration = () => {
                         </div>
                     )}
 
+                    {activeManagementTab === 'uploads' && (
+                        <div className="mt-4 flex gap-2">
+                            <Button
+                                type="button"
+                                onClick={() => setActiveUploadTab('create')}
+                                variant={activeUploadTab === 'create' ? 'default' : 'outline'}
+                                className={cn(activeUploadTab !== 'create' && "border-slate-200 bg-white")}
+                            >
+                                Create Upload Source
+                            </Button>
+                            <Button
+                                type="button"
+                                onClick={() => setActiveUploadTab('sources')}
+                                variant={activeUploadTab === 'sources' ? 'default' : 'outline'}
+                                className={cn(activeUploadTab !== 'sources' && "border-slate-200 bg-white")}
+                            >
+                                Uploaded Sources
+                            </Button>
+                        </div>
+                    )}
+                </section>
+
+                {/* Content */}
+                <div className="flex-1 overflow-auto pr-2">
                     {activeManagementTab === 'uploads' ? (
-                        <VideoUpload embedded />
+                        <VideoUpload
+                            embedded
+                            activeSection={activeUploadTab}
+                            onActiveSectionChange={setActiveUploadTab}
+                        />
                     ) : (
                         activeStreamTab === 'added' && !isAddMode && !isEditMode && !showUpload ? (
                             <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
                                 {cameras.map((cam) => {
                                     const overlayMode = inferOverlayMode(cam.analysis_tags);
                                     return (
-                                    <Card key={cam.id} className={cn("relative group overflow-hidden hover:border-primary/50 transition-all cursor-pointer border-muted", !cam.enabled && "opacity-60")}>
+                                    <Card key={cam.id} className={cn(SYSTEM_SURFACE_CARD_CLASS, "relative group overflow-hidden transition-all cursor-pointer hover:border-primary/50", !cam.enabled && "opacity-60")}>
                                         <div className="aspect-video bg-muted relative flex items-center justify-center bg-black">
                                             {isStreamSource(cam) ? (
                                                 <StreamPlayer
@@ -638,7 +674,7 @@ const SystemConfiguration = () => {
 
                     {/* Edit/Add/Upload Form Overlay */}
                     {activeManagementTab === 'streams' && activeStreamTab === 'form' && (isAddMode || isEditMode || showUpload) && (
-                        <Card className="max-w-2xl mx-auto">
+                        <Card className={cn(SYSTEM_SURFACE_CARD_CLASS, "mx-auto max-w-2xl")}>
                             <CardHeader className="flex flex-row items-center justify-between">
                                 <CardTitle>
                                     {showUpload ? "Upload Video Source" : (isEditMode ? "Modify Camera Source" : "Add Stream Camera")}

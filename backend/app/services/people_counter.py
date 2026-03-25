@@ -47,7 +47,8 @@ DEFAULT_LINE_IN_MIN_TRACK_FRAMES = 10
 DEFAULT_LINE_OUT_MIN_TRACK_FRAMES = 0
 DEFAULT_LINE_OUT_MAX_TRACK_FRAMES = 10
 DEFAULT_OUT_ZONE_ARM_MIN_FRAMES = 5
-DEFAULT_UNCOUNT_IN_REAPPEAR_FRAMES = 20 # reverse count frames
+DEFAULT_OUT_TRAVEL_MIN_DISTANCE = 0.07
+DEFAULT_UNCOUNT_IN_REAPPEAR_FRAMES = 150 # reverse count frames
 
 
 class _LineTrackState:
@@ -56,6 +57,8 @@ class _LineTrackState:
     __slots__ = (
         "last_seen_time",
         "frame_count",
+        "birth_point",
+        "born_in_active_zone",
         "last_right_point",
         "last_in_side_value",
         "last_in_active_zone",
@@ -66,6 +69,8 @@ class _LineTrackState:
     def __init__(self):
         self.last_seen_time: float = time.time()
         self.frame_count: int = 0
+        self.birth_point: tuple[float, float] = (0.0, 0.0)
+        self.born_in_active_zone: bool = False
         self.last_right_point: tuple[float, float] = (0.0, 0.0)
         self.last_in_side_value: float = 0.0
         self.last_in_active_zone: bool = False
@@ -146,6 +151,8 @@ class PeopleCounter:
         self._line_track_states: dict[str, dict[int, _LineTrackState]] = {}
         self._foot_traffic_track_states: dict[str, dict[int, _FootTrafficTrackState]] = {}
         self._line_track_frame_totals: dict[int, int] = {}
+        self._persistent_birth_points: dict[int, tuple[float, float]] = {}
+        self._persistent_birth_in_active_zone: dict[int, bool] = {}
         self._counted_in_tracks: dict[int, _CountedTrackRecord] = {}
         self._counted_out_tracks: dict[int, _CountedTrackRecord] = {}
         self._counted_foot_traffic_tracks: set[int] = set()
@@ -159,6 +166,7 @@ class PeopleCounter:
         self.disappear_timeout: float = config.get("disappear_timeout", DEFAULT_DISAPPEAR_TIMEOUT)
         self.count_cooldown: float = config.get("count_cooldown", DEFAULT_COUNT_COOLDOWN)
         self._last_in_count_time: dict[int, float] = {}
+        self._last_in_count_points: dict[int, tuple[float, float]] = {}
 
         self._line_signature = self._build_line_signature(self.lines)
         self._sync_line_track_states()
@@ -342,6 +350,8 @@ class PeopleCounter:
         self._line_track_states = {}
         self._foot_traffic_track_states = {}
         self._line_track_frame_totals = {}
+        self._persistent_birth_points = {}
+        self._persistent_birth_in_active_zone = {}
         self._counted_in_tracks = {}
         self._counted_out_tracks = {}
         self._counted_foot_traffic_tracks = set()
@@ -350,6 +360,7 @@ class PeopleCounter:
         self.foot_traffic_left = 0
         self.foot_traffic_right = 0
         self._last_in_count_time = {}
+        self._last_in_count_points = {}
         self._sync_line_track_states()
 
     def _build_line_signature(self, lines: list[dict]) -> tuple:
@@ -422,6 +433,15 @@ class PeopleCounter:
             ts = _LineTrackState()
             ts.last_seen_time = now
             ts.frame_count = self._line_track_frame_totals.get(int(track_id), 0)
+            persistent_birth_point = self._persistent_birth_points.get(int(track_id))
+            persistent_birth_in_active_zone = self._persistent_birth_in_active_zone.get(int(track_id))
+            if persistent_birth_point is None:
+                persistent_birth_point = right_point
+                self._persistent_birth_points[int(track_id)] = persistent_birth_point
+                persistent_birth_in_active_zone = bool(in_active_zone)
+                self._persistent_birth_in_active_zone[int(track_id)] = persistent_birth_in_active_zone
+            ts.birth_point = persistent_birth_point
+            ts.born_in_active_zone = bool(persistent_birth_in_active_zone)
             ts.last_right_point = right_point
             ts.last_in_side_value = curr_side
             ts.last_in_active_zone = in_active_zone
@@ -495,15 +515,16 @@ class PeopleCounter:
             )
 
         max_frames = self._line_max_track_frames(line_cfg)
-        if prev_side <= DEFAULT_LINE_SIDE_EPS and curr_side > DEFAULT_LINE_SIDE_EPS:
-            direction = "OUT" if count_event == LINE_EVENT_OUT else "IN"
+        if count_event == LINE_EVENT_IN and prev_side <= DEFAULT_LINE_SIDE_EPS and curr_side > DEFAULT_LINE_SIDE_EPS:
+            direction = "IN"
             if (
                 crossing_point_in_active_zone
                 and ts.frame_count >= required_frames
                 and (max_frames is None or ts.frame_count <= max_frames)
-                and (count_event != LINE_EVENT_IN or self._can_count_in(track_id, now))
+                and self._can_count_in(track_id, now)
             ):
                 if self._register_count(track_id, direction, "line_cross", now):
+                    self._last_in_count_points[int(track_id)] = cross_point or right_point
                     self._log_count_event(
                         track_id,
                         direction,
@@ -552,7 +573,7 @@ class PeopleCounter:
                     reasons.append(f"frames_below_min({ts.frame_count}<{required_frames})")
                 if max_frames is not None and ts.frame_count > max_frames:
                     reasons.append(f"frames_above_max({ts.frame_count}>{max_frames})")
-                if count_event == LINE_EVENT_IN and not self._can_count_in(track_id, now):
+                if not self._can_count_in(track_id, now):
                     reasons.append("in_count_cooldown_active")
                 reason = ",".join(reasons) if reasons else "not_eligible"
                 print(
@@ -572,28 +593,87 @@ class PeopleCounter:
                     )
                 )
 
-        if (
-            count_event == LINE_EVENT_OUT
-            and ts.out_zone_armed
-            and prev_in_active_zone
-            and not in_active_zone
-            and curr_side > DEFAULT_LINE_SIDE_EPS
-            and ts.frame_count >= required_frames
-            and (max_frames is None or ts.frame_count <= max_frames)
-        ):
-            if self._register_count(track_id, "OUT", "zone_exit", now):
-                self._log_count_event(
-                    track_id,
-                    "OUT",
-                    "zone_exit",
-                    point=right_point,
-                    prev_point=prev_point,
-                    detail=(
-                        f"line={line_name} side={curr_side:.4f} "
-                        f"zone_streak={prev_active_zone_streak}"
-                    ),
-                )
-                if DEBUG_COUNTING:
+        if count_event == LINE_EVENT_OUT:
+            counted_in_record = self._counted_in_tracks.get(int(track_id))
+            has_active_in_reference = counted_in_record is not None and not counted_in_record.uncounted
+            reference_point = None
+            reference_source = "none"
+            if has_active_in_reference and ts.born_in_active_zone:
+                reference_point = ts.birth_point
+                reference_source = "birth_point"
+            elif has_active_in_reference:
+                reference_point = self._last_in_count_points.get(int(track_id))
+                reference_source = "last_in_count"
+            elif ts.born_in_active_zone:
+                reference_point = ts.birth_point
+                reference_source = "birth_point"
+
+            travel_distance = (
+                math.dist(reference_point, right_point)
+                if reference_point is not None
+                else 0.0
+            )
+            min_travel_distance = self._out_travel_min_distance(line_cfg)
+
+            if (
+                reference_point is not None
+                and curr_side > DEFAULT_LINE_SIDE_EPS
+                and ts.frame_count >= required_frames
+                and travel_distance >= min_travel_distance
+            ):
+                if self._register_count(track_id, "OUT", "travel_exit", now):
+                    self._last_in_count_points.pop(int(track_id), None)
+                    self._log_count_event(
+                        track_id,
+                        "OUT",
+                        "travel_exit",
+                        point=right_point,
+                        prev_point=prev_point,
+                        detail=(
+                            f"line={line_name} side={curr_side:.4f} "
+                            f"travel={travel_distance:.4f} ref={reference_source}"
+                        ),
+                    )
+                    if DEBUG_COUNTING:
+                        print(
+                            " ".join(
+                                [
+                                    "[COUNT-DECISION]",
+                                    f"track_id={track_id}",
+                                    f"line={line_name}",
+                                    "direction=OUT",
+                                    "source=travel_exit",
+                                    "result=counted",
+                                    f"frames={ts.frame_count}",
+                                    f"travel={travel_distance:.4f}",
+                                    f"min_travel={min_travel_distance:.4f}",
+                                    f"reference={reference_source}",
+                                    f"side_state={self._side_label(curr_side)}",
+                                ]
+                            )
+                        )
+                    self._log_live_track_frame(
+                        track_id,
+                        line_name,
+                        event="count_out_travel_exit",
+                        count_event=count_event,
+                        point=right_point,
+                        side=curr_side,
+                        frame_count=ts.frame_count,
+                        in_active_zone=in_active_zone,
+                        out_zone_armed=ts.out_zone_armed,
+                        active_zone_streak=ts.active_zone_streak,
+                    )
+                    return 1
+            elif DEBUG_COUNTING and curr_side > DEFAULT_LINE_SIDE_EPS:
+                reasons: list[str] = []
+                if reference_point is None:
+                    reasons.append("no_out_reference_point")
+                if ts.frame_count < required_frames:
+                    reasons.append(f"frames_below_min({ts.frame_count}<{required_frames})")
+                if reference_point is not None and travel_distance < min_travel_distance:
+                    reasons.append(f"travel_below_min({travel_distance:.4f}<{min_travel_distance:.4f})")
+                if reasons:
                     print(
                         " ".join(
                             [
@@ -601,59 +681,14 @@ class PeopleCounter:
                                 f"track_id={track_id}",
                                 f"line={line_name}",
                                 "direction=OUT",
-                                "source=zone_exit",
-                                "result=counted",
-                                f"frames={ts.frame_count}",
-                                f"zone_streak={prev_active_zone_streak}",
+                                "source=travel_exit",
+                                "result=rejected",
+                                f"reason={','.join(reasons)}",
+                                f"reference={reference_source}",
                                 f"side_state={self._side_label(curr_side)}",
                             ]
                         )
                     )
-                self._log_live_track_frame(
-                    track_id,
-                    line_name,
-                    event="count_out_zone_exit",
-                    count_event=count_event,
-                    point=right_point,
-                    side=curr_side,
-                    frame_count=ts.frame_count,
-                    in_active_zone=in_active_zone,
-                    out_zone_armed=ts.out_zone_armed,
-                    active_zone_streak=ts.active_zone_streak,
-                )
-                return 1
-        elif (
-            DEBUG_COUNTING
-            and count_event == LINE_EVENT_OUT
-            and prev_in_active_zone
-            and not in_active_zone
-            and curr_side > DEFAULT_LINE_SIDE_EPS
-        ):
-            reasons: list[str] = []
-            if not ts.out_zone_armed:
-                reasons.append(
-                    f"active_zone_frames_below_arm({prev_active_zone_streak}<{active_zone_arm_frames})"
-                )
-            if ts.frame_count < required_frames:
-                reasons.append(f"frames_below_min({ts.frame_count}<{required_frames})")
-            if max_frames is not None and ts.frame_count > max_frames:
-                reasons.append(f"frames_above_max({ts.frame_count}>{max_frames})")
-            if reasons:
-                print(
-                    " ".join(
-                        [
-                            "[COUNT-DECISION]",
-                            f"track_id={track_id}",
-                            f"line={line_name}",
-                            "direction=OUT",
-                            "source=zone_exit",
-                            "result=rejected",
-                            f"reason={','.join(reasons)}",
-                            f"side_state={self._side_label(curr_side)}",
-                            f"zone_streak={prev_active_zone_streak}",
-                        ]
-                    )
-                )
 
         return 0
 
@@ -810,6 +845,7 @@ class PeopleCounter:
                     if self._register_count(track_id, "IN", "line_disappear", now):
                         total_in += 1
                         counted = True
+                        self._last_in_count_points[int(track_id)] = ts.last_right_point
                         self._log_count_event(
                             track_id,
                             "IN",
@@ -946,6 +982,7 @@ class PeopleCounter:
                 if record.visible_streak_after_count > DEFAULT_UNCOUNT_IN_REAPPEAR_FRAMES:
                     self.total_in = max(0, self.total_in - 1)
                     record.uncounted = True
+                    self._last_in_count_points.pop(int(track_id), None)
                     print(
                         " ".join(
                             [
@@ -1350,6 +1387,18 @@ class PeopleCounter:
         if self._line_count_event(line_cfg) == LINE_EVENT_OUT:
             return max(1, int(line_cfg.get("out_zone_arm_frames", DEFAULT_OUT_ZONE_ARM_MIN_FRAMES) or DEFAULT_OUT_ZONE_ARM_MIN_FRAMES))
         return 1
+
+    def _out_travel_min_distance(self, line_cfg: dict) -> float:
+        return max(
+            0.0,
+            float(
+                line_cfg.get(
+                    "out_travel_min_distance",
+                    DEFAULT_OUT_TRAVEL_MIN_DISTANCE,
+                )
+                or DEFAULT_OUT_TRAVEL_MIN_DISTANCE
+            ),
+        )
 
     def _line_target_side_value(self, line_cfg: dict, point: tuple[float, float]) -> float:
         points = line_cfg.get("points", [])

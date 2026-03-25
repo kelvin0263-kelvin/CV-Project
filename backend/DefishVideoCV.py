@@ -1,8 +1,6 @@
 import cv2
 import numpy as np
 import FisheyeToPlanar 
-from background_subtraction import BackgroundSubtraction 
-from motion_detection_utils import add_motion_alert_border
 from logger import log 
 
 class FisheyeMultiView:
@@ -11,7 +9,7 @@ class FisheyeMultiView:
     based on a given configuration.
     """
 
-    def __init__(self, fisheye_frame_shape, view_configs, show_original=True, motion_detection_enabled=False, perimeter_zones={}, use_cuda=False, downscale_size=(640, 360)):
+    def __init__(self, fisheye_frame_shape, view_configs, show_original=True, use_cuda=False, downscale_size=(640, 360)):
         """
         Initializes the processor and pre-calculates all necessary transformation maps.
 
@@ -42,15 +40,6 @@ class FisheyeMultiView:
         # --- Pre-calculate all transformation maps ---
         self._create_all_maps()
 
-
-        self.motion_detection_enabled = motion_detection_enabled
-        self.perimeter_zones = perimeter_zones
-
-        if self.motion_detection_enabled:
-            print(f"Motion detection enabled. Initializing {len(view_configs)} background subtractors.")
-            self.bg_subtractors = [BackgroundSubtraction() for _ in view_configs]
-        else:
-            self.bg_subtractors = []
 
     def _create_all_maps(self):
         """Generates a transformation map for each view configuration and uploads to GPU if available."""
@@ -134,8 +123,10 @@ class FisheyeMultiView:
         processed_masks = {}
         processed_motion_flag = {}
         
-        # Always return original if specifically requested or no view_id (backward compat)
-        if view_id is None or view_id == 'original':
+        # Only include the original fisheye frame when this processor is configured
+        # to expose it. Runtime fisheye streams set show_original=False so we avoid
+        # carrying an unused extra frame through the pipeline.
+        if self.show_original and (view_id is None or view_id == 'original'):
              processed_frames['original'] = frame.copy()
 
         # --- Crop the frame to the center square ---
@@ -183,30 +174,7 @@ class FisheyeMultiView:
                 # ROTATE 180 degrees (Correct for ceiling mount)
                 planar_view = cv2.rotate(planar_view, cv2.ROTATE_180)
 
-                motion_mask = None
-                # --- Handle motion detection if enabled ---
-                if self.motion_detection_enabled and i < len(self.bg_subtractors):
-                    subtractor = self.bg_subtractors[i]
-
-                    current_view_zones = self.view_configs[i].get('zones', {})
-
-                    detections, motion_mask = subtractor.get_detections(planar_view.copy(), zones=current_view_zones , bbox_thresh=50)
-                    
-                    # Draw bounding boxes on the view
-                    if detections is not None:
-                        planar_view = add_motion_alert_border(planar_view) # New way
-                        processed_motion_flag[f"partition_{i}"] = True
-                    else:
-                        processed_motion_flag[f"partition_{i}"] = False
-                    
-
                 processed_frames[f"partition_{i}"] = planar_view
-
-                if motion_mask is not None:
-                    # if detections is not None:
-                    #     draw_bboxes(motion_mask, detections)
-
-                    processed_masks[f"partition_{i}"] = motion_mask
 
         # --- Include the original fisheye view if requested ---
         if overlay and self.show_original:

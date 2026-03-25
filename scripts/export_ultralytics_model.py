@@ -1,3 +1,4 @@
+# python scripts\export_ultralytics_model.py --model backend\yolo26m-pose.pt --format engine --device 0 --imgsz 416 736 --batch 8 --dynamic --half --name yolo26m-pose 
 import argparse
 import os
 import sys
