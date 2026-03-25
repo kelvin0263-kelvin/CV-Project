@@ -1,5 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 
+const STREAM_RENDER_INTERVAL_MS = 100;
+
 const StreamPlayer = ({
     wsUrl,
     className,
@@ -14,7 +16,17 @@ const StreamPlayer = ({
     const canvasRef = useRef(null);
     const wsRef = useRef(null);
     const detectionsRef = useRef([]);
+    const latestPayloadRef = useRef(null);
+    const renderRafRef = useRef(null);
+    const lastRenderedAtRef = useRef(0);
+    const statusRef = useRef('connecting');
     const [status, setStatus] = useState('connecting');
+
+    const setStatusSafe = useCallback((nextStatus) => {
+        if (statusRef.current === nextStatus) return;
+        statusRef.current = nextStatus;
+        setStatus(nextStatus);
+    }, []);
 
     // --- Compute actual image display area within object-contain ---
     const getImageDisplayArea = useCallback(() => {
@@ -224,6 +236,63 @@ const StreamPlayer = ({
         });
     }, [getImageDisplayArea, getOverlayVisual, showCountingAnchors]);
 
+    const applyPayload = useCallback((data) => {
+        if (data.image && imgRef.current) {
+            imgRef.current.src = `data:image/jpeg;base64,${data.image}`;
+            setStatusSafe('connected');
+        } else if (imgRef.current) {
+            imgRef.current.removeAttribute('src');
+            drawDetections([]);
+            setStatusSafe(data.stream_status === 'offline' ? 'disconnected' : 'recovering');
+        }
+
+        if (onStats) {
+            onStats({
+                fps: data.fps || 0,
+                people_count: data.people_count || 0,
+            });
+        }
+
+        const detections = Array.isArray(data.detections) ? data.detections : [];
+        detectionsRef.current = detections;
+        drawDetections(detections);
+
+        if (onDetections) {
+            onDetections(detections);
+        }
+
+        if (onCountingData && data.counting_data) {
+            onCountingData(data.counting_data);
+        }
+    }, [drawDetections, onCountingData, onDetections, onStats, setStatusSafe]);
+
+    const scheduleLatestRender = useCallback(() => {
+        if (renderRafRef.current !== null) return;
+
+        const pump = () => {
+            renderRafRef.current = window.requestAnimationFrame((now) => {
+                if ((now - lastRenderedAtRef.current) < STREAM_RENDER_INTERVAL_MS) {
+                    pump();
+                    return;
+                }
+
+                renderRafRef.current = null;
+                const payload = latestPayloadRef.current;
+                latestPayloadRef.current = null;
+                if (!payload) return;
+
+                lastRenderedAtRef.current = now;
+                applyPayload(payload);
+
+                if (latestPayloadRef.current) {
+                    pump();
+                }
+            });
+        };
+
+        pump();
+    }, [applyPayload]);
+
     useEffect(() => {
         if (!wsUrl) return;
 
@@ -234,44 +303,20 @@ const StreamPlayer = ({
 
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
+        latestPayloadRef.current = null;
+        lastRenderedAtRef.current = 0;
+        setStatusSafe('connecting');
 
         ws.onopen = () => {
             console.log(`Connected to ${wsUrl}`);
-            setStatus('connected');
+            setStatusSafe('connected');
         };
 
         ws.onmessage = (event) => {
             try {
                 const data = JSON.parse(event.data);
-                if (data.image && imgRef.current) {
-                    imgRef.current.src = `data:image/jpeg;base64,${data.image}`;
-                    setStatus('connected');
-                } else if (imgRef.current) {
-                    imgRef.current.removeAttribute('src');
-                    drawDetections([]);
-                    setStatus(data.stream_status === 'offline' ? 'disconnected' : 'recovering');
-                }
-                if (onStats) {
-                    onStats({
-                        fps: data.fps || 0,
-                        people_count: data.people_count || 0,
-                    });
-                }
-
-                // Store detections and draw on canvas
-                const detections = data.detections || [];
-                detectionsRef.current = detections;
-                drawDetections(detections);
-
-                // Forward detections to parent if callback provided
-                if (onDetections) {
-                    onDetections(detections);
-                }
-
-                // Forward counting data to parent if callback provided
-                if (onCountingData && data.counting_data) {
-                    onCountingData(data.counting_data);
-                }
+                latestPayloadRef.current = data;
+                scheduleLatestRender();
             } catch (e) {
                 console.error("Error parsing WS message", e);
             }
@@ -279,20 +324,30 @@ const StreamPlayer = ({
 
         ws.onerror = (error) => {
             console.error("WebSocket error:", error);
-            setStatus('error');
+            setStatusSafe('error');
         };
 
         ws.onclose = () => {
             console.log("WebSocket closed");
-            setStatus('disconnected');
+            setStatusSafe('disconnected');
         };
 
         return () => {
             if (wsRef.current) {
                 wsRef.current.close();
             }
+            if (renderRafRef.current !== null) {
+                window.cancelAnimationFrame(renderRafRef.current);
+                renderRafRef.current = null;
+            }
+            latestPayloadRef.current = null;
+            detectionsRef.current = [];
+            if (imgRef.current) {
+                imgRef.current.removeAttribute('src');
+            }
+            drawDetections([]);
         };
-    }, [wsUrl]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [drawDetections, scheduleLatestRender, setStatusSafe, wsUrl]);
 
     return (
         <div className={`relative bg-black flex items-center justify-center overflow-hidden ${className}`}>

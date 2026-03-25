@@ -1,13 +1,17 @@
+import os
 import threading
+from contextlib import contextmanager
 
 import cv2
 
 RTSP_SCHEMES = ("rtsp://", "rtsps://")
 _CAPTURE_OPEN_LOCK = threading.Lock()
 _NVDEC_CONFIG_LOGGED = False
+_CAPTURE_BACKEND_INFO_LOGGED = False
 
 RTSP_TRANSPORT = "tcp"
 RTSP_BUFFER_SIZE = 8
+# RTSP_BUFFER_SIZE = 2
 RTSP_OPEN_TIMEOUT_MS = 5000
 RTSP_READ_TIMEOUT_MS = 5000
 RTSP_ENABLE_NVDEC = False
@@ -152,19 +156,75 @@ def _release_if_needed(cap: cv2.VideoCapture | None):
         pass
 
 
-def open_video_capture(
-    source_path: str,
+def _log_capture_backend_info(
+    cap: cv2.VideoCapture | None,
     *,
-    is_rtsp: bool | None = None,
+    rtsp: bool,
+    ffmpeg_options: str = "",
+    enable_hwaccel: bool = False,
+):
+    global _CAPTURE_BACKEND_INFO_LOGGED
+    if _CAPTURE_BACKEND_INFO_LOGGED or not rtsp or not _is_opened(cap):
+        return
+
+    backend_name = "unknown"
+    hw_accel_value = None
+
+    try:
+        backend_id = int(cap.get(cv2.CAP_PROP_BACKEND))
+        if hasattr(cv2, "videoio_registry"):
+            backend_name = cv2.videoio_registry.getBackendName(backend_id) or "unknown"
+        else:
+            backend_name = str(backend_id)
+    except Exception:
+        pass
+
+    try:
+        if hasattr(cv2, "CAP_PROP_HW_ACCELERATION"):
+            hw_accel_value = cap.get(cv2.CAP_PROP_HW_ACCELERATION)
+    except Exception:
+        hw_accel_value = None
+
+    print(
+        "[VideoCapture] Opened RTSP capture: "
+        f"backend={backend_name}, "
+        f"hwaccel_requested={enable_hwaccel}, "
+        f"reported_hw_accel={hw_accel_value}, "
+        f"ffmpeg_options_applied={bool(ffmpeg_options)}"
+    )
+    if ffmpeg_options:
+        print(f"[VideoCapture] Active FFmpeg capture options: {ffmpeg_options}")
+    _CAPTURE_BACKEND_INFO_LOGGED = True
+
+
+@contextmanager
+def _temporary_ffmpeg_capture_options(options: str | None):
+    env_key = "OPENCV_FFMPEG_CAPTURE_OPTIONS"
+    previous = os.environ.get(env_key)
+
+    if options:
+        os.environ[env_key] = options
+
+    try:
+        yield
+    finally:
+        if options:
+            if previous is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = previous
+
+
+def open_video_capture(source_path: str,*,is_rtsp: bool | None = None,
     allow_hwaccel: bool | None = None,
 ) -> cv2.VideoCapture:
     global _NVDEC_CONFIG_LOGGED
     rtsp = is_rtsp_source(source_path) if is_rtsp is None else is_rtsp
     backend = getattr(cv2, "CAP_FFMPEG", None) if rtsp else None
     enable_nvdec = RTSP_ENABLE_NVDEC if allow_hwaccel is None else allow_hwaccel
-    params = _build_capture_open_params(is_rtsp=rtsp, enable_hwaccel=enable_nvdec)
 
     with _CAPTURE_OPEN_LOCK:
+        ffmpeg_options = ""
         if rtsp:
             ffmpeg_options = _build_rtsp_ffmpeg_capture_options(enable_hwaccel=enable_nvdec)
             if enable_nvdec and not _NVDEC_CONFIG_LOGGED:
@@ -176,15 +236,7 @@ def open_video_capture(
 
         cap = None
         if backend is not None:
-            if params:
-                try:
-                    cap = cv2.VideoCapture(source_path, backend, params)
-                except (TypeError, cv2.error):
-                    cap = None
-            if not _is_opened(cap):
-                _release_if_needed(cap)
-                cap = None
-            if cap is None:
+            with _temporary_ffmpeg_capture_options(ffmpeg_options):
                 try:
                     cap = cv2.VideoCapture(source_path, backend)
                 except cv2.error:
@@ -192,10 +244,27 @@ def open_video_capture(
             if not _is_opened(cap):
                 _release_if_needed(cap)
                 cap = None
+            if _is_opened(cap) and rtsp:
+                _apply_rtsp_capture_fallback_props(cap, enable_hwaccel=enable_nvdec)
+                _log_capture_backend_info(
+                    cap,
+                    rtsp=rtsp,
+                    ffmpeg_options=ffmpeg_options,
+                    enable_hwaccel=enable_nvdec,
+                )
+            elif not _is_opened(cap):
+                _release_if_needed(cap)
+                cap = None
 
         if cap is None:
             cap = cv2.VideoCapture(source_path)
             if rtsp:
                 _apply_rtsp_capture_fallback_props(cap, enable_hwaccel=enable_nvdec)
+                _log_capture_backend_info(
+                    cap,
+                    rtsp=rtsp,
+                    ffmpeg_options=ffmpeg_options,
+                    enable_hwaccel=enable_nvdec,
+                )
 
     return cap

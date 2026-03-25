@@ -373,6 +373,110 @@ def classify_lower_body_batch(
     return results
 
 
+def classify_lower_body_multi_frame_batch(
+    items: list[dict],
+    device: str | None = None,
+    enable_pants: bool = True,
+    enable_slipper: bool = True,
+) -> list[dict | None]:
+    """
+    Batch classify lower-body crops across multiple frames/streams.
+
+    Args:
+        items: List of {"frame": np.ndarray, "bbox": [...], "keypoints": ...}
+        device: CUDA device id
+
+    Returns:
+        List aligned with input items. Each entry is classification dict or None.
+    """
+    if not enable_pants and not enable_slipper:
+        return [None] * len(items)
+
+    if (dresscode_model is None or not enable_pants) and (slipper_model is None or not enable_slipper):
+        return [None] * len(items)
+
+    if not items:
+        return []
+
+    lower_pending_indices: list[int] = []
+    lower_crops: list[np.ndarray] = []
+    lower_bboxes: list[tuple[int, int, int, int]] = []
+    slipper_pending_indices: list[int] = []
+    slipper_crops: list[np.ndarray] = []
+    slipper_bboxes: list[tuple[int, int, int, int]] = []
+    results: list[dict | None] = [None] * len(items)
+
+    for idx, item in enumerate(items):
+        frame = item.get("frame")
+        bbox = item.get("bbox")
+        keypoints = item.get("keypoints")
+        if frame is None or bbox is None:
+            continue
+
+        entry = {
+            "label": None,
+            "confidence": None,
+            "lower_bbox": None,
+            "slipper_bbox": None,
+            "classifications": [],
+        }
+        results[idx] = entry
+
+        lower_crop, lower_bbox = crop_lower_body(frame, bbox, keypoints)
+        if lower_crop is not None and dresscode_model is not None and enable_pants:
+            if lower_crop.shape[0] >= 32 and lower_crop.shape[1] >= 32:
+                lower_pending_indices.append(idx)
+                lower_crops.append(lower_crop)
+                lower_bboxes.append(lower_bbox)
+
+        slipper_crop, slipper_bbox = crop_slipper_region(frame, bbox, keypoints)
+        if slipper_crop is not None and slipper_model is not None and enable_slipper:
+            slipper_pending_indices.append(idx)
+            slipper_crops.append(slipper_crop)
+            slipper_bboxes.append(slipper_bbox)
+
+    lower_predictions = _predict_batch(dresscode_model, dresscode_class_names, lower_crops, device=device)
+    slipper_predictions = _predict_batch(slipper_model, slipper_class_names, slipper_crops, device=device)
+
+    for batch_pos, prediction in enumerate(lower_predictions):
+        if prediction is None:
+            continue
+        result_index = lower_pending_indices[batch_pos]
+        entry = results[result_index]
+        if entry is None:
+            continue
+        entry["lower_bbox"] = list(map(int, lower_bboxes[batch_pos]))
+        entry["classifications"].append(
+            {
+                "label": prediction["label"],
+                "confidence": prediction["confidence"],
+                "region": "lower_body",
+            }
+        )
+
+    for batch_pos, prediction in enumerate(slipper_predictions):
+        if prediction is None:
+            continue
+        result_index = slipper_pending_indices[batch_pos]
+        entry = results[result_index]
+        if entry is None:
+            continue
+        entry["slipper_bbox"] = list(map(int, slipper_bboxes[batch_pos]))
+        entry["classifications"].append(
+            {
+                "label": prediction["label"],
+                "confidence": prediction["confidence"],
+                "region": "footwear",
+            }
+        )
+
+    for idx, entry in enumerate(results):
+        finalized = _finalize_combined_result(entry) if entry is not None else None
+        results[idx] = finalized
+
+    return results
+
+
 def crop_full_person(frame: np.ndarray, bbox, padding_percent=0.05) -> np.ndarray | None:
     """
     Crop the full person with slight padding for snapshot evidence.

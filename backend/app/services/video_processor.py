@@ -38,7 +38,11 @@ from ultralytics.engine.results import Boxes
 from ultralytics.trackers.track import TRACKER_MAP
 from turbojpeg import TurboJPEG
 from ultralytics.utils import IterableSimpleNamespace, YAML
-from app.services.dresscode_detector import classify_lower_body_batch, crop_full_person
+from app.services.dresscode_detector import (
+    classify_lower_body_batch,
+    classify_lower_body_multi_frame_batch,
+    crop_full_person,
+)
 from app.services.fall_detector import is_person_in_fall_pose
 from app.services.building_counter import ingest_sensor_events
 from app.services.cross_camera_verifier import (
@@ -88,13 +92,15 @@ POSE_TRACK_IMGSZ = (416,736)
 # POSE_TRACK_IMGSZ = 736
 DETECTION_STRIDE = 1
 COUNTING_SNAPSHOT_HEARTBEAT_SEC = 300
+
 DRESSCODE_RECLASSIFY_INTERVAL_SEC = 1.0
 DRESSCODE_VIOLATION_CONFIRMATIONS = 2
+DRESSCODE_VIOLATION_WINDOW_SEC = 5.0
 PERF_LOG_INTERVAL_FRAMES = 30
 PERF_STAGE_LOGS = True
 MULTI_STREAM_BATCH_INFER = True
-BATCH_INFER_WINDOW_MS = 5
-BATCH_INFER_MAX_BATCH = 8
+BATCH_INFER_WINDOW_MS = 2
+BATCH_INFER_MAX_BATCH = 5
 BATCH_INFER_WAIT_MS = 1500
 BATCH_INFER_LOG_INTERVAL = 30
 ASYNC_CAPTURE_ENABLED = True
@@ -336,6 +342,7 @@ def _build_perf_dict(
     classify_candidates: int = 0,
     classified: int = 0,
     infer_wait_ms: float = 0.0,
+    infer_queue_wait_ms: float = 0.0,
     infer_predict_ms: float = 0.0,
     infer_predict_total_ms: float | None = None,
     infer_post_ms: float = 0.0,
@@ -348,6 +355,7 @@ def _build_perf_dict(
         "classify_candidates": classify_candidates,
         "classified": classified,
         "infer_wait_ms": infer_wait_ms,
+        "infer_queue_wait_ms": infer_queue_wait_ms,
         "infer_predict_ms": infer_predict_ms,
         "infer_predict_total_ms": (
             infer_predict_ms if infer_predict_total_ms is None else infer_predict_total_ms
@@ -363,12 +371,14 @@ def _empty_detection_result(
     detect_ms: float = 0.0,
     detect_total_ms: float | None = None,
     infer_wait_ms: float = 0.0,
+    infer_queue_wait_ms: float = 0.0,
     ) -> tuple[list[dict], int, dict, dict]:
     return [], 0, track_state, _build_perf_dict(
         detect_ms=detect_ms,
         detect_total_ms=detect_total_ms,
         batch_size=batch_size,
         infer_wait_ms=infer_wait_ms,
+        infer_queue_wait_ms=infer_queue_wait_ms,
     )
 
 
@@ -833,6 +843,7 @@ class _BatchInferenceEngine:
         need_fall_detection: bool,
     ) -> tuple[list[dict], int, dict, dict]:
         done = threading.Event()
+        wait_started_at = time.perf_counter()
         req = {
             "stream_id": stream_id,
             "img": img,
@@ -844,8 +855,8 @@ class _BatchInferenceEngine:
             "need_fall_detection": need_fall_detection,
             "done": done,
             "result": None,
+            "enqueued_at": wait_started_at,
         }
-        wait_started_at = time.perf_counter()
         self._req_queue.put(req)
 
         if not done.wait(timeout=BATCH_INFER_WAIT_MS / 1000.0):
@@ -929,6 +940,7 @@ class _BatchInferenceEngine:
 
     def _process_batch(self, batch: list[dict]):
         detect_started_at = time.perf_counter()
+        batch_started_at = detect_started_at
         images = [item.get("infer_img") if item.get("infer_img") is not None else item["img"] for item in batch]
         self._processed_batches += 1
         # if len(batch) > 1 or (self._processed_batches % BATCH_INFER_LOG_INTERVAL == 0):
@@ -953,6 +965,8 @@ class _BatchInferenceEngine:
         detect_ms_total = (time.perf_counter() - detect_started_at) * 1000.0
         detect_ms_each = detect_ms_total / max(1, len(batch))
 
+        req_contexts: list[dict] = []
+        global_classify_candidates: list[dict] = []
         processed = 0
         for req, result in zip(batch, results):
             processed += 1
@@ -1035,63 +1049,106 @@ class _BatchInferenceEngine:
                         "keypoints_data": kp_row_fall,
                     }
                 )
+            req_context = {
+                "req": req,
+                "detections": detections,
+                "track_state": track_state,
+                "tracked_count": len(tracked),
+                "classify_candidates": classify_candidates,
+                "classified_count": classified_count,
+                "classify_ms": classify_ms,
+                "infer_queue_wait_ms": max(
+                    0.0,
+                    (batch_started_at - float(req.get("enqueued_at") or batch_started_at)) * 1000.0,
+                ),
+                "req_post_started_at": req_post_started_at,
+                "classify_now_monotonic": classify_now_monotonic,
+            }
+            req_contexts.append(req_context)
 
-            if not req["skip_classification"] and classify_candidates:
-                classify_started_at = time.perf_counter()
-                batch_results = classify_lower_body_batch(
-                    req["img"],
-                    [{"bbox": item["bbox"], "keypoints": item["keypoints"]} for item in classify_candidates],
-                    device=YOLO_DEVICE,
-                    enable_pants=enable_pants_detection,
-                    enable_slipper=enable_slipper_detection,
+            for cand in classify_candidates:
+                global_classify_candidates.append(
+                    {
+                        "req_context": req_context,
+                        "det_pos": cand["det_pos"],
+                        "track_id": cand["track_id"],
+                        "frame": req["img"],
+                        "bbox": cand["bbox"],
+                        "keypoints": cand["keypoints"],
+                    }
                 )
-                classify_ms = (time.perf_counter() - classify_started_at) * 1000.0
 
-                for cand, cls_result in zip(classify_candidates, batch_results):
-                    if cls_result is None:
-                        continue
-                    det = detections[cand["det_pos"]]
-                    det["label"] = cls_result["label"]
-                    det["confidence"] = cls_result["confidence"]
-                    det["lower_bbox"] = cls_result.get("lower_bbox")
-                    det["slipper_bbox"] = cls_result.get("slipper_bbox")
-                    det["classifications"] = list(cls_result.get("classifications") or [])
-                    det["_classification_fresh"] = True
-                    classified_count += 1
+        total_classify_ms = 0.0
+        if global_classify_candidates:
+            enable_pants_detection, enable_slipper_detection = _get_classifier_flags()
+            classify_started_at = time.perf_counter()
+            batch_results = classify_lower_body_multi_frame_batch(
+                [
+                    {
+                        "frame": item["frame"],
+                        "bbox": item["bbox"],
+                        "keypoints": item["keypoints"],
+                    }
+                    for item in global_classify_candidates
+                ],
+                device=YOLO_DEVICE,
+                enable_pants=enable_pants_detection,
+                enable_slipper=enable_slipper_detection,
+            )
+            total_classify_ms = (time.perf_counter() - classify_started_at) * 1000.0
 
-                    track_id = cand["track_id"]
-                    if track_id not in track_state:
-                        track_state[track_id] = {"violation_saved": False}
-                    track_state[track_id].update(
-                        {
-                            "label": cls_result["label"],
-                            "confidence": cls_result["confidence"],
-                            "lower_bbox": cls_result.get("lower_bbox"),
-                            "slipper_bbox": cls_result.get("slipper_bbox"),
-                            "classifications": list(cls_result.get("classifications") or []),
-                            "last_classified_at_monotonic": classify_now_monotonic,
-                        }
-                    )
+            total_candidates = len(global_classify_candidates)
+            for item, cls_result in zip(global_classify_candidates, batch_results):
+                req_context = item["req_context"]
+                if total_candidates > 0:
+                    req_context["classify_ms"] += total_classify_ms / total_candidates
+                if cls_result is None:
+                    continue
 
-            req_total_post_ms = (time.perf_counter() - req_post_started_at) * 1000.0
-            req_post_ms = max(0.0, req_total_post_ms - classify_ms)
-            req["result"] = (
-                detections,
-                len(tracked),
-                track_state,
+                det = req_context["detections"][item["det_pos"]]
+                det["label"] = cls_result["label"]
+                det["confidence"] = cls_result["confidence"]
+                det["lower_bbox"] = cls_result.get("lower_bbox")
+                det["slipper_bbox"] = cls_result.get("slipper_bbox")
+                det["classifications"] = list(cls_result.get("classifications") or [])
+                det["_classification_fresh"] = True
+                req_context["classified_count"] += 1
+
+                track_id = item["track_id"]
+                if track_id not in req_context["track_state"]:
+                    req_context["track_state"][track_id] = {"violation_saved": False}
+                req_context["track_state"][track_id].update(
+                    {
+                        "label": cls_result["label"],
+                        "confidence": cls_result["confidence"],
+                        "lower_bbox": cls_result.get("lower_bbox"),
+                        "slipper_bbox": cls_result.get("slipper_bbox"),
+                        "classifications": list(cls_result.get("classifications") or []),
+                        "last_classified_at_monotonic": req_context["classify_now_monotonic"],
+                    }
+                )
+
+        for req_context in req_contexts:
+            req_total_post_ms = (time.perf_counter() - req_context["req_post_started_at"]) * 1000.0
+            req_post_ms = max(0.0, req_total_post_ms - req_context["classify_ms"])
+            req_context["req"]["result"] = (
+                req_context["detections"],
+                req_context["tracked_count"],
+                req_context["track_state"],
                 _build_perf_dict(
                     detect_ms=detect_ms_each,
                     detect_total_ms=detect_ms_total,
                     batch_size=len(batch),
-                    classify_ms=classify_ms,
-                    classify_candidates=len(classify_candidates),
-                    classified=classified_count,
+                    classify_ms=req_context["classify_ms"],
+                    classify_candidates=len(req_context["classify_candidates"]),
+                    classified=req_context["classified_count"],
+                    infer_queue_wait_ms=req_context["infer_queue_wait_ms"],
                     infer_predict_ms=detect_ms_each,
                     infer_predict_total_ms=detect_ms_total,
                     infer_post_ms=req_post_ms,
                 ),
             )
-            req["done"].set()
+            req_context["req"]["done"].set()
 
         if processed < len(batch):
             for req in batch[processed:]:
@@ -2201,6 +2258,7 @@ def video_producer(
                 detection_roi_areas=detection_roi_areas,
             )
             stage_ms["infer_wait"] += perf.get("infer_wait_ms", perf.get("detect_ms", 0.0))
+            stage_ms["infer_queue_wait"] += perf.get("infer_queue_wait_ms", 0.0)
             stage_ms["infer_predict"] += perf.get("infer_predict_ms", perf.get("detect_ms", 0.0))
             stage_ms["infer_predict_total_batch"] += perf.get(
                 "infer_predict_total_ms",
@@ -2334,6 +2392,7 @@ def video_producer(
             "capture_decode": decode_ms,
             "fisheye": 0.0,
             "infer_wait": 0.0,
+            "infer_queue_wait": 0.0,
             "infer_predict": 0.0,
             "infer_predict_total_batch": 0.0,
             "infer_post": 0.0,
@@ -2443,6 +2502,7 @@ def video_producer(
             #     f"producer_stage_sum={producer_stage_sum_ms:.1f}ms "
             #     f"fisheye={stage_ms['fisheye']:.1f}ms "
             #     f"infer_wait={stage_ms['infer_wait']:.1f}ms "
+            #     f"infer_queue_wait={stage_ms['infer_queue_wait']:.1f}ms "
             #     f"infer_predict={stage_ms['infer_predict']:.1f}ms "
             #     f"infer_predict_total_batch={stage_ms['infer_predict_total_batch']:.1f}ms "
             #     f"infer_post={stage_ms['infer_post']:.1f}ms "
@@ -2621,9 +2681,16 @@ def _select_display_violation(matched_violations: list[dict]) -> dict | None:
 def _clear_violation_tracking(track_entry: dict) -> None:
     track_entry.pop("violation_candidate_label", None)
     track_entry.pop("violation_candidate_count", None)
+    track_entry.pop("violation_candidate_started_at_monotonic", None)
     track_entry.pop("confirmed_violation", None)
     track_entry.pop("confirmed_matched_violations", None)
     track_entry.pop("last_matched_violations", None)
+
+
+def _clear_pending_violation_candidate(track_entry: dict) -> None:
+    track_entry.pop("violation_candidate_label", None)
+    track_entry.pop("violation_candidate_count", None)
+    track_entry.pop("violation_candidate_started_at_monotonic", None)
 
 
 def _update_violation_confirmation_state(
@@ -2632,24 +2699,44 @@ def _update_violation_confirmation_state(
     *,
     classification_fresh: bool,
 ) -> tuple[dict | None, list[dict]]:
+    now_monotonic = time.monotonic()
+    candidate_started_at = track_entry.get("violation_candidate_started_at_monotonic")
+    if candidate_started_at is not None:
+        candidate_age_sec = now_monotonic - float(candidate_started_at)
+        if candidate_age_sec > DRESSCODE_VIOLATION_WINDOW_SEC:
+            _clear_pending_violation_candidate(track_entry)
+
     if not matched_violations:
-        _clear_violation_tracking(track_entry)
+        track_entry.pop("confirmed_violation", None)
+        track_entry.pop("confirmed_matched_violations", None)
+        track_entry.pop("last_matched_violations", None)
         return None, []
 
     display_violation = _select_display_violation(matched_violations)
     if display_violation is None:
-        _clear_violation_tracking(track_entry)
+        track_entry.pop("confirmed_violation", None)
+        track_entry.pop("confirmed_matched_violations", None)
+        track_entry.pop("last_matched_violations", None)
         return None, []
 
     track_entry["last_matched_violations"] = [dict(item) for item in matched_violations]
 
     if classification_fresh:
         display_label = display_violation.get("label")
-        if track_entry.get("violation_candidate_label") == display_label:
+        candidate_label = track_entry.get("violation_candidate_label")
+        candidate_started_at = track_entry.get("violation_candidate_started_at_monotonic")
+        candidate_within_window = (
+            candidate_label == display_label
+            and candidate_started_at is not None
+            and (now_monotonic - float(candidate_started_at)) <= DRESSCODE_VIOLATION_WINDOW_SEC
+        )
+
+        if candidate_within_window:
             track_entry["violation_candidate_count"] = int(track_entry.get("violation_candidate_count", 0)) + 1
         else:
             track_entry["violation_candidate_label"] = display_label
             track_entry["violation_candidate_count"] = 1
+            track_entry["violation_candidate_started_at_monotonic"] = now_monotonic
 
         if int(track_entry.get("violation_candidate_count", 0)) >= DRESSCODE_VIOLATION_CONFIRMATIONS:
             track_entry["confirmed_violation"] = dict(display_violation)

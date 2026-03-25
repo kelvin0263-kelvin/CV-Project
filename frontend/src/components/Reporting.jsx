@@ -741,6 +741,11 @@ const aggregateDressCodeAnalytics = (events, snapshots, { startMs = null, endMs 
     const totalViolations = relevantEvents.length;
     const totalTrafficBase = Number(trafficSummary.totalFootTraffic || 0);
     const violationRate = totalTrafficBase > 0 ? (totalViolations / totalTrafficBase) * 100 : 0;
+    const peakViolationPoint = mergedRateSeries.reduce((best, point) => {
+        if (point.violations <= 0) return best;
+        if (!best || point.violations > best.violations) return point;
+        return best;
+    }, null);
     const peakRatePoint = mergedRateSeries.reduce((best, point) => {
         if (point.totalFootTraffic <= 0) return best;
         if (!best || point.violationRate > best.violationRate) return point;
@@ -760,7 +765,7 @@ const aggregateDressCodeAnalytics = (events, snapshots, { startMs = null, endMs 
         totalViolations,
         uniqueViolators: violatorKeys.size,
         violationRate,
-        peakViolationTimeLabel: getPeakTwoHourLabel(relevantEvents),
+        peakViolationTimeLabel: peakViolationPoint?.fullLabel || '-',
         peakConversionLabel: peakRatePoint?.fullLabel || '-',
         breakdown,
         rateSeries: mergedRateSeries,
@@ -1483,7 +1488,7 @@ const DressCodeAnalyticsPanel = ({ events, snapshots, cameraLabel, startMs, endM
                         <Clock3 className="h-4 w-4 text-indigo-600" />
                         Peak Violation Time
                     </div>
-                    <div className="mt-2 text-lg font-semibold text-indigo-700">{analytics.peakViolationTimeLabel}</div>
+                    <div className="mt-2 text-lg font-semibold text-indigo-700">{chartAnalytics.peakViolationTimeLabel}</div>
                 </div>
             </div>
 
