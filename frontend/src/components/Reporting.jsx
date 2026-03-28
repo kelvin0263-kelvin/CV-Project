@@ -9,6 +9,7 @@ import {
 import {
     Download, Calendar, Eye, FileText, XCircle, AlertTriangle, RefreshCw, Users, Building2,
     ArrowDownToLine, ArrowUpFromLine, Activity, Clock3, TrendingUp, ArrowLeft, ArrowRight, Target,
+    ChevronDown, ChevronRight,
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { getApiBaseUrl } from '../apiConfig';
@@ -105,6 +106,17 @@ const formatDateTimeLocal = (date) => {
 const formatDateOnlyLocal = (date) => {
     const pad = (n) => String(n).padStart(2, '0');
     return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+};
+
+const toApiDateTimeParam = (value) => {
+    if (value == null) return null;
+    const date = value instanceof Date ? value : new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+};
+
+const appendQueryParam = (params, key, value) => {
+    if (value == null || value === '') return;
+    params.set(key, String(value));
 };
 
 const formatNumber = (value) => new Intl.NumberFormat('en-US').format(Number(value || 0));
@@ -602,22 +614,80 @@ const aggregateBuildingEntranceContribution = (rows, { startMs = null, endMs = n
                 totalTraffic: 0,
                 currentOccupancy: 0,
                 cameraCount: 0,
+                cameras: new Map(),
             };
 
             existing.totalIn += deltaIn;
             existing.totalOut += deltaOut;
             existing.totalTraffic += deltaIn + deltaOut;
             existing.currentOccupancy = Number(current.occupancy ?? existing.currentOccupancy ?? 0);
-            existing.cameraCount = Array.isArray(current.camera_ids)
-                ? current.camera_ids.length
-                : existing.cameraCount;
+            const currentCameraSummaries = current.camera_summaries || {};
+            const previousCameraSummaries = previous.camera_summaries || {};
+            const cameraIds = new Set([
+                ...(Array.isArray(current.camera_ids) ? current.camera_ids : []),
+                ...(Array.isArray(previous.camera_ids) ? previous.camera_ids : []),
+                ...Object.keys(currentCameraSummaries),
+                ...Object.keys(previousCameraSummaries),
+            ]);
+
+            cameraIds.forEach((cameraId) => {
+                const currentCamera = currentCameraSummaries[cameraId] || {};
+                const previousCamera = previousCameraSummaries[cameraId] || {};
+                const currentCameraIn = Number(currentCamera.total_in ?? 0);
+                const currentCameraOut = Number(currentCamera.total_out ?? 0);
+                const previousCameraIn = Number(previousCamera.total_in ?? 0);
+                const previousCameraOut = Number(previousCamera.total_out ?? 0);
+                const cameraResetDetected = previousRow && (
+                    currentCameraIn < previousCameraIn
+                    || currentCameraOut < previousCameraOut
+                );
+                const deltaCameraIn = previousRow
+                    ? Math.max(0, cameraResetDetected ? currentCameraIn : (currentCameraIn - previousCameraIn))
+                    : Math.max(0, currentCameraIn);
+                const deltaCameraOut = previousRow
+                    ? Math.max(0, cameraResetDetected ? currentCameraOut : (currentCameraOut - previousCameraOut))
+                    : Math.max(0, currentCameraOut);
+
+                const existingCamera = existing.cameras.get(cameraId) || {
+                    id: cameraId,
+                    totalIn: 0,
+                    totalOut: 0,
+                    totalTraffic: 0,
+                    currentOccupancy: 0,
+                };
+
+                existingCamera.totalIn += deltaCameraIn;
+                existingCamera.totalOut += deltaCameraOut;
+                existingCamera.totalTraffic += deltaCameraIn + deltaCameraOut;
+                existingCamera.currentOccupancy = Number(currentCamera.occupancy ?? existingCamera.currentOccupancy ?? 0);
+                existing.cameras.set(cameraId, existingCamera);
+            });
+
+            existing.cameraCount = Math.max(existing.cameraCount, existing.cameras.size, Array.isArray(current.camera_ids) ? current.camera_ids.length : 0);
             entranceMap.set(entranceId, existing);
         });
 
         previousRow = row;
     });
 
-    const rawEntries = Array.from(entranceMap.values());
+    const rawEntries = Array.from(entranceMap.values()).map((entry) => {
+        const cameras = Array.from(entry.cameras.values())
+            .map((camera) => ({
+                ...camera,
+                share: entry.totalTraffic > 0 ? (Number(camera.totalTraffic || 0) / Number(entry.totalTraffic || 0)) * 100 : 0,
+            }))
+            .sort((a, b) => {
+                const trafficDelta = Number(b.totalTraffic || 0) - Number(a.totalTraffic || 0);
+                if (trafficDelta !== 0) return trafficDelta;
+                return String(a.id || '').localeCompare(String(b.id || ''));
+            });
+
+        return {
+            ...entry,
+            cameraCount: Math.max(entry.cameraCount, cameras.length),
+            cameras,
+        };
+    });
     const totalTraffic = rawEntries.reduce((sum, entry) => sum + Number(entry.totalTraffic || 0), 0);
     const entries = rawEntries
         .map((entry) => ({
@@ -1615,16 +1685,27 @@ const DressCodeAnalyticsPanel = ({ events, snapshots, cameraLabel, startMs, endM
     );
 };
 
-const BuildingOccupancyPanel = ({ apiUrl, reportStartMs, reportEndMs, refreshToken, visible }) => {
+const BuildingOccupancyPanel = ({
+    apiUrl,
+    reportStartMs,
+    reportEndMs,
+    selectedBucket,
+    refreshToken,
+    visible,
+    cameraNameById,
+    countingSnapshots,
+}) => {
     const [buildingSummary, setBuildingSummary] = useState(EMPTY_BUILDING_SUMMARY);
     const [buildingHistory, setBuildingHistory] = useState([]);
     const [loading, setLoading] = useState(false);
-    const [timeRange, setTimeRange] = useState('24h');
-    const [selectedBucket, setSelectedBucket] = useState('auto');
-    const [customStart, setCustomStart] = useState(() => createDefaultCustomRange().start);
-    const [customEnd, setCustomEnd] = useState(() => createDefaultCustomRange().end);
     const [rangeNowMs, setRangeNowMs] = useState(() => Date.now());
     const [brushWindow, setBrushWindow] = useState({ key: '', startTs: null, endTs: null });
+    const [expandedEntranceIds, setExpandedEntranceIds] = useState(() => new Set());
+    const buildingHistoryFetchBounds = useMemo(() => ({
+        valid: reportStartMs == null || reportEndMs == null || reportStartMs <= reportEndMs,
+        startMs: reportStartMs,
+        endMs: reportEndMs ?? rangeNowMs,
+    }), [rangeNowMs, reportEndMs, reportStartMs]);
 
     const fetchBuildingSummary = useCallback(async () => {
         if (!visible) return;
@@ -1643,13 +1724,22 @@ const BuildingOccupancyPanel = ({ apiUrl, reportStartMs, reportEndMs, refreshTok
             setBuildingHistory([]);
             return;
         }
+        if (!buildingHistoryFetchBounds.valid) {
+            setBuildingHistory([]);
+            return;
+        }
         setLoading(true);
         try {
             const rows = [];
             let offset = 0;
             while (offset < MAX_BUILDING_HISTORY_ROWS) {
+                const params = new URLSearchParams();
+                appendQueryParam(params, 'limit', BUILDING_HISTORY_PAGE_SIZE);
+                appendQueryParam(params, 'offset', offset);
+                appendQueryParam(params, 'start', toApiDateTimeParam(buildingHistoryFetchBounds.startMs));
+                appendQueryParam(params, 'end', toApiDateTimeParam(buildingHistoryFetchBounds.endMs));
                 const res = await fetch(
-                    `${apiUrl}/api/building-counting-history?limit=${BUILDING_HISTORY_PAGE_SIZE}&offset=${offset}`,
+                    `${apiUrl}/api/building-counting-history?${params.toString()}`,
                 );
                 if (!res.ok) break;
 
@@ -1680,7 +1770,7 @@ const BuildingOccupancyPanel = ({ apiUrl, reportStartMs, reportEndMs, refreshTok
             setBuildingHistory([]);
         }
         setLoading(false);
-    }, [apiUrl, visible]);
+    }, [apiUrl, buildingHistoryFetchBounds.endMs, buildingHistoryFetchBounds.startMs, buildingHistoryFetchBounds.valid, visible]);
 
     useEffect(() => {
         if (!visible) return undefined;
@@ -1699,10 +1789,8 @@ const BuildingOccupancyPanel = ({ apiUrl, reportStartMs, reportEndMs, refreshTok
         const timeoutId = setTimeout(() => {
             void fetchBuildingHistory();
         }, 0);
-        const interval = setInterval(fetchBuildingHistory, 15000);
         return () => {
             clearTimeout(timeoutId);
-            clearInterval(interval);
         };
     }, [fetchBuildingHistory, visible, refreshToken]);
 
@@ -1714,34 +1802,11 @@ const BuildingOccupancyPanel = ({ apiUrl, reportStartMs, reportEndMs, refreshTok
         return () => clearInterval(intervalId);
     }, [visible]);
 
-    const panelRangeBounds = useMemo(() => {
-        let rangeStartMs = null;
-        let rangeEndMs = rangeNowMs;
-
-        if (timeRange === 'custom') {
-            const customStartMs = new Date(customStart).getTime();
-            const customEndMs = new Date(customEnd).getTime();
-            if (Number.isNaN(customStartMs) || Number.isNaN(customEndMs) || customStartMs > customEndMs) {
-                return { valid: false, startMs: null, endMs: null };
-            }
-            rangeStartMs = customStartMs;
-            rangeEndMs = customEndMs;
-        } else if (timeRange !== 'all') {
-            rangeStartMs = rangeNowMs - OCCUPANCY_RANGE_LOOKBACK_MS[timeRange];
-        }
-
-        if (reportStartMs !== null) {
-            rangeStartMs = rangeStartMs == null ? reportStartMs : Math.max(rangeStartMs, reportStartMs);
-        }
-        if (reportEndMs !== null) {
-            rangeEndMs = Math.min(rangeEndMs, reportEndMs);
-        }
-        if (rangeStartMs != null && rangeEndMs != null && rangeStartMs > rangeEndMs) {
-            return { valid: false, startMs: null, endMs: null };
-        }
-
-        return { valid: true, startMs: rangeStartMs, endMs: rangeEndMs };
-    }, [customEnd, customStart, rangeNowMs, reportEndMs, reportStartMs, timeRange]);
+    const panelRangeBounds = useMemo(() => ({
+        valid: reportStartMs == null || reportEndMs == null || reportStartMs <= reportEndMs,
+        startMs: reportStartMs,
+        endMs: reportEndMs ?? rangeNowMs,
+    }), [rangeNowMs, reportEndMs, reportStartMs]);
 
     const filteredHistory = useMemo(() => {
         if (!panelRangeBounds.valid) return [];
@@ -1772,12 +1837,12 @@ const BuildingOccupancyPanel = ({ apiUrl, reportStartMs, reportEndMs, refreshTok
     const effectiveBucket = useMemo(() => {
         if (selectedBucket !== 'auto') return selectedBucket;
         return getAdaptiveFlowBucket(
-            timeRange,
+            'custom',
             panelRangeBounds.startMs,
             panelRangeBounds.endMs ?? rangeNowMs,
         );
-    }, [panelRangeBounds.endMs, panelRangeBounds.startMs, rangeNowMs, selectedBucket, timeRange]);
-    const brushContextKey = `${timeRange}|${customStart}|${customEnd}|${reportStartMs}|${reportEndMs}`;
+    }, [panelRangeBounds.endMs, panelRangeBounds.startMs, rangeNowMs, selectedBucket]);
+    const brushContextKey = `${reportStartMs}|${reportEndMs}|${selectedBucket}`;
     const activeBrushWindow = useMemo(() => (
         brushWindow.key === brushContextKey
             ? brushWindow
@@ -1838,15 +1903,11 @@ const BuildingOccupancyPanel = ({ apiUrl, reportStartMs, reportEndMs, refreshTok
         });
     }, [buildingHistory, effectiveBucket, panelRangeBounds]);
 
-    const todaySummary = useMemo(() => {
-        const todayStart = new Date();
-        todayStart.setHours(0, 0, 0, 0);
-        return aggregateBuildingFlow(buildingHistory, {
-            startMs: todayStart.getTime(),
-            endMs: rangeNowMs,
-            bucket: '1h',
-        });
-    }, [buildingHistory, rangeNowMs]);
+    const rangeSummary = useMemo(() => aggregateBuildingFlow(buildingHistory, {
+        startMs: panelRangeBounds.valid ? panelRangeBounds.startMs : null,
+        endMs: panelRangeBounds.valid ? panelRangeBounds.endMs : null,
+        bucket: effectiveBucket,
+    }), [buildingHistory, effectiveBucket, panelRangeBounds]);
 
     const entranceContribution = useMemo(() => {
         const aggregated = aggregateBuildingEntranceContribution(buildingHistory, {
@@ -1865,12 +1926,25 @@ const BuildingOccupancyPanel = ({ apiUrl, reportStartMs, reportEndMs, refreshTok
                 totalTraffic: Number(entrance?.total_in ?? 0) + Number(entrance?.total_out ?? 0),
                 currentOccupancy: Number(entrance?.occupancy ?? 0),
                 cameraCount: Array.isArray(entrance?.camera_ids) ? entrance.camera_ids.length : 0,
+                cameras: Object.entries(entrance?.camera_summaries ?? {})
+                    .map(([cameraId, camera]) => ({
+                        id: cameraId,
+                        totalIn: Number(camera?.total_in ?? 0),
+                        totalOut: Number(camera?.total_out ?? 0),
+                        totalTraffic: Number(camera?.total_in ?? 0) + Number(camera?.total_out ?? 0),
+                        currentOccupancy: Number(camera?.occupancy ?? 0),
+                    }))
+                    .sort((a, b) => Number(b.totalTraffic || 0) - Number(a.totalTraffic || 0)),
             }))
             .sort((a, b) => Number(b.totalTraffic || 0) - Number(a.totalTraffic || 0));
         const totalTraffic = liveEntries.reduce((sum, entry) => sum + Number(entry.totalTraffic || 0), 0);
         const entries = liveEntries.map((entry) => ({
             ...entry,
             share: totalTraffic > 0 ? (Number(entry.totalTraffic || 0) / totalTraffic) * 100 : 0,
+            cameras: (entry.cameras || []).map((camera) => ({
+                ...camera,
+                share: Number(entry.totalTraffic || 0) > 0 ? (Number(camera.totalTraffic || 0) / Number(entry.totalTraffic || 0)) * 100 : 0,
+            })),
         }));
 
         return {
@@ -1881,6 +1955,57 @@ const BuildingOccupancyPanel = ({ apiUrl, reportStartMs, reportEndMs, refreshTok
             busiestEntrance: entries[0] || null,
         };
     }, [buildingHistory, buildingSummary.entrance_summaries, panelRangeBounds]);
+    const entranceContributionWithCameraBreakdown = useMemo(() => {
+        const entries = entranceContribution.entries.map((entry) => {
+            const configuredCameraIds = Array.isArray(buildingSummary.entrance_summaries?.[entry.name]?.camera_ids)
+                ? buildingSummary.entrance_summaries[entry.name].camera_ids
+                : [];
+
+            if (!configuredCameraIds.length) {
+                return entry;
+            }
+
+            const cameras = configuredCameraIds
+                .map((cameraId) => {
+                    const summary = aggregateCountingFlow(
+                        countingSnapshots.filter((snapshot) => snapshot.camera_id === cameraId),
+                        {
+                            startMs: panelRangeBounds.valid ? panelRangeBounds.startMs : null,
+                            endMs: panelRangeBounds.valid ? panelRangeBounds.endMs : null,
+                            bucket: '1h',
+                        },
+                    );
+
+                    return {
+                        id: cameraId,
+                        totalIn: summary.totalIn,
+                        totalOut: summary.totalOut,
+                        totalTraffic: summary.totalTraffic,
+                        currentOccupancy: summary.estimatedOccupancy,
+                    };
+                })
+                .sort((a, b) => {
+                    const trafficDelta = Number(b.totalTraffic || 0) - Number(a.totalTraffic || 0);
+                    if (trafficDelta !== 0) return trafficDelta;
+                    return String(a.id || '').localeCompare(String(b.id || ''));
+                });
+
+            return {
+                ...entry,
+                cameraCount: Math.max(entry.cameraCount, cameras.length),
+                cameras: cameras.map((camera) => ({
+                    ...camera,
+                    share: Number(entry.totalTraffic || 0) > 0 ? (Number(camera.totalTraffic || 0) / Number(entry.totalTraffic || 0)) * 100 : 0,
+                })),
+            };
+        });
+
+        return {
+            ...entranceContribution,
+            entries,
+            busiestEntrance: entries[0] || null,
+        };
+    }, [buildingSummary.entrance_summaries, countingSnapshots, entranceContribution, panelRangeBounds]);
 
     const capacityUtilization = buildingSummary.max_capacity
         ? (Number(buildingSummary.occupancy ?? 0) / Number(buildingSummary.max_capacity)) * 100
@@ -1892,20 +2017,62 @@ const BuildingOccupancyPanel = ({ apiUrl, reportStartMs, reportEndMs, refreshTok
         Number(buildingSummary.occupancy ?? 0),
         Number(flowSummary.peakOccupancy ?? 0),
     );
-    const occupancyChartRangeLabel = timeRange === 'custom'
-        ? 'Custom range'
-        : timeRange === 'all'
-            ? 'All time'
-            : timeRange === '1h'
-                ? 'Last 1 hour'
-                : timeRange === '6h'
-                    ? 'Last 6 hours'
-                    : timeRange === '24h'
-                        ? 'Last 24 hours'
-                        : timeRange === '7d'
-                            ? 'Last 7 days'
-                            : 'Last 30 days';
+    const busiestCamera = useMemo(() => {
+        const cameras = entranceContributionWithCameraBreakdown.entries
+            .flatMap((entry) => (entry.cameras || []).map((camera) => ({
+                ...camera,
+                entranceName: entry.name,
+            })))
+            .sort((a, b) => {
+                const trafficDelta = Number(b.totalTraffic || 0) - Number(a.totalTraffic || 0);
+                if (trafficDelta !== 0) return trafficDelta;
+                return String(a.id || '').localeCompare(String(b.id || ''));
+            });
+        return cameras[0] || null;
+    }, [entranceContributionWithCameraBreakdown.entries]);
+    const entranceContributionChartData = useMemo(() => {
+        const totalTraffic = Number(entranceContributionWithCameraBreakdown.totalTraffic || 0);
+        const flattenedCameras = entranceContributionWithCameraBreakdown.entries
+            .flatMap((entry) => (entry.cameras || []).map((camera) => ({
+                id: camera.id,
+                name: cameraNameById?.[camera.id] || camera.id,
+                buildingId: entry.name,
+                totalIn: Number(camera.totalIn || 0),
+                totalOut: Number(camera.totalOut || 0),
+                totalTraffic: Number(camera.totalTraffic || 0),
+                currentOccupancy: Number(camera.currentOccupancy || 0),
+                shareOfBuilding: totalTraffic > 0 ? (Number(camera.totalTraffic || 0) / totalTraffic) * 100 : 0,
+            })))
+            .sort((a, b) => {
+                const shareDelta = Number(b.shareOfBuilding || 0) - Number(a.shareOfBuilding || 0);
+                if (shareDelta !== 0) return shareDelta;
+                return String(a.name || '').localeCompare(String(b.name || ''));
+            });
+
+        if (flattenedCameras.length > 0) {
+            return flattenedCameras;
+        }
+
+        return entranceContributionWithCameraBreakdown.entries.map((entry) => ({
+            id: entry.name,
+            name: `Building ${entry.name}`,
+            buildingId: entry.name,
+            totalIn: Number(entry.totalIn || 0),
+            totalOut: Number(entry.totalOut || 0),
+            totalTraffic: Number(entry.totalTraffic || 0),
+            currentOccupancy: Number(entry.currentOccupancy || 0),
+            shareOfBuilding: Number(entry.share || 0),
+        }));
+    }, [cameraNameById, entranceContributionWithCameraBreakdown]);
     const isDailyFlowView = effectiveBucket === '1d';
+    const toggleEntranceExpanded = useCallback((entranceId) => {
+        setExpandedEntranceIds((prev) => {
+            const next = new Set(prev);
+            if (next.has(entranceId)) next.delete(entranceId);
+            else next.add(entranceId);
+            return next;
+        });
+    }, []);
 
     if (!visible) return null;
 
@@ -1923,52 +2090,10 @@ const BuildingOccupancyPanel = ({ apiUrl, reportStartMs, reportEndMs, refreshTok
                                 Building-wide occupancy, throughput, and entrance contribution from persisted counting snapshots.
                             </p>
                         </div>
-                        <div className="flex flex-wrap items-center gap-2">
-                            <span className="text-xs font-medium text-muted-foreground">Range</span>
-                            <select
-                                value={timeRange}
-                                onChange={(e) => setTimeRange(e.target.value)}
-                                className="h-8 rounded-md border border-input bg-background px-2 text-xs"
-                            >
-                                <option value="1h">Last 1 hour</option>
-                                <option value="6h">Last 6 hours</option>
-                                <option value="24h">Last 24 hours</option>
-                                <option value="7d">Last 7 days</option>
-                                <option value="30d">Last 30 days</option>
-                                <option value="all">All time</option>
-                                <option value="custom">Custom range</option>
-                            </select>
-                            <span className="text-xs font-medium text-muted-foreground">Grouping</span>
-                            <select
-                                value={selectedBucket}
-                                onChange={(e) => setSelectedBucket(e.target.value)}
-                                className="h-8 rounded-md border border-input bg-background px-2 text-xs"
-                            >
-                                <option value="auto">Auto</option>
-                                <option value="15m">15 min</option>
-                                <option value="1h">Hourly</option>
-                                <option value="1d">Daily</option>
-                            </select>
+                        <div className="text-xs text-muted-foreground">
+                            Uses the global report range and building-only grouping control above.
                         </div>
                     </div>
-
-                    {timeRange === 'custom' && (
-                        <div className="flex flex-wrap items-center gap-2">
-                            <input
-                                type="datetime-local"
-                                value={customStart}
-                                onChange={(e) => setCustomStart(e.target.value)}
-                                className="h-8 rounded-md border border-input bg-background px-2 text-xs"
-                            />
-                            <span className="text-xs text-muted-foreground">to</span>
-                            <input
-                                type="datetime-local"
-                                value={customEnd}
-                                onChange={(e) => setCustomEnd(e.target.value)}
-                                className="h-8 rounded-md border border-input bg-background px-2 text-xs"
-                            />
-                        </div>
-                    )}
 
                     <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
                         <span>Building counting: {buildingSummary.enabled ? 'Enabled' : 'Disabled'}</span>
@@ -2002,19 +2127,19 @@ const BuildingOccupancyPanel = ({ apiUrl, reportStartMs, reportEndMs, refreshTok
                         <div className="rounded-xl border border-green-500/20 bg-green-500/10 p-4">
                             <div className="flex items-center gap-2 text-sm text-muted-foreground">
                                 <ArrowDownToLine className="h-4 w-4 text-green-600" />
-                                Today IN
+                                Range IN
                             </div>
-                            <div className="mt-2 text-3xl font-bold text-green-600">{formatNumber(todaySummary.totalIn)}</div>
-                            <div className="mt-1 text-xs text-muted-foreground">Since local midnight</div>
+                            <div className="mt-2 text-3xl font-bold text-green-600">{formatNumber(rangeSummary.totalIn)}</div>
+                            <div className="mt-1 text-xs text-muted-foreground">Within selected report range</div>
                         </div>
 
                         <div className="rounded-xl border border-red-500/20 bg-red-500/10 p-4">
                             <div className="flex items-center gap-2 text-sm text-muted-foreground">
                                 <ArrowUpFromLine className="h-4 w-4 text-red-600" />
-                                Today OUT
+                                Range OUT
                             </div>
-                            <div className="mt-2 text-3xl font-bold text-red-600">{formatNumber(todaySummary.totalOut)}</div>
-                            <div className="mt-1 text-xs text-muted-foreground">Since local midnight</div>
+                            <div className="mt-2 text-3xl font-bold text-red-600">{formatNumber(rangeSummary.totalOut)}</div>
+                            <div className="mt-1 text-xs text-muted-foreground">Within selected report range</div>
                         </div>
 
                         <div className="rounded-xl border border-blue-500/20 bg-blue-500/10 p-4">
@@ -2029,14 +2154,14 @@ const BuildingOccupancyPanel = ({ apiUrl, reportStartMs, reportEndMs, refreshTok
                         <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-4">
                             <div className="flex items-center gap-2 text-sm text-muted-foreground">
                                 <Target className="h-4 w-4 text-amber-600" />
-                                Busiest Entrance
+                                Busiest Camera
                             </div>
                             <div className="mt-2 text-xl font-bold text-amber-700">
-                                {entranceContribution.busiestEntrance?.name || '-'}
+                                {busiestCamera ? (cameraNameById?.[busiestCamera.id] || busiestCamera.id) : '-'}
                             </div>
                             <div className="mt-1 text-xs text-muted-foreground">
-                                {entranceContribution.busiestEntrance
-                                    ? `${formatNumber(entranceContribution.busiestEntrance.totalTraffic)} traffic | ${formatPercent(entranceContribution.busiestEntrance.share)}`
+                                {busiestCamera
+                                    ? `${formatNumber(busiestCamera.totalTraffic)} traffic | Building ID ${busiestCamera.entranceName}`
                                     : 'No entrance flow in range'}
                             </div>
                         </div>
@@ -2048,7 +2173,7 @@ const BuildingOccupancyPanel = ({ apiUrl, reportStartMs, reportEndMs, refreshTok
                 <CardHeader className="space-y-2">
                     <CardTitle>Building Occupancy</CardTitle>
                     <p className="text-sm text-muted-foreground">
-                        Current occupancy trend across {occupancyChartRangeLabel.toLowerCase()}.
+                        Current occupancy trend across the selected report range.
                     </p>
                 </CardHeader>
                 <CardContent className="flex-1">
@@ -2218,36 +2343,53 @@ const BuildingOccupancyPanel = ({ apiUrl, reportStartMs, reportEndMs, refreshTok
                 <CardHeader className="space-y-2">
                     <CardTitle>Entrance Contribution</CardTitle>
                     <p className="text-sm text-muted-foreground">
-                        Entrance-level share of building traffic for the selected range.
+                        Entrance-level contribution share of total building traffic for the selected range.
                     </p>
                 </CardHeader>
                 <CardContent className="grid gap-6 xl:grid-cols-[minmax(0,1.5fr)_320px]">
                     <div className="h-[320px]">
-                        {entranceContribution.entries.length > 0 ? (
+                        {entranceContributionChartData.length > 0 ? (
                             <ResponsiveContainer width="100%" height="100%">
                                 <BarChart
-                                    data={entranceContribution.entries}
+                                    data={entranceContributionChartData}
                                     layout="vertical"
-                                    margin={{ top: 10, right: 20, left: 20, bottom: 0 }}
+                                    margin={{ top: 10, right: 20, left: 0, bottom: 0 }}
+                                    barCategoryGap="28%"
                                 >
                                     <CartesianGrid strokeDasharray="3 3" className="stroke-muted" horizontal={false} />
-                                    <XAxis type="number" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} allowDecimals={false} />
+                                    <XAxis
+                                        type="number"
+                                        domain={[0, 100]}
+                                        className="text-xs text-muted-foreground"
+                                        tickLine={false}
+                                        axisLine={false}
+                                        tickFormatter={(value) => `${value}%`}
+                                    />
                                     <YAxis
                                         type="category"
                                         dataKey="name"
-                                        width={110}
+                                        width={120}
                                         className="text-xs text-muted-foreground"
                                         tickLine={false}
                                         axisLine={false}
                                     />
                                     <RechartsTooltip
-                                        formatter={(value, name) => [formatNumber(value), name]}
-                                        labelFormatter={(value) => `${value}`}
+                                        cursor={{ fill: 'transparent' }}
+                                        formatter={(value, name, item) => {
+                                            if (name === 'Contribution') {
+                                                return [`${Number(value || 0).toFixed(1)}%`, name];
+                                            }
+                                            return [formatNumber(value), name];
+                                        }}
+                                        labelFormatter={(_, payload) => {
+                                            const row = payload?.[0]?.payload;
+                                            if (!row) return '';
+                                            return `${row.name}${row.buildingId ? ` | Building ID ${row.buildingId}` : ''}`;
+                                        }}
                                         contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
                                     />
                                     <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
-                                    <Bar dataKey="totalIn" name="In" fill="#22c55e" radius={[0, 4, 4, 0]} maxBarSize={24} />
-                                    <Bar dataKey="totalOut" name="Out" fill="#ef4444" radius={[0, 4, 4, 0]} maxBarSize={24} />
+                                    <Bar dataKey="shareOfBuilding" name="Contribution" fill="#2563eb" radius={[0, 4, 4, 0]} maxBarSize={18} />
                                 </BarChart>
                             </ResponsiveContainer>
                         ) : (
@@ -2259,28 +2401,60 @@ const BuildingOccupancyPanel = ({ apiUrl, reportStartMs, reportEndMs, refreshTok
 
                     <div className="space-y-3">
                         <div className="rounded-xl border border-muted bg-muted/20 p-4">
-                            <div className="text-xs uppercase tracking-wide text-muted-foreground">Busiest Entrance</div>
-                            <div className="mt-2 text-2xl font-bold">{entranceContribution.busiestEntrance?.name || '-'}</div>
+                            <div className="text-xs uppercase tracking-wide text-muted-foreground">Busiest Camera</div>
+                            <div className="mt-2 text-2xl font-bold">
+                                {busiestCamera ? (cameraNameById?.[busiestCamera.id] || busiestCamera.id) : '-'}
+                            </div>
                             <div className="mt-1 text-sm text-muted-foreground">
-                                {entranceContribution.busiestEntrance
-                                    ? `${formatNumber(entranceContribution.busiestEntrance.totalTraffic)} total movements`
-                                    : 'No building entrance activity yet'}
+                                {busiestCamera
+                                    ? `${formatNumber(busiestCamera.totalTraffic)} traffic | Building ID ${busiestCamera.entranceName}`
+                                    : 'No building camera activity yet'}
                             </div>
                         </div>
 
                         <div className="space-y-2">
-                            {entranceContribution.entries.slice(0, 5).map((entry) => (
+                            {entranceContributionWithCameraBreakdown.entries.slice(0, 5).map((entry) => (
                                 <div key={entry.name} className="rounded-xl border p-3">
-                                    <div className="flex items-center justify-between gap-3">
-                                        <div className="font-medium">{entry.name}</div>
-                                        <div className="text-sm text-muted-foreground">{formatPercent(entry.share)}</div>
+                                    <div className="flex items-start justify-between gap-3">
+                                        <div className="min-w-0 flex-1">
+                                            <div className="font-medium">{entry.name}</div>
+                                            <div className="mt-2 flex flex-wrap items-center gap-3 text-xs">
+                                                <span className="text-green-600">IN: {formatNumber(entry.totalIn)}</span>
+                                                <span className="text-red-600">OUT: {formatNumber(entry.totalOut)}</span>
+                                                <span className="text-muted-foreground">Cameras: {entry.cameraCount}</span>
+                                            </div>
+                                        </div>
+                                        <div className="flex items-center gap-2">
+                                            <div className="text-sm text-muted-foreground">{formatPercent(entry.share)}</div>
+                                            {entry.cameras?.length > 0 && (
+                                                <button
+                                                    type="button"
+                                                    onClick={() => toggleEntranceExpanded(entry.name)}
+                                                    className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-slate-200 text-muted-foreground transition-colors hover:bg-slate-50 hover:text-foreground"
+                                                    aria-label={expandedEntranceIds.has(entry.name) ? `Collapse ${entry.name}` : `Expand ${entry.name}`}
+                                                >
+                                                    {expandedEntranceIds.has(entry.name) ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+                                                </button>
+                                            )}
+                                        </div>
                                     </div>
-                                    <div className="mt-2 flex flex-wrap items-center gap-3 text-xs">
-                                        <span className="text-green-600">IN: {formatNumber(entry.totalIn)}</span>
-                                        <span className="text-red-600">OUT: {formatNumber(entry.totalOut)}</span>
-                                        <span className="text-primary">NOW: {formatNumber(entry.currentOccupancy)}</span>
-                                        <span className="text-muted-foreground">Cameras: {entry.cameraCount}</span>
-                                    </div>
+                                    {expandedEntranceIds.has(entry.name) && entry.cameras?.length > 0 && (
+                                        <div className="mt-3 space-y-2 border-t border-slate-200 pt-3">
+                                            {entry.cameras.map((camera) => (
+                                                <div key={camera.id} className="rounded-lg bg-slate-50/90 px-3 py-2 text-xs">
+                                                    <div className="flex items-center justify-between gap-3">
+                                                        <div className="font-medium text-foreground">{cameraNameById?.[camera.id] || camera.id}</div>
+                                                        <div className="text-muted-foreground">{formatPercent(camera.share)}</div>
+                                                    </div>
+                                                    <div className="mt-1 flex flex-wrap items-center gap-3">
+                                                        <span className="text-green-600">IN: {formatNumber(camera.totalIn)}</span>
+                                                        <span className="text-red-600">OUT: {formatNumber(camera.totalOut)}</span>
+                                                        <span className="text-slate-700">TRAFFIC: {formatNumber(camera.totalTraffic)}</span>
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
                                 </div>
                             ))}
                         </div>
@@ -2553,13 +2727,22 @@ const Reporting = () => {
     const [selectedCategory, setSelectedCategory] = useState('All');
     const [selectedPeopleCountingView, setSelectedPeopleCountingView] = useState('building');
     const [selectedCameraFilter, setSelectedCameraFilter] = useState('all');
-    const [selectedQuickRange, setSelectedQuickRange] = useState('7d');
+    const [selectedQuickRange, setSelectedQuickRange] = useState('today');
+    const [buildingGrouping, setBuildingGrouping] = useState('auto');
     const [startDate, setStartDate] = useState(() => {
-        const bounds = getQuickRangeDateBounds('7d', '', '');
+        const bounds = getQuickRangeDateBounds('today', '', '');
         return bounds.startDate;
     });
     const [endDate, setEndDate] = useState(() => {
-        const bounds = getQuickRangeDateBounds('7d', '', '');
+        const bounds = getQuickRangeDateBounds('today', '', '');
+        return bounds.endDate;
+    });
+    const [draftStartDate, setDraftStartDate] = useState(() => {
+        const bounds = getQuickRangeDateBounds('today', '', '');
+        return bounds.startDate;
+    });
+    const [draftEndDate, setDraftEndDate] = useState(() => {
+        const bounds = getQuickRangeDateBounds('today', '', '');
         return bounds.endDate;
     });
     const [selectedRecord, setSelectedRecord] = useState(null);
@@ -2567,6 +2750,32 @@ const Reporting = () => {
     const [currentPage, setCurrentPage] = useState(1);
     const [rowsPerPage, setRowsPerPage] = useState(20);
     const [refreshToken, setRefreshToken] = useState(0);
+    const effectiveDateRange = useMemo(
+        () => getQuickRangeDateBounds(selectedQuickRange, startDate, endDate),
+        [selectedQuickRange, startDate, endDate],
+    );
+    const effectiveStartDate = effectiveDateRange.startDate;
+    const effectiveEndDate = effectiveDateRange.endDate;
+    const isCustomQuickRange = selectedQuickRange === 'custom';
+    const draftDateBounds = useMemo(
+        () => getDateRangeBounds(draftStartDate, draftEndDate),
+        [draftEndDate, draftStartDate],
+    );
+    const isCustomRangeValid = (
+        draftDateBounds.startMs != null
+        && draftDateBounds.endMs != null
+        && draftDateBounds.startMs <= draftDateBounds.endMs
+    );
+    const isCustomRangeDirty = draftStartDate !== startDate || draftEndDate !== endDate;
+    const reportingDateBounds = getDateRangeBounds(effectiveStartDate, effectiveEndDate);
+    const reportingStartParam = useMemo(
+        () => toApiDateTimeParam(reportingDateBounds.startMs),
+        [reportingDateBounds.startMs],
+    );
+    const reportingEndParam = useMemo(
+        () => toApiDateTimeParam(reportingDateBounds.endMs),
+        [reportingDateBounds.endMs],
+    );
 
     // Fetch cameras
     useEffect(() => {
@@ -2587,15 +2796,21 @@ const Reporting = () => {
     const fetchEvents = useCallback(async () => {
         setLoading(true);
         try {
-            let url = `${apiUrl}/api/detection-events?limit=200`;
+            const params = new URLSearchParams();
+            appendQueryParam(params, 'limit', 200);
             if (selectedCategory === 'Dress Code') {
-                url += '&event_type=Dress Code Violation';
+                appendQueryParam(params, 'event_type', 'Dress Code Violation');
             } else if (selectedCategory === 'Fall Detection') {
-                url += '&event_type=Fall Detected';
+                appendQueryParam(params, 'event_type', 'Fall Detected');
             } else if (selectedCategory === 'People Counting') {
-                url += '&event_type=Capacity Exceeded';
+                appendQueryParam(params, 'event_type', 'Capacity Exceeded');
             }
-            const res = await fetch(url);
+            if (selectedCameraFilter !== 'all') {
+                appendQueryParam(params, 'camera_id', selectedCameraFilter);
+            }
+            appendQueryParam(params, 'start', reportingStartParam);
+            appendQueryParam(params, 'end', reportingEndParam);
+            const res = await fetch(`${apiUrl}/api/detection-events?${params.toString()}`);
             const data = await res.json();
             setEvents(data);
         } catch (err) {
@@ -2603,11 +2818,16 @@ const Reporting = () => {
         } finally {
             setLoading(false);
         }
-    }, [apiUrl, selectedCategory]);
+    }, [apiUrl, reportingEndParam, reportingStartParam, selectedCameraFilter, selectedCategory]);
 
     // Fetch counting snapshots when People Counting category is selected
     const fetchCountingSnapshots = useCallback(async () => {
-        if (selectedCategory !== 'People Counting' && selectedCategory !== 'Dress Code' && selectedCategory !== 'All') {
+        const needsCountingSnapshots = (
+            selectedCategory === 'Dress Code'
+            || selectedCategory === 'All'
+            || selectedCategory === 'People Counting'
+        );
+        if (!needsCountingSnapshots) {
             setCountingSnapshots([]);
             return;
         }
@@ -2616,8 +2836,16 @@ const Reporting = () => {
             let offset = 0;
 
             while (offset < MAX_COUNTING_HISTORY_ROWS) {
+                const params = new URLSearchParams();
+                appendQueryParam(params, 'limit', SNAPSHOT_PAGE_SIZE);
+                appendQueryParam(params, 'offset', offset);
+                if (selectedCameraFilter !== 'all') {
+                    appendQueryParam(params, 'camera_id', selectedCameraFilter);
+                }
+                appendQueryParam(params, 'start', reportingStartParam);
+                appendQueryParam(params, 'end', reportingEndParam);
                 const res = await fetch(
-                    `${apiUrl}/api/people-counting-history?limit=${SNAPSHOT_PAGE_SIZE}&offset=${offset}`,
+                    `${apiUrl}/api/people-counting-history?${params.toString()}`,
                 );
                 if (!res.ok) break;
 
@@ -2642,7 +2870,14 @@ const Reporting = () => {
         } catch (err) {
             console.error("Failed to fetch counting snapshots:", err);
         }
-    }, [apiUrl, selectedCategory]);
+    }, [
+        apiUrl,
+        reportingEndParam,
+        reportingStartParam,
+        selectedCameraFilter,
+        selectedCategory,
+        selectedPeopleCountingView,
+    ]);
 
     useEffect(() => {
         fetchEvents();
@@ -2652,8 +2887,7 @@ const Reporting = () => {
 
     useEffect(() => {
         fetchCountingSnapshots();
-        const interval = setInterval(fetchCountingSnapshots, 15000);
-        return () => clearInterval(interval);
+        return undefined;
     }, [fetchCountingSnapshots]);
 
     const cameraNameById = cameras.reduce((acc, cam) => {
@@ -2685,15 +2919,6 @@ const Reporting = () => {
             .map(([id, name]) => ({ id, name }))
             .sort((a, b) => a.name.localeCompare(b.name));
     }, [cameras, events, countingSnapshots]);
-    const effectiveDateRange = useMemo(
-        () => getQuickRangeDateBounds(selectedQuickRange, startDate, endDate),
-        [selectedQuickRange, startDate, endDate],
-    );
-    const effectiveStartDate = effectiveDateRange.startDate;
-    const effectiveEndDate = effectiveDateRange.endDate;
-    const isCustomQuickRange = selectedQuickRange === 'custom';
-    const reportingDateBounds = getDateRangeBounds(effectiveStartDate, effectiveEndDate);
-
     // Date filter helper
     const dateFilter = (timestamp) => {
         const tsMs = getTimestampMs(timestamp);
@@ -2818,8 +3043,26 @@ const Reporting = () => {
         }
     }, [currentPage, totalPages]);
 
+    useEffect(() => {
+        if (!isCustomQuickRange) {
+            setDraftStartDate(effectiveStartDate);
+            setDraftEndDate(effectiveEndDate);
+        }
+    }, [effectiveEndDate, effectiveStartDate, isCustomQuickRange]);
+
     // Handlers
     const handleCategoryChange = (cat) => setSelectedCategory(cat);
+    const applyCustomRange = useCallback(() => {
+        if (!isCustomRangeValid) return;
+        setStartDate(draftStartDate);
+        setEndDate(draftEndDate);
+    }, [draftEndDate, draftStartDate, isCustomRangeValid]);
+    const handleCustomRangeKeyDown = useCallback((event) => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            applyCustomRange();
+        }
+    }, [applyCustomRange]);
 
     const handleDownload = (format) => {
         setShowExportModal(false);
@@ -2938,8 +3181,12 @@ const Reporting = () => {
                     <div className={cn(
                         "grid gap-4 xl:items-end",
                         isPeopleCountingBuildingView
-                            ? "xl:grid-cols-[minmax(180px,0.8fr)_minmax(180px,1fr)_minmax(180px,1fr)_auto]"
-                            : "xl:grid-cols-[minmax(180px,0.8fr)_minmax(180px,1fr)_minmax(180px,1fr)_minmax(220px,1fr)_auto]",
+                            ? (isCustomQuickRange
+                                ? "xl:grid-cols-[minmax(180px,0.8fr)_minmax(180px,1fr)_minmax(180px,1fr)_minmax(140px,0.6fr)_auto_auto]"
+                                : "xl:grid-cols-[minmax(180px,0.8fr)_minmax(180px,1fr)_minmax(180px,1fr)_minmax(140px,0.6fr)_auto]")
+                            : (isCustomQuickRange
+                                ? "xl:grid-cols-[minmax(180px,0.8fr)_minmax(180px,1fr)_minmax(180px,1fr)_minmax(220px,1fr)_auto_auto]"
+                                : "xl:grid-cols-[minmax(180px,0.8fr)_minmax(180px,1fr)_minmax(180px,1fr)_minmax(220px,1fr)_auto]"),
                     )}>
                         <div className="space-y-2">
                             <label className="text-sm font-medium">Quick Range</label>
@@ -2964,8 +3211,9 @@ const Reporting = () => {
                                     type="datetime-local"
                                     disabled={!isCustomQuickRange}
                                     className={cn("h-10 w-full rounded-md border px-3 py-2 pl-9 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:bg-muted/30", REPORT_INPUT_CLASS)}
-                                    value={isCustomQuickRange ? startDate : effectiveStartDate}
-                                    onChange={(e) => setStartDate(e.target.value)}
+                                    value={isCustomQuickRange ? draftStartDate : effectiveStartDate}
+                                    onChange={(e) => setDraftStartDate(e.target.value)}
+                                    onKeyDown={handleCustomRangeKeyDown}
                                 />
                             </div>
                         </div>
@@ -2978,13 +3226,28 @@ const Reporting = () => {
                                     type="datetime-local"
                                     disabled={!isCustomQuickRange}
                                     className={cn("h-10 w-full rounded-md border px-3 py-2 pl-9 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:bg-muted/30", REPORT_INPUT_CLASS)}
-                                    value={isCustomQuickRange ? endDate : effectiveEndDate}
-                                    onChange={(e) => setEndDate(e.target.value)}
+                                    value={isCustomQuickRange ? draftEndDate : effectiveEndDate}
+                                    onChange={(e) => setDraftEndDate(e.target.value)}
+                                    onKeyDown={handleCustomRangeKeyDown}
                                 />
                             </div>
                         </div>
 
-                        {!isPeopleCountingBuildingView && (
+                        {isPeopleCountingBuildingView ? (
+                            <div className="space-y-2">
+                                <label className="text-sm font-medium">Grouping</label>
+                                <select
+                                    className={cn("h-10 w-full rounded-md border px-3 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring", REPORT_INPUT_CLASS)}
+                                    value={buildingGrouping}
+                                    onChange={(e) => setBuildingGrouping(e.target.value)}
+                                >
+                                    <option value="auto">Auto</option>
+                                    <option value="15m">15 min</option>
+                                    <option value="1h">Hourly</option>
+                                    <option value="1d">Daily</option>
+                                </select>
+                            </div>
+                        ) : (
                             <div className="space-y-2">
                                 <label className="text-sm font-medium">Camera</label>
                                 <select
@@ -2997,6 +3260,20 @@ const Reporting = () => {
                                         <option key={cam.id} value={cam.id}>{cam.name || cam.id}</option>
                                     ))}
                                 </select>
+                            </div>
+                        )}
+
+                        {isCustomQuickRange && (
+                            <div className="space-y-2 xl:self-end">
+                                <label className="text-sm font-medium opacity-0">Apply</label>
+                                <Button
+                                    variant="outline"
+                                    className="h-10 border-slate-200 bg-white"
+                                    onClick={applyCustomRange}
+                                    disabled={!isCustomRangeDirty || !isCustomRangeValid}
+                                >
+                                    Apply
+                                </Button>
                             </div>
                         )}
 
@@ -3028,8 +3305,11 @@ const Reporting = () => {
                     apiUrl={apiUrl}
                     reportStartMs={reportingDateBounds.startMs}
                     reportEndMs={reportingDateBounds.endMs}
+                    selectedBucket={buildingGrouping}
                     refreshToken={refreshToken}
                     visible={isPeopleCountingBuildingView}
+                    cameraNameById={cameraNameById}
+                    countingSnapshots={filteredSnapshots}
                 />
 
                 <BuildingAlertsPanel

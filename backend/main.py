@@ -42,67 +42,102 @@ def configure_uvicorn_access_log_filter() -> None:
     access_logger.addFilter(UvicornAccessPathFilter())
 
 
+def should_bootstrap_schema() -> bool:
+    return os.getenv("ENABLE_DEV_SCHEMA_BOOTSTRAP", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Create tables if they don't exist (dev convenience). In production use Alembic."""
+    """App lifespan hooks. Prefer Alembic migrations for schema management."""
     configure_uvicorn_access_log_filter()
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        await conn.execute(
-            sa.text(
-                "ALTER TABLE stream_configs "
-                "ADD COLUMN IF NOT EXISTS detection_roi JSON"
+    if should_bootstrap_schema():
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            await conn.execute(
+                sa.text(
+                    "ALTER TABLE stream_configs "
+                    "ADD COLUMN IF NOT EXISTS runtime_key VARCHAR(1500)"
+                )
             )
-        )
-        await conn.execute(
-            sa.text(
-                "ALTER TABLE people_counting_configs "
-                "ADD COLUMN IF NOT EXISTS cross_camera_enabled BOOLEAN NOT NULL DEFAULT FALSE"
+            await conn.execute(
+                sa.text(
+                    "UPDATE stream_configs "
+                    "SET runtime_key = source_path "
+                    "WHERE runtime_key IS NULL OR runtime_key = ''"
+                )
             )
-        )
-        await conn.execute(
-            sa.text(
-                "ALTER TABLE people_counting_configs "
-                "ADD COLUMN IF NOT EXISTS cross_camera_pair_id VARCHAR(100)"
+            await conn.execute(
+                sa.text(
+                    "ALTER TABLE stream_configs "
+                    "ALTER COLUMN runtime_key SET NOT NULL"
+                )
             )
-        )
-        await conn.execute(
-            sa.text(
-                "ALTER TABLE people_counting_configs "
-                "ADD COLUMN IF NOT EXISTS cross_camera_role VARCHAR(20) NOT NULL DEFAULT 'none'"
+            await conn.execute(
+                sa.text(
+                    "CREATE INDEX IF NOT EXISTS ix_stream_configs_runtime_key "
+                    "ON stream_configs (runtime_key)"
+                )
             )
-        )
-        await conn.execute(
-            sa.text(
-                "ALTER TABLE people_counting_configs "
-                "ADD COLUMN IF NOT EXISTS verification_camera_id VARCHAR"
+            await conn.execute(
+                sa.text(
+                    "ALTER TABLE stream_configs "
+                    "ADD COLUMN IF NOT EXISTS detection_roi JSON"
+                )
             )
-        )
-        await conn.execute(
-            sa.text(
-                "ALTER TABLE people_counting_configs "
-                "ADD COLUMN IF NOT EXISTS verification_inward_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.02"
+            await conn.execute(
+                sa.text(
+                    "ALTER TABLE people_counting_configs "
+                    "ADD COLUMN IF NOT EXISTS cross_camera_enabled BOOLEAN NOT NULL DEFAULT FALSE"
+                )
             )
-        )
-        await conn.execute(
-            sa.text(
-                "ALTER TABLE people_counting_snapshots "
-                "ADD COLUMN IF NOT EXISTS foot_traffic_left INTEGER NOT NULL DEFAULT 0"
+            await conn.execute(
+                sa.text(
+                    "ALTER TABLE people_counting_configs "
+                    "ADD COLUMN IF NOT EXISTS cross_camera_pair_id VARCHAR(100)"
+                )
             )
-        )
-        await conn.execute(
-            sa.text(
-                "ALTER TABLE people_counting_snapshots "
-                "ADD COLUMN IF NOT EXISTS foot_traffic_right INTEGER NOT NULL DEFAULT 0"
+            await conn.execute(
+                sa.text(
+                    "ALTER TABLE people_counting_configs "
+                    "ADD COLUMN IF NOT EXISTS cross_camera_role VARCHAR(20) NOT NULL DEFAULT 'none'"
+                )
             )
-        )
-        await conn.execute(
-            sa.text(
-                "ALTER TABLE people_counting_snapshots "
-                "ADD COLUMN IF NOT EXISTS foot_traffic_total INTEGER NOT NULL DEFAULT 0"
+            await conn.execute(
+                sa.text(
+                    "ALTER TABLE people_counting_configs "
+                    "ADD COLUMN IF NOT EXISTS verification_camera_id VARCHAR"
+                )
             )
-        )
+            await conn.execute(
+                sa.text(
+                    "ALTER TABLE people_counting_configs "
+                    "ADD COLUMN IF NOT EXISTS verification_inward_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.02"
+                )
+            )
+            await conn.execute(
+                sa.text(
+                    "ALTER TABLE people_counting_snapshots "
+                    "ADD COLUMN IF NOT EXISTS foot_traffic_left INTEGER NOT NULL DEFAULT 0"
+                )
+            )
+            await conn.execute(
+                sa.text(
+                    "ALTER TABLE people_counting_snapshots "
+                    "ADD COLUMN IF NOT EXISTS foot_traffic_right INTEGER NOT NULL DEFAULT 0"
+                )
+            )
+            await conn.execute(
+                sa.text(
+                    "ALTER TABLE people_counting_snapshots "
+                    "ADD COLUMN IF NOT EXISTS foot_traffic_total INTEGER NOT NULL DEFAULT 0"
+                )
+            )
 
     # Ensure the default admin account exists when the database is reachable.
     try:

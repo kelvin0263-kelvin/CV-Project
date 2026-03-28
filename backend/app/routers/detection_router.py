@@ -11,8 +11,9 @@ processor thread and persist events to the database.
 import os
 import asyncio
 from typing import Optional
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
@@ -31,21 +32,40 @@ PROJECT_ROOT = os.path.dirname(BACKEND_ROOT)
 SNAPSHOT_DIR = os.path.join(PROJECT_ROOT, "temp_video_uploads", "snapshots")
 
 
+def _normalize_query_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
 @router.get("/api/detection-events", response_model=list[DetectionEventRead])
 async def list_detection_events(
     camera_id: Optional[str] = Query(None),
     event_type: Optional[str] = Query(None),
+    start: datetime | None = Query(None),
+    end: datetime | None = Query(None),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
 ):
     """List detection events with optional filters, newest first."""
+    start = _normalize_query_datetime(start)
+    end = _normalize_query_datetime(end)
+    if start is not None and end is not None and start > end:
+        raise HTTPException(status_code=400, detail="start must be earlier than or equal to end")
+
     query = select(DetectionEvent).order_by(desc(DetectionEvent.timestamp))
 
     if camera_id:
         query = query.where(DetectionEvent.camera_id == camera_id)
     if event_type:
         query = query.where(DetectionEvent.event_type == event_type)
+    if start is not None:
+        query = query.where(DetectionEvent.timestamp >= start)
+    if end is not None:
+        query = query.where(DetectionEvent.timestamp <= end)
 
     query = query.offset(offset).limit(limit)
     result = await db.execute(query)

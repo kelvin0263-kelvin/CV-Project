@@ -246,7 +246,7 @@ const PeopleCounting = () => {
                 setFrameExcludeAreas(filterValidFrameExcludeAreas(data.frame_exclude_areas));
                 setEnabled(data.enabled ?? true);
                 setParticipateInBuildingCount(data.participate_in_building_count ?? false);
-                setEntranceId(data.entrance_id || '');
+                setEntranceId(data.building_id || data.entrance_id || '');
                 setCrossCameraEnabled(data.cross_camera_enabled ?? false);
                 setCrossCameraPairId(data.cross_camera_pair_id || '');
                 setCrossCameraRole(data.cross_camera_role || 'none');
@@ -322,7 +322,7 @@ const PeopleCounting = () => {
             : 'none';
 
         if (participateInBuildingCount && !entranceId.trim()) {
-            setSaveMessage('Error: entrance ID is required for building counting.');
+            setSaveMessage('Error: building ID is required for building counting.');
             setTimeout(() => setSaveMessage(''), 3000);
             return;
         }
@@ -346,7 +346,7 @@ const PeopleCounting = () => {
             const body = {
                 enabled,
                 participate_in_building_count: participateInBuildingCount,
-                entrance_id: participateInBuildingCount ? entranceId.trim() : null,
+                building_id: participateInBuildingCount ? entranceId.trim() : null,
                 cross_camera_enabled: crossCameraEnabled,
                 cross_camera_pair_id: crossCameraEnabled ? crossCameraPairId.trim() : null,
                 cross_camera_role: effectiveCrossCameraRole,
@@ -371,7 +371,7 @@ const PeopleCounting = () => {
             setFrameExcludeAreas(filterValidFrameExcludeAreas(savedConfig.frame_exclude_areas));
             setEnabled(savedConfig.enabled ?? true);
             setParticipateInBuildingCount(savedConfig.participate_in_building_count ?? false);
-            setEntranceId(savedConfig.entrance_id || '');
+            setEntranceId(savedConfig.building_id || savedConfig.entrance_id || '');
             setCrossCameraEnabled(savedConfig.cross_camera_enabled ?? false);
             setCrossCameraPairId(savedConfig.cross_camera_pair_id || '');
             setCrossCameraRole(savedConfig.cross_camera_role || 'none');
@@ -752,18 +752,18 @@ const PeopleCounting = () => {
                 {drawingMode === 'frame_exclude' && <p className="text-xs text-muted-foreground">Click around the preview to place points, then double-click to close the area.</p>}
             </SectionShell>
 
-            <SectionShell title="Building Entrance Group" description="Only cameras with the same entrance ID are merged into one building entrance total.">
+            <SectionShell title="Building Entrance Group" description="Only cameras with the same building ID are merged into one building entrance total.">
                 <div className="flex items-center justify-between rounded-2xl border border-border/70 bg-background px-4 py-3">
                     <div>
-                        <div className="text-sm font-medium">Participates in Building Count</div>
-                        <div className="text-xs text-muted-foreground">Turn this on only for actual entrance cameras.</div>
+                        <div className="text-sm font-medium">Use Building ID</div>
+                        <div className="text-xs text-muted-foreground">Turn this on only for cameras that should belong to a building group.</div>
                     </div>
                     <Toggle checked={participateInBuildingCount} onClick={() => setParticipateInBuildingCount(!participateInBuildingCount)} />
                 </div>
                 {participateInBuildingCount && (
                     <div className="space-y-2">
-                        <label className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Entrance ID</label>
-                        <input type="text" className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm" value={entranceId} onChange={(e) => setEntranceId(e.target.value)} placeholder="entrance_1" />
+                        <label className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Building ID</label>
+                        <input type="text" className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm" value={entranceId} onChange={(e) => setEntranceId(e.target.value)} placeholder="building_1" />
                     </div>
                 )}
             </SectionShell>

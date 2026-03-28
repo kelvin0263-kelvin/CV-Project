@@ -10,6 +10,18 @@ Supports:
    counts when its probe point is inside the configured active zone.
 
 All coordinates are stored in normalized (0-1) form.
+
+High-level execution order:
+1. `PeopleCounter(config)` loads lines/zones, prepares runtime state, and
+   synchronizes per-line dictionaries.
+2. `update(detections, frame_shape)` runs once per frame.
+3. Each detection is normalized into anchor points and frame-age tracking data.
+4. Each configured line routes the track through either occupancy logic
+   (`_update_line_track_state`) or foot-traffic logic
+   (`_update_foot_traffic_track_state`).
+5. After line updates, disappear cleanup and fallback counting run.
+6. A result payload is returned, and snapshot helpers can be called separately
+   by the outer pipeline when persistence is needed.
 """
 
 import math
@@ -67,6 +79,7 @@ class _LineTrackState:
     )
 
     def __init__(self):
+        """Helper initializer: creates per-track occupancy state used only inside `PeopleCounter`."""
         self.last_seen_time: float = time.time()
         self.frame_count: int = 0
         self.birth_point: tuple[float, float] = (0.0, 0.0)
@@ -84,6 +97,7 @@ class _CountedTrackRecord:
     __slots__ = ("direction", "source", "count_time", "visible_streak_after_count", "uncounted")
 
     def __init__(self, direction: str, source: str, count_time: float):
+        """Helper initializer: stores one counted-track record so duplicate line events can be blocked."""
         self.direction = direction
         self.source = source
         self.count_time = count_time
@@ -106,6 +120,7 @@ class _FootTrafficTrackState:
     )
 
     def __init__(self):
+        """Helper initializer: creates per-track foot-traffic state for internal line-cross checks."""
         self.last_seen_time: float = time.time()
         self.last_point: tuple[float, float] = (0.0, 0.0)
         self.last_side_value: float = 0.0
@@ -117,6 +132,7 @@ class _FootTrafficTrackState:
 
 
 def _extract_active_zones(config: dict) -> list[dict]:
+    """Helper function: normalizes active-zone polygons from config before counting starts."""
     normalized: list[dict] = []
     raw_areas = config.get("active_zones")
     if raw_areas is None:
@@ -135,19 +151,21 @@ def _extract_active_zones(config: dict) -> list[dict]:
     return normalized
 
 
-# counter = PeopleCounter(config)
 class PeopleCounter:
     """Stateful line-only people counter for a single camera/view."""
 
-   
+    # Setup call sequence:
+    # 1. `PeopleCounter(config)` is called by the outer service.
+    # 2. `_extract_active_zones(config)` normalizes polygons.
+    # 3. `_build_line_signature(self.lines)` creates a config fingerprint.
+    # 4. `_sync_line_track_states()` prepares runtime dictionaries.
     def __init__(self, config: dict):
-         # 1 read config
+        """Core function: initializes one counter instance from camera config before frame updates begin."""
         self.lines = config.get("lines", [])
         self.active_zones = _extract_active_zones(config)
         self.frame_exclude_areas = self.active_zones
         self.enabled = config.get("enabled", True)
 
-        # init all the variable
         self._line_track_states: dict[str, dict[int, _LineTrackState]] = {}
         self._foot_traffic_track_states: dict[str, dict[int, _FootTrafficTrackState]] = {}
         self._line_track_frame_totals: dict[int, int] = {}
@@ -174,7 +192,24 @@ class PeopleCounter:
         self._last_snapshot_time = time.time()
         self._last_snapshot_signature: tuple[int, int, int] | None = None
 
+    # Per-frame call sequence:
+    # 1. `update(detections, frame_shape)` starts one frame cycle.
+    # 2. `_cleanup_in_cooldown(now)` removes expired cooldown entries.
+    # 3. Anchor helpers normalize each detection:
+    #    `_bbox_bottom_center_point`, `_bbox_line_target_point`,
+    #    `_bbox_frame_accumulation_point`.
+    # 4. `_should_accumulate_track_frames(...)` updates frame-age totals.
+    # 5. For each line:
+    #    `_line_state_key(...)` -> `_bbox_line_target_point(...)` ->
+    #    `_line_type(...)` ->
+    #    `_update_line_track_state(...)` or `_update_foot_traffic_track_state(...)`.
+    # 6. End-of-frame cleanup:
+    #    `_process_line_disappears(...)` ->
+    #    `_cleanup_foot_traffic_tracks(...)` ->
+    #    `_process_count_reversions(...)`.
+    # 7. `_build_foot_traffic_summary()` helps build the final return payload.
     def update(self, detections: list[dict], frame_shape: tuple[int, int]) -> dict:
+        """Core function: call once per frame with detections and `(height, width)` to update counts."""
         if not self.enabled:
             return self._empty_result()
 
@@ -287,7 +322,12 @@ class PeopleCounter:
             "frame_exclude_areas": self.frame_exclude_areas,
         }
 
+    # Snapshot decision sequence:
+    # 1. Usually called after `update()`.
+    # 2. Compares current totals with the last saved signature.
+    # 3. Returns `True` on first run, on count change, or on heartbeat timeout.
     def should_snapshot(self, heartbeat_interval: float = 300.0) -> bool:
+        """Core helper: tells the caller when current totals should be persisted or emitted again."""
         now = time.time()
         occupancy = max(0, self.total_in - self.total_out)
         current_signature = (
@@ -315,7 +355,12 @@ class PeopleCounter:
 
         return False
 
+    # Snapshot payload sequence:
+    # 1. Usually called only if `should_snapshot()` returned `True`.
+    # 2. Reads current totals from memory.
+    # 3. Builds a database-friendly payload for one camera snapshot.
     def get_snapshot_data(self, camera_id: str) -> dict:
+        """Core helper: builds a snapshot payload for storing the current totals of one camera."""
         occupancy = max(0, self.total_in - self.total_out)
         return {
             "id": str(uuid.uuid4()),
@@ -329,8 +374,13 @@ class PeopleCounter:
             "foot_traffic_total": self.foot_traffic_left + self.foot_traffic_right,
         }
 
+    # Config reload sequence:
+    # 1. Replace current line, zone, and timeout settings.
+    # 2. Rebuild the line signature.
+    # 3. Reset per-line runtime dictionaries only if the line set changed.
+    # 4. Synchronize state containers with the active lines.
     def update_config(self, config: dict):
-        """Hot-reload config without resetting counts."""
+        """Core function: hot-reloads line and zone settings while preserving accumulated counts."""
         self.lines = config.get("lines", [])
         self.active_zones = _extract_active_zones(config)
         self.frame_exclude_areas = self.active_zones
@@ -345,8 +395,12 @@ class PeopleCounter:
             self._line_signature = new_line_signature
         self._sync_line_track_states()
 
+    # Reset sequence:
+    # 1. Clear all per-track and per-line runtime state.
+    # 2. Reset totals and cooldown memory.
+    # 3. Recreate empty line dictionaries for the current config.
     def reset(self):
-        """Reset all counters (e.g. on video loop)."""
+        """Core function: clears runtime state and totals, typically when restarting or looping video."""
         self._line_track_states = {}
         self._foot_traffic_track_states = {}
         self._line_track_frame_totals = {}
@@ -364,6 +418,7 @@ class PeopleCounter:
         self._sync_line_track_states()
 
     def _build_line_signature(self, lines: list[dict]) -> tuple:
+        """Helper function: creates a stable signature so config changes can reset per-line runtime state."""
         signature: list[tuple] = []
         for idx, line_cfg in enumerate(lines):
             points = line_cfg.get("points", [])
@@ -383,6 +438,7 @@ class PeopleCounter:
         return tuple(signature)
 
     def _sync_line_track_states(self):
+        """Helper function: keeps internal state dictionaries aligned with the currently configured lines."""
         active_line_keys = {
             self._line_state_key(line_cfg, idx)
             for idx, line_cfg in enumerate(self.lines)
@@ -407,8 +463,15 @@ class PeopleCounter:
         }
 
     def _line_state_key(self, line_cfg: dict, index: int) -> str:
+        """Helper function: returns the internal dictionary key used to store state for one line."""
         return str(line_cfg.get("id") or line_cfg.get("name") or f"line_{index}")
 
+    # Occupancy line sequence:
+    # 1. Load or create `_LineTrackState` for this track on this line.
+    # 2. Compute side value, active-zone status, and crossing point.
+    # 3. If the line is an IN line, try normal line-cross counting.
+    # 4. If the line is an OUT line, try travel-exit counting.
+    # 5. Any accepted count goes through `_register_count(...)`.
     def _update_line_track_state(
         self,
         line_key: str,
@@ -418,6 +481,7 @@ class PeopleCounter:
         right_point: tuple[float, float] | None,
         now: float,
     ) -> int:
+        """Core helper: updates one occupancy track against one line and returns any new IN or OUT count."""
         if right_point is None:
             return 0
 
@@ -692,6 +756,11 @@ class PeopleCounter:
 
         return 0
 
+    # Foot-traffic line sequence:
+    # 1. Load or create `_FootTrafficTrackState` for this track on this line.
+    # 2. Compute current side, crossing point, and motion direction.
+    # 3. Check segment validity, allowed direction, rearm state, and cooldown.
+    # 4. If all checks pass, call `_register_foot_traffic_count(...)`.
     def _update_foot_traffic_track_state(
         self,
         line_key: str,
@@ -701,6 +770,7 @@ class PeopleCounter:
         target_point: tuple[float, float] | None,
         now: float,
     ) -> None:
+        """Core helper: updates one foot-traffic track and records a directional crossing when eligible."""
         if target_point is None:
             return
 
@@ -800,7 +870,13 @@ class PeopleCounter:
                 in_active_zone=in_active_zone,
             )
 
+    # Disappear handling sequence:
+    # 1. Runs after live line updates inside `update()`.
+    # 2. Finds tracked IDs that are no longer visible in the current frame.
+    # 3. Applies disappear-based fallback counting for eligible IN lines.
+    # 4. Removes expired track state from the line dictionary.
     def _process_line_disappears(self, active_ids: set[int], now: float) -> tuple[int, int]:
+        """Core helper: handles tracks that vanished and applies disappear-based fallback counting rules."""
         total_in = 0
         total_out = 0
 
@@ -906,7 +982,11 @@ class PeopleCounter:
 
         return (total_in, total_out)
 
+    # Foot-traffic cleanup sequence:
+    # 1. Runs near the end of `update()`.
+    # 2. Removes FT tracks that are no longer active and have passed timeout.
     def _cleanup_foot_traffic_tracks(self, active_ids: set[int], now: float) -> None:
+        """Helper function: removes expired foot-traffic track state after tracks stop appearing."""
         for line_key, states in self._foot_traffic_track_states.items():
             to_remove: list[int] = []
             for track_id, ts in states.items():
@@ -919,7 +999,13 @@ class PeopleCounter:
             for track_id in to_remove:
                 del states[track_id]
 
+    # Count registration sequence:
+    # 1. Called only after a line/disappear rule decides a count is valid.
+    # 2. Checks duplicate memory for the same direction.
+    # 3. Clears opposite-direction memory if needed.
+    # 4. Stores `_CountedTrackRecord` and updates cooldown data for IN counts.
     def _register_count(self, track_id: int, direction: str, source: str, now: float) -> bool:
+        """Core helper: records a finalized count and blocks duplicate events for the same track ID."""
         direction = str(direction).upper()
         tid = int(track_id)
         target_tracks = self._get_counted_track_store(direction)
@@ -955,6 +1041,7 @@ class PeopleCounter:
         return True
 
     def _can_count_in(self, track_id: int, now: float) -> bool:
+        """Helper function: checks whether an IN event can pass duplicate and cooldown guards."""
         if int(track_id) in self._counted_in_tracks:
             return False
         if self.count_cooldown <= 0:
@@ -965,6 +1052,7 @@ class PeopleCounter:
         return (now - last_ts) >= self.count_cooldown
 
     def _cleanup_in_cooldown(self, now: float):
+        """Helper function: prunes old cooldown timestamps so the cache does not grow forever."""
         if not self._last_in_count_time:
             return
         keep_for = max(self.count_cooldown, 1.0) * 10.0
@@ -972,7 +1060,12 @@ class PeopleCounter:
             tid: ts for tid, ts in self._last_in_count_time.items() if (now - ts) < keep_for
         }
 
+    # Count reversion sequence:
+    # 1. Runs after disappear processing inside `update()`.
+    # 2. Looks only at IN tracks that were counted by fallback logic.
+    # 3. If one keeps reappearing for too many frames, the earlier count is undone.
     def _process_count_reversions(self, active_ids: set[int]):
+        """Core helper: reverses fallback IN counts when a supposedly disappeared track keeps reappearing."""
         for track_id, record in self._counted_in_tracks.items():
             if record.uncounted:
                 continue
@@ -1002,11 +1095,13 @@ class PeopleCounter:
                 record.visible_streak_after_count = 0
 
     def _get_counted_track_store(self, direction: str) -> dict[int, _CountedTrackRecord]:
+        """Helper function: returns the internal count store for either IN or OUT track memory."""
         if str(direction).upper() == "OUT":
             return self._counted_out_tracks
         return self._counted_in_tracks
 
     def _reset_track_frame_history(self, track_id: int):
+        """Helper function: clears accumulated frame-age data for one track after a finalized count."""
         tid = int(track_id)
         self._line_track_frame_totals.pop(tid, None)
         for states in self._line_track_states.values():
@@ -1014,7 +1109,12 @@ class PeopleCounter:
             if ts is not None:
                 ts.frame_count = 0
 
+    # Result-summary sequence:
+    # 1. Called while building the final payload from `update()`.
+    # 2. Walks all configured FT lines.
+    # 3. Returns per-line left/right/total breakdowns.
     def _build_foot_traffic_summary(self) -> list[dict]:
+        """Helper function: formats per-line foot-traffic totals for the result payload returned to callers."""
         summaries: list[dict] = []
         for line_index, line_cfg in enumerate(self.lines):
             if self._line_type(line_cfg) != LINE_TYPE_FOOT_TRAFFIC:
@@ -1038,6 +1138,7 @@ class PeopleCounter:
         return summaries
 
     def _register_foot_traffic_count(self, line_key: str, direction: str, line_cfg: dict, track_id: int) -> None:
+        """Core helper: increments foot-traffic totals once a valid directional crossing is confirmed."""
         counts = self._foot_traffic_line_counts.setdefault(line_key, {"left": 0, "right": 0})
         normalized_direction = self._foot_traffic_bucket_direction(direction, line_cfg)
         counts[normalized_direction] = int(counts.get(normalized_direction, 0) or 0) + 1
@@ -1048,6 +1149,7 @@ class PeopleCounter:
             self.foot_traffic_left += 1
 
     def _foot_traffic_bucket_direction(self, direction: str, line_cfg: dict) -> str:
+        """Helper function: maps raw movement direction into the summary bucket expected by the UI."""
         normalized = str(direction).lower()
         negative_label, positive_label = self._foot_traffic_labels(line_cfg)
 
@@ -1061,14 +1163,17 @@ class PeopleCounter:
         return "right" if normalized == "down" else "left"
 
     def _format_point(self, point: tuple[float, float] | None) -> str:
+        """Helper function: formats a normalized point for debug logging output."""
         if point is None:
             return "n/a"
         return f"({point[0]:.3f},{point[1]:.3f})"
 
     def _bool_label(self, value: bool) -> str:
+        """Helper function: converts booleans into short debug-friendly yes/no labels."""
         return "yes" if bool(value) else "no"
 
     def _side_label(self, side: float) -> str:
+        """Helper function: turns a signed side value into a readable line-side label for logs."""
         if side > DEFAULT_LINE_SIDE_EPS:
             return "target"
         if side < -DEFAULT_LINE_SIDE_EPS:
@@ -1076,6 +1181,7 @@ class PeopleCounter:
         return "on_line"
 
     def _line_type(self, line_cfg: dict) -> str:
+        """Helper function: normalizes each line config into either occupancy or foot-traffic mode."""
         raw_value = str(
             line_cfg.get("line_type")
             or line_cfg.get("metric")
@@ -1087,6 +1193,7 @@ class PeopleCounter:
         return LINE_TYPE_OCCUPANCY
 
     def _foot_traffic_rearm_side_eps(self, line_cfg: dict) -> float:
+        """Helper function: reads the rearm threshold used before a foot-traffic track can count again."""
         return max(
             DEFAULT_LINE_SIDE_EPS,
             float(
@@ -1099,6 +1206,7 @@ class PeopleCounter:
         )
 
     def _foot_traffic_recount_cooldown(self, line_cfg: dict) -> float:
+        """Helper function: reads the minimum delay between repeated foot-traffic counts for one track."""
         return max(
             0.0,
             float(
@@ -1116,6 +1224,7 @@ class PeopleCounter:
         now: float,
         line_cfg: dict,
     ) -> bool:
+        """Helper function: checks whether a foot-traffic track has waited long enough to count again."""
         cooldown = self._foot_traffic_recount_cooldown(line_cfg)
         if cooldown <= 0:
             return True
@@ -1124,6 +1233,7 @@ class PeopleCounter:
         return (now - ts.last_count_time) >= cooldown
 
     def _foot_traffic_labels(self, line_cfg: dict) -> tuple[str, str]:
+        """Helper function: derives human-readable direction labels from the line orientation."""
         points = line_cfg.get("points", [])
         if len(points) >= 2:
             dx = float(points[1][0]) - float(points[0][0])
@@ -1133,6 +1243,7 @@ class PeopleCounter:
         return ("down", "up")
 
     def _foot_traffic_allowed_direction(self, line_cfg: dict) -> str | None:
+        """Helper function: converts configured line direction into the only allowed foot-traffic movement."""
         configured_direction = str(line_cfg.get("direction") or "").strip().lower()
         if configured_direction not in {"left_to_right", "right_to_left"}:
             return None
@@ -1152,6 +1263,7 @@ class PeopleCounter:
         prev_side: float,
         curr_side: float,
     ) -> str | None:
+        """Helper function: infers movement direction when a track crosses a foot-traffic line."""
         crossed_forward = prev_side <= DEFAULT_LINE_SIDE_EPS and curr_side > DEFAULT_LINE_SIDE_EPS
         crossed_backward = prev_side >= -DEFAULT_LINE_SIDE_EPS and curr_side < -DEFAULT_LINE_SIDE_EPS
         if not crossed_forward and not crossed_backward:
@@ -1182,6 +1294,7 @@ class PeopleCounter:
         line_cfg: dict,
         cross_point: tuple[float, float] | None,
     ) -> bool:
+        """Helper function: ensures the computed crossing actually lands on the configured line segment."""
         if cross_point is None:
             return False
         points = line_cfg.get("points", [])
@@ -1197,6 +1310,7 @@ class PeopleCounter:
         )
 
     def _should_accumulate_track_frames(self, point: tuple[float, float] | None) -> bool:
+        """Helper function: decides whether a track should keep aging for minimum-frame occupancy checks."""
         if point is None:
             return False
         if not self.active_zones:
@@ -1204,6 +1318,7 @@ class PeopleCounter:
         return not self._is_inside_active_zone(point)
 
     def _should_debug_track(self, track_id: int) -> bool:
+        """Helper function: filters verbose debug logging to the configured track or all tracks."""
         if not DEBUG_COUNTING:
             return False
         if DEBUG_COUNTING_TRACK_ID is None:
@@ -1225,6 +1340,7 @@ class PeopleCounter:
         out_zone_armed: bool | None = None,
         active_zone_streak: int | None = None,
     ):
+        """Helper function: prints per-frame line-state diagnostics when verbose debugging is enabled."""
         if not DEBUG_COUNTING_VERBOSE:
             return
         if not self._should_debug_track(track_id):
@@ -1259,6 +1375,7 @@ class PeopleCounter:
         prev_point: tuple[float, float] | None = None,
         detail: str | None = None,
     ):
+        """Helper function: prints a compact log entry whenever the service accepts a count event."""
         parts = [
             "[Count]",
             f"dir={direction}",
@@ -1273,7 +1390,12 @@ class PeopleCounter:
             parts.append(f"point={self._format_point(point)}")
         print(" ".join(parts))
 
+    # Zone-check sequence:
+    # 1. Called by both occupancy and foot-traffic logic.
+    # 2. Loops through active-zone polygons.
+    # 3. Uses `_point_in_polygon(...)` to decide whether the point is valid.
     def _is_inside_active_zone(self, point: tuple[float, float] | None) -> bool:
+        """Helper function: checks whether a normalized point is inside any configured active zone."""
         if point is None:
             return False
         if not self.active_zones:
@@ -1291,6 +1413,7 @@ class PeopleCounter:
         prev_side: float,
         curr_side: float,
     ) -> tuple[float, float] | None:
+        """Helper function: interpolates the approximate point where a track crossed a counting line."""
         if prev_point is None or curr_point is None:
             return None
         denominator = prev_side - curr_side
@@ -1311,6 +1434,7 @@ class PeopleCounter:
         seg_end: tuple[float, float],
         endpoint_tol: float = 0.0,
     ) -> bool:
+        """Helper function: checks whether a point projection falls within a line segment and endpoint tolerance."""
         seg_dx = seg_end[0] - seg_start[0]
         seg_dy = seg_end[1] - seg_start[1]
         seg_len_sq = (seg_dx * seg_dx) + (seg_dy * seg_dy)
@@ -1325,23 +1449,29 @@ class PeopleCounter:
         return (-tol_ratio) <= proj <= (1.0 + tol_ratio)
 
     def _bbox_bottom_center_point(self, bbox: list[float], frame_w: int, frame_h: int) -> tuple[float, float]:
+        """Helper function: returns the normalized bottom-center anchor used by foot-traffic counting."""
         x1, y1, x2, y2 = bbox
         cx = ((x1 + x2) / 2.0) / frame_w
         cy = (y1 + ((y2 - y1) * 0.95)) / frame_h
         return (cx, cy)
 
     def _bbox_line_right_point(self, bbox: list[float], frame_w: int, frame_h: int) -> tuple[float, float]:
+        """Helper function: returns the normalized right-bottom anchor used by standard occupancy IN lines."""
         _, _, x2, y2 = bbox
         right_x = x2 / frame_w
         bottom_y = y2 / frame_h
         return (right_x, bottom_y)
 
     def _bbox_line_right_midlower_point(self, bbox: list[float], frame_w: int, frame_h: int) -> tuple[float, float]:
+        """Helper function: returns the normalized right-side mid-lower anchor used by occupancy OUT logic."""
         _, y1, x2, y2 = bbox
         right_x = x2 / frame_w
         midlower_y = (y1 + ((y2 - y1) * 0.75)) / frame_h
         return (right_x, midlower_y)
 
+    # Anchor-selection sequence:
+    # 1. Called during `update()` for each visible detection and line.
+    # 2. Chooses a different bbox anchor for FT, occupancy IN, or occupancy OUT.
     def _bbox_line_target_point(
         self,
         bbox: list[float],
@@ -1349,18 +1479,23 @@ class PeopleCounter:
         frame_h: int,
         line_cfg: dict,
     ) -> tuple[float, float]:
+        """Helper function: chooses the correct bbox anchor for the current line type and count event."""
         if self._line_type(line_cfg) == LINE_TYPE_FOOT_TRAFFIC:
             return self._bbox_bottom_center_point(bbox, frame_w, frame_h)
         if self._line_count_event(line_cfg) == LINE_EVENT_OUT:
             return self._bbox_line_right_midlower_point(bbox, frame_w, frame_h)
         return self._bbox_line_right_point(bbox, frame_w, frame_h)
 
+    # Frame-age anchor sequence:
+    # 1. Called during `update()` before per-line counting begins.
+    # 2. Chooses the anchor used to accumulate visible-frame totals for a track.
     def _bbox_frame_accumulation_point(
         self,
         bbox: list[float],
         frame_w: int,
         frame_h: int,
     ) -> tuple[float, float]:
+        """Helper function: chooses the anchor used to accumulate visible-frame totals for a track."""
         occupancy_lines = [
             line_cfg
             for line_cfg in self.lines
@@ -1371,24 +1506,29 @@ class PeopleCounter:
         return self._bbox_line_right_point(bbox, frame_w, frame_h)
 
     def _line_count_event(self, line_cfg: dict) -> str:
+        """Helper function: normalizes the configured event type so line logic can treat it consistently."""
         return LINE_EVENT_OUT if line_cfg.get("count_event") == LINE_EVENT_OUT else LINE_EVENT_IN
 
     def _line_min_track_frames(self, line_cfg: dict) -> int:
+        """Helper function: returns the minimum visible-frame requirement before a line event can count."""
         if self._line_count_event(line_cfg) == LINE_EVENT_OUT:
             return DEFAULT_LINE_OUT_MIN_TRACK_FRAMES
         return DEFAULT_LINE_IN_MIN_TRACK_FRAMES
 
     def _line_max_track_frames(self, line_cfg: dict) -> int | None:
+        """Helper function: returns the optional maximum frame-age allowed for the current line event."""
         if self._line_count_event(line_cfg) == LINE_EVENT_OUT:
             return DEFAULT_LINE_OUT_MAX_TRACK_FRAMES
         return None
 
     def _out_zone_arm_min_frames(self, line_cfg: dict) -> int:
+        """Helper function: returns how long an OUT track must stay in-zone before disappear logic is armed."""
         if self._line_count_event(line_cfg) == LINE_EVENT_OUT:
             return max(1, int(line_cfg.get("out_zone_arm_frames", DEFAULT_OUT_ZONE_ARM_MIN_FRAMES) or DEFAULT_OUT_ZONE_ARM_MIN_FRAMES))
         return 1
 
     def _out_travel_min_distance(self, line_cfg: dict) -> float:
+        """Helper function: reads the minimum travel distance required before a travel-exit OUT count is allowed."""
         return max(
             0.0,
             float(
@@ -1401,6 +1541,7 @@ class PeopleCounter:
         )
 
     def _line_target_side_value(self, line_cfg: dict, point: tuple[float, float]) -> float:
+        """Helper function: computes which side of a line a point is on for crossing and direction checks."""
         points = line_cfg.get("points", [])
         if len(points) < 2:
             return 0.0
@@ -1413,6 +1554,7 @@ class PeopleCounter:
         return -side_value
 
     def _empty_result(self) -> dict:
+        """Helper function: returns the zeroed payload shape used when counting is disabled."""
         return {
             "total_in": 0,
             "total_out": 0,
@@ -1428,10 +1570,12 @@ class PeopleCounter:
 
 
 def _cross_product_sign(a, b, p):
+    """Helper function: returns the signed cross product used for line-side calculations."""
     return (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
 
 
 def _point_in_polygon(point, polygon):
+    """Helper function: uses ray casting to test whether a normalized point lies inside a polygon."""
     x, y = point
     n = len(polygon)
     inside = False

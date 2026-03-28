@@ -100,7 +100,7 @@ PERF_LOG_INTERVAL_FRAMES = 30
 PERF_STAGE_LOGS = True
 MULTI_STREAM_BATCH_INFER = True
 BATCH_INFER_WINDOW_MS = 2
-BATCH_INFER_MAX_BATCH = 5
+BATCH_INFER_MAX_BATCH = 6
 BATCH_INFER_WAIT_MS = 1500
 BATCH_INFER_LOG_INTERVAL = 30
 ASYNC_CAPTURE_ENABLED = True
@@ -192,6 +192,9 @@ def drain_violation_queue() -> list:
     return events
 
 
+# ---------------------------------------------------------------------------
+# Source/runtime management helpers
+# ---------------------------------------------------------------------------
 def _build_source_meta(source_path: str) -> dict:
     is_rtsp_stream = is_rtsp_source(source_path)
     if is_rtsp_stream:
@@ -382,6 +385,130 @@ def _empty_detection_result(
     )
 
 
+# ---------------------------------------------------------------------------
+# Frame preprocessing and output helpers
+# ---------------------------------------------------------------------------
+def _build_stage_metrics(decode_ms: float) -> dict:
+    return {
+        "capture_decode": decode_ms,
+        "fisheye": 0.0,
+        "infer_wait": 0.0,
+        "infer_queue_wait": 0.0,
+        "infer_predict": 0.0,
+        "infer_predict_total_batch": 0.0,
+        "infer_post": 0.0,
+        "classify": 0.0,
+        "policy_queue": 0.0,
+        "counting": 0.0,
+        "encode": 0.0,
+        "nvenc": 0.0,
+    }
+
+
+def _build_runtime_buffer(current_real_fps: float, cached_people_count: int) -> dict:
+    return {
+        "__meta__": {
+            "fps": round(current_real_fps, 1),
+            "people_count": cached_people_count,
+            "detections": [],
+            "counting_data": {},
+            "stream_status": "live",
+        }
+    }
+
+
+def _build_fisheye_view_configs(active_views: list | None) -> list:
+    all_configs = [
+        {"angle_z": 0, "angle_up": 35, "zoom": 80},
+        {"angle_z": 45, "angle_up": 35, "zoom": 80},
+        {"angle_z": 90, "angle_up": 35, "zoom": 80},
+        {"angle_z": 135, "angle_up": 35, "zoom": 80},
+        {"angle_z": 180, "angle_up": 35, "zoom": 80},
+        {"angle_z": 225, "angle_up": 35, "zoom": 80},
+        {"angle_z": 270, "angle_up": 35, "zoom": 80},
+        {"angle_z": 315, "angle_up": 35, "zoom": 80},
+    ]
+    final_configs = []
+    for i in range(8):
+        if active_views is None or i in active_views:
+            final_configs.append(all_configs[i])
+        else:
+            final_configs.append(None)
+    return final_configs
+
+
+def _create_fisheye_processor(
+    frame_size: tuple[int, int],
+    active_views: list | None,
+    *,
+    use_cuda: bool,
+) -> FisheyeMultiView:
+    return FisheyeMultiView(
+        frame_size,
+        _build_fisheye_view_configs(active_views),
+        show_original=False,
+        use_cuda=use_cuda,
+        downscale_size=None,
+    )
+
+
+def _resize_for_web(img: np.ndarray, *, use_cuda: bool) -> np.ndarray:
+    if use_cuda and hasattr(cv2, "cuda"):
+        try:
+            gpu_img = cv2.cuda_GpuMat()
+            gpu_img.upload(img)
+            gpu_resized = cv2.cuda.resize(gpu_img, (640, 360), interpolation=cv2.INTER_AREA)
+            return gpu_resized.download()
+        except Exception:
+            pass
+    return cv2.resize(img, (640, 360))
+
+
+def _encode_frame(img: np.ndarray, *, use_cuda: bool) -> str:
+    img_small = _resize_for_web(img, use_cuda=use_cuda)
+    if jpeg:
+        buf = jpeg.encode(img_small, quality=40)
+    else:
+        _, buf = cv2.imencode(".jpg", img_small, [cv2.IMWRITE_JPEG_QUALITY, 40])
+    return base64.b64encode(buf).decode("utf-8")
+
+
+def _scale_detections(
+    detections,
+    orig_h,
+    orig_w,
+    target_w=640,
+    target_h=360,
+):
+    sx = target_w / orig_w
+    sy = target_h / orig_h
+    scaled = []
+    for d in detections:
+        sd = dict(d)
+        sd.pop("keypoints_data", None)
+        sd.pop("_classification_fresh", None)
+        if sd.get("person_bbox"):
+            b = sd["person_bbox"]
+            sd["person_bbox"] = [round(b[0] * sx), round(b[1] * sy), round(b[2] * sx), round(b[3] * sy)]
+        if sd.get("count_anchor"):
+            p = sd["count_anchor"]
+            sd["count_anchor"] = [round(p[0] * sx), round(p[1] * sy)]
+        if sd.get("display_anchor"):
+            p = sd["display_anchor"]
+            sd["display_anchor"] = [round(p[0] * sx), round(p[1] * sy)]
+        if sd.get("lower_bbox"):
+            b = sd["lower_bbox"]
+            sd["lower_bbox"] = [round(b[0] * sx), round(b[1] * sy), round(b[2] * sx), round(b[3] * sy)]
+        if sd.get("slipper_bbox"):
+            b = sd["slipper_bbox"]
+            sd["slipper_bbox"] = [round(b[0] * sx), round(b[1] * sy), round(b[2] * sx), round(b[3] * sy)]
+        scaled.append(sd)
+    return scaled
+
+
+# ---------------------------------------------------------------------------
+# Detection/tracking and ROI helpers
+# ---------------------------------------------------------------------------
 def _prepare_detection_roi_image(
     img: np.ndarray,
     roi_areas: list[dict] | None,
@@ -430,25 +557,26 @@ def _prepare_detection_roi_image(
     if min_x >= max_x or min_y >= max_y:
         return img, None
 
+    # Keep a small rectangle padding around the ROI bounds so detector/tracker
+    # still sees natural context near the entrance instead of a hard crop edge.
+    bbox_w = max_x - min_x + 1
+    bbox_h = max_y - min_y + 1
+    pad_x = max(8, int(round(bbox_w * 0.05)))
+    pad_y = max(8, int(round(bbox_h * 0.05)))
+    min_x = max(0, min_x - pad_x)
+    min_y = max(0, min_y - pad_y)
+    max_x = min(frame_w - 1, max_x + pad_x)
+    max_y = min(frame_h - 1, max_y + pad_y)
+
     crop = img[min_y:max_y + 1, min_x:max_x + 1].copy()
     if crop.size == 0:
         return img, None
 
-    mask = np.zeros(crop.shape[:2], dtype=np.uint8)
-    shifted_polygons: list[np.ndarray] = []
-    for polygon in polygons_px:
-        shifted = polygon.copy()
-        shifted[:, 0] -= min_x
-        shifted[:, 1] -= min_y
-        shifted_polygons.append(shifted)
-    cv2.fillPoly(mask, shifted_polygons, 255)
-    masked_crop = cv2.bitwise_and(crop, crop, mask=mask)
-
-    return masked_crop, {
+    return crop, {
         "offset_x": float(min_x),
         "offset_y": float(min_y),
-        "crop_w": float(masked_crop.shape[1]),
-        "crop_h": float(masked_crop.shape[0]),
+        "crop_w": float(crop.shape[1]),
+        "crop_h": float(crop.shape[0]),
     }
 
 
@@ -618,183 +746,8 @@ def _handle_rtsp_capture_failure_common(
     return 0, capture_allow_hwaccel, True
 
 
-try:
-    _FALL_POSE_ACCEPTS_SENSITIVITY = "detection_sensitivity" in inspect.signature(
-        is_person_in_fall_pose
-    ).parameters
-except (TypeError, ValueError):
-    _FALL_POSE_ACCEPTS_SENSITIVITY = False
-
-
-def _is_person_in_fall_pose_compat(
-    person_bbox,
-    keypoints_data,
-    detection_sensitivity,
-):
-    if _FALL_POSE_ACCEPTS_SENSITIVITY:
-        return is_person_in_fall_pose(
-            person_bbox,
-            keypoints_data,
-            detection_sensitivity=detection_sensitivity,
-        )
-    return is_person_in_fall_pose(person_bbox, keypoints_data)
-
-
-class _NvencOutputWriter:
-    """Optional FFmpeg NVENC sink for processed frames."""
-
-    def __init__(self, runtime_key: str, view_key: str, fps: float):
-        self.runtime_key = runtime_key
-        self.view_key = view_key
-        self.fps = max(1.0, float(fps) if fps else 30.0)
-        self.process: subprocess.Popen | None = None
-        self.width: int | None = None
-        self.height: int | None = None
-        self.output_path: str | None = None
-        self.disabled = False
-
-    def _output_ext(self) -> str:
-        return "mkv" if NVENC_OUTPUT_CONTAINER == "mkv" else "mp4"
-
-    def _build_output_path(self) -> str:
-        os.makedirs(NVENC_OUTPUT_DIR, exist_ok=True)
-        runtime_hash = hashlib.sha1(self.runtime_key.encode("utf-8", errors="ignore")).hexdigest()[:10]
-        view_label = _sanitize_token(self.view_key, fallback="view")[:32]
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        suffix = uuid.uuid4().hex[:6]
-        return os.path.join(NVENC_OUTPUT_DIR, f"{runtime_hash}_{view_label}_{ts}_{suffix}.{self._output_ext()}")
-
-    def _build_cmd(self, width: int, height: int) -> list[str]:
-        cmd = [
-            FFMPEG_BIN,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "bgr24",
-            "-s:v",
-            f"{width}x{height}",
-            "-r",
-            f"{self.fps:.3f}",
-            "-i",
-            "-",
-            "-an",
-            "-c:v",
-            NVENC_CODEC,
-            "-preset",
-            NVENC_PRESET,
-        ]
-        if NVENC_TUNE:
-            cmd.extend(["-tune", NVENC_TUNE])
-        if NVENC_RATE_CONTROL:
-            cmd.extend(["-rc", NVENC_RATE_CONTROL])
-        cmd.extend(
-            [
-                "-b:v",
-                f"{NVENC_BITRATE_K}k",
-                "-maxrate",
-                f"{NVENC_MAXRATE_K}k",
-                "-bufsize",
-                f"{NVENC_BUFSIZE_K}k",
-                "-pix_fmt",
-                "yuv420p",
-            ]
-        )
-        if self._output_ext() == "mp4":
-            cmd.extend(["-movflags", "+faststart"])
-        cmd.append(self.output_path or self._build_output_path())
-        return cmd
-
-    def _start(self, frame: np.ndarray) -> bool:
-        if self.disabled:
-            return False
-        if frame is None or frame.size == 0:
-            return False
-
-        height, width = frame.shape[:2]
-        if height <= 0 or width <= 0:
-            return False
-
-        self.width = int(width)
-        self.height = int(height)
-        self.output_path = self._build_output_path()
-        cmd = self._build_cmd(self.width, self.height)
-
-        try:
-            self.process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            print(
-                f"[NVENC] Started writer for runtime_key={self.runtime_key}, "
-                f"view={self.view_key}, output={self.output_path}"
-            )
-            return True
-        except FileNotFoundError:
-            print(f"[NVENC] FFmpeg executable not found: {FFMPEG_BIN}")
-        except Exception as e:
-            print(f"[NVENC] Failed to start writer for {self.runtime_key} ({self.view_key}): {e}")
-
-        self.disabled = True
-        self.process = None
-        return False
-
-    def write(self, frame: np.ndarray) -> bool:
-        if self.disabled:
-            return False
-        if frame is None or frame.size == 0:
-            return False
-        if self.process is None and not self._start(frame):
-            return False
-        if self.process is None or self.process.stdin is None:
-            return False
-        if self.process.poll() is not None:
-            self.disabled = True
-            print(
-                f"[NVENC] Writer exited early for runtime_key={self.runtime_key}, "
-                f"view={self.view_key}"
-            )
-            return False
-
-        out = frame
-        if self.width and self.height and (frame.shape[1] != self.width or frame.shape[0] != self.height):
-            out = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
-
-        try:
-            self.process.stdin.write(out.tobytes())
-            return True
-        except Exception as e:
-            print(f"[NVENC] Failed to write frame for {self.runtime_key} ({self.view_key}): {e}")
-            self.close()
-            self.disabled = True
-            return False
-
-    def close(self):
-        proc = self.process
-        self.process = None
-        if proc is None:
-            return
-        try:
-            if proc.stdin is not None:
-                proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=2.0)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-
-
 # ---------------------------------------------------------------------------
-# Shared multi-stream batched inference engine
+# Detection/tracking: shared multi-stream batched inference engine
 # ---------------------------------------------------------------------------
 class _BatchInferenceEngine:
     def __init__(self):
@@ -829,6 +782,21 @@ class _BatchInferenceEngine:
                 tracker = self._tracker_cls(args=self._tracker_cfg, frame_rate=30)
                 self._trackers[stream_id] = tracker
             return tracker
+
+    def clear_trackers_for_runtime(self, runtime_key: str) -> None:
+        runtime_prefix = f"{runtime_key}||"
+        with self._tracker_lock:
+            stale_stream_ids = [
+                stream_id
+                for stream_id in self._trackers
+                if stream_id.startswith(runtime_prefix)
+            ]
+            for stream_id in stale_stream_ids:
+                self._trackers.pop(stream_id, None)
+        if stale_stream_ids:
+            print(
+                f"[BatchInfer] Cleared {len(stale_stream_ids)} tracker(s) for runtime_key={runtime_key}"
+            )
 
     def infer(
         self,
@@ -1171,6 +1139,17 @@ def _get_batch_infer_engine() -> _BatchInferenceEngine:
         return _BATCH_INFER_ENGINE
 
 
+def _clear_batch_infer_trackers_for_runtime(runtime_key: str) -> None:
+    with _BATCH_INFER_LOCK:
+        engine = _BATCH_INFER_ENGINE
+    if engine is None:
+        return
+    engine.clear_trackers_for_runtime(runtime_key)
+
+
+# ---------------------------------------------------------------------------
+# Frame acquisition: async capture reader
+# ---------------------------------------------------------------------------
 class _AsyncFrameReader:
     """Owns VideoCapture in a separate thread and keeps only the latest frames."""
 
@@ -1369,7 +1348,163 @@ class _AsyncFrameReader:
 
 
 # ---------------------------------------------------------------------------
-# Producer thread management
+# Output/publish: optional FFmpeg NVENC sink
+# ---------------------------------------------------------------------------
+class _NvencOutputWriter:
+    """Optional FFmpeg NVENC sink for processed frames."""
+
+    def __init__(self, runtime_key: str, view_key: str, fps: float):
+        self.runtime_key = runtime_key
+        self.view_key = view_key
+        self.fps = max(1.0, float(fps) if fps else 30.0)
+        self.process: subprocess.Popen | None = None
+        self.width: int | None = None
+        self.height: int | None = None
+        self.output_path: str | None = None
+        self.disabled = False
+
+    def _output_ext(self) -> str:
+        return "mkv" if NVENC_OUTPUT_CONTAINER == "mkv" else "mp4"
+
+    def _build_output_path(self) -> str:
+        os.makedirs(NVENC_OUTPUT_DIR, exist_ok=True)
+        runtime_hash = hashlib.sha1(self.runtime_key.encode("utf-8", errors="ignore")).hexdigest()[:10]
+        view_label = _sanitize_token(self.view_key, fallback="view")[:32]
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        suffix = uuid.uuid4().hex[:6]
+        return os.path.join(NVENC_OUTPUT_DIR, f"{runtime_hash}_{view_label}_{ts}_{suffix}.{self._output_ext()}")
+
+    def _build_cmd(self, width: int, height: int) -> list[str]:
+        cmd = [
+            FFMPEG_BIN,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s:v",
+            f"{width}x{height}",
+            "-r",
+            f"{self.fps:.3f}",
+            "-i",
+            "-",
+            "-an",
+            "-c:v",
+            NVENC_CODEC,
+            "-preset",
+            NVENC_PRESET,
+        ]
+        if NVENC_TUNE:
+            cmd.extend(["-tune", NVENC_TUNE])
+        if NVENC_RATE_CONTROL:
+            cmd.extend(["-rc", NVENC_RATE_CONTROL])
+        cmd.extend(
+            [
+                "-b:v",
+                f"{NVENC_BITRATE_K}k",
+                "-maxrate",
+                f"{NVENC_MAXRATE_K}k",
+                "-bufsize",
+                f"{NVENC_BUFSIZE_K}k",
+                "-pix_fmt",
+                "yuv420p",
+            ]
+        )
+        if self._output_ext() == "mp4":
+            cmd.extend(["-movflags", "+faststart"])
+        cmd.append(self.output_path or self._build_output_path())
+        return cmd
+
+    def _start(self, frame: np.ndarray) -> bool:
+        if self.disabled:
+            return False
+        if frame is None or frame.size == 0:
+            return False
+
+        height, width = frame.shape[:2]
+        if height <= 0 or width <= 0:
+            return False
+
+        self.width = int(width)
+        self.height = int(height)
+        self.output_path = self._build_output_path()
+        cmd = self._build_cmd(self.width, self.height)
+
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(
+                f"[NVENC] Started writer for runtime_key={self.runtime_key}, "
+                f"view={self.view_key}, output={self.output_path}"
+            )
+            return True
+        except FileNotFoundError:
+            print(f"[NVENC] FFmpeg executable not found: {FFMPEG_BIN}")
+        except Exception as e:
+            print(f"[NVENC] Failed to start writer for {self.runtime_key} ({self.view_key}): {e}")
+
+        self.disabled = True
+        self.process = None
+        return False
+
+    def write(self, frame: np.ndarray) -> bool:
+        if self.disabled:
+            return False
+        if frame is None or frame.size == 0:
+            return False
+        if self.process is None and not self._start(frame):
+            return False
+        if self.process is None or self.process.stdin is None:
+            return False
+        if self.process.poll() is not None:
+            self.disabled = True
+            print(
+                f"[NVENC] Writer exited early for runtime_key={self.runtime_key}, "
+                f"view={self.view_key}"
+            )
+            return False
+
+        out = frame
+        if self.width and self.height and (frame.shape[1] != self.width or frame.shape[0] != self.height):
+            out = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
+
+        try:
+            self.process.stdin.write(out.tobytes())
+            return True
+        except Exception as e:
+            print(f"[NVENC] Failed to write frame for {self.runtime_key} ({self.view_key}): {e}")
+            self.close()
+            self.disabled = True
+            return False
+
+    def close(self):
+        proc = self.process
+        self.process = None
+        if proc is None:
+            return
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Source/runtime management: producer thread lifecycle
 # ---------------------------------------------------------------------------
 def start_producer_thread(
     runtime_key: str,
@@ -1383,6 +1518,8 @@ def start_producer_thread(
         existing = PRODUCER_THREADS.get(runtime_key)
         if existing is not None and existing.is_alive():
             return  # Already running for this source
+
+        _clear_batch_infer_trackers_for_runtime(runtime_key)
 
         stop_event = threading.Event()
         source_meta = _build_source_meta(source_path)
@@ -1468,6 +1605,7 @@ def _cleanup_producer_state(runtime_key: str, clear_frame_buffer: bool):
     with PRODUCER_LOCK:
         PRODUCER_THREADS.pop(runtime_key, None)
         PRODUCER_STOP_EVENTS.pop(runtime_key, None)
+    _clear_batch_infer_trackers_for_runtime(runtime_key)
     if clear_frame_buffer:
         FRAME_BUFFERS.pop(runtime_key, None)
 
@@ -1485,6 +1623,10 @@ def video_producer(
     sync_barrier: threading.Barrier | None = None,
     sync_state: dict | None = None,
 ):
+    # -----------------------------------------------------------------------
+    # Source/runtime setup
+    # -----------------------------------------------------------------------
+    # Step 1: Start one runtime pipeline for this source/runtime_key.
     print(f"[Producer] Starting loop for runtime_key={runtime_key}, source={source_path}")
     _set_runtime_stream_status(runtime_key, status="connecting", reason="initializing", clear_images=True)
     reached_eof = False
@@ -1494,6 +1636,7 @@ def video_producer(
     if source_meta is None:
         source_meta = _build_source_meta(source_path)
 
+    # Step 2: Open the underlying source (RTSP stream or uploaded/local video).
     capture_allow_hwaccel = bool(source_meta.get("is_rtsp_source")) and RTSP_ENABLE_NVDEC
     cap = open_video_capture(
         source_path,
@@ -1538,6 +1681,10 @@ def video_producer(
         _cleanup_producer_state(runtime_key, clear_frame_buffer=True)
         return
 
+    # -----------------------------------------------------------------------
+    # Detection/tracking setup
+    # -----------------------------------------------------------------------
+    # Step 3: Prepare detection/tracking runtime (shared batch engine or local model).
     local_model = None
     local_models_by_view: dict[str, YOLO] = {}
     use_batch_infer = MULTI_STREAM_BATCH_INFER
@@ -1596,55 +1743,17 @@ def video_producer(
             f"container={NVENC_OUTPUT_CONTAINER}, output_dir={NVENC_OUTPUT_DIR}"
         )
 
-    # --- Fisheye processor setup ---
+    # -----------------------------------------------------------------------
+    # Frame preprocessing setup
+    # -----------------------------------------------------------------------
+    # Step 4: Prepare optional preprocessing such as fisheye dewarp.
     processor = None
     if is_fisheye:
-        all_configs = [
-            {'angle_z': 0,   'angle_up': 35, 'zoom': 80},  # View 0
-            {'angle_z': 45,  'angle_up': 35, 'zoom': 80},  # View 1
-            {'angle_z': 90,  'angle_up': 35, 'zoom': 80},  # View 2
-            {'angle_z': 135, 'angle_up': 35, 'zoom': 80},  # View 3
-            {'angle_z': 180, 'angle_up': 35, 'zoom': 80},  # View 4
-            {'angle_z': 225, 'angle_up': 35, 'zoom': 80},  # View 5
-            {'angle_z': 270, 'angle_up': 35, 'zoom': 80},  # View 6
-            {'angle_z': 315, 'angle_up': 35, 'zoom': 80},  # View 7
-        ]
-
-        final_configs = []
-        for i in range(8):
-            if active_views is None or i in active_views:
-                final_configs.append(all_configs[i])
-            else:
-                final_configs.append(None)  # Skip this view
-
-        processor = FisheyeMultiView(
+        processor = _create_fisheye_processor(
             (height, width),
-            final_configs,
-            show_original=False,
+            active_views,
             use_cuda=cuda_available,
-            downscale_size=None,  # Keep full resolution for accurate classification
         )
-
-    # --- GPU-aware resize helper ---
-    def resize_for_web(img):
-        if cuda_available and hasattr(cv2, "cuda"):
-            try:
-                gpu_img = cv2.cuda_GpuMat()
-                gpu_img.upload(img)
-                gpu_resized = cv2.cuda.resize(gpu_img, (640, 360), interpolation=cv2.INTER_AREA)
-                return gpu_resized.download()
-            except Exception:
-                pass
-        return cv2.resize(img, (640, 360))
-
-    # --- Encode frame to base64 JPEG ---
-    def encode_frame(img):
-        img_small = resize_for_web(img)
-        if jpeg:
-            buf = jpeg.encode(img_small, quality=40)
-        else:
-            _, buf = cv2.imencode('.jpg', img_small, [cv2.IMWRITE_JPEG_QUALITY, 40])
-        return base64.b64encode(buf).decode('utf-8')
 
     # --- Detection + optional classification for a single view ---
     def run_detection_and_classify(
@@ -1847,36 +1956,10 @@ def video_producer(
             print(f"[Detection] Error: {e}")
             return _empty_detection_result(track_state)
 
-    # --- Scale detection coordinates to 640x360 for frontend ---
-    def scale_detections(detections, orig_h, orig_w, target_w=640, target_h=360):
-        sx = target_w / orig_w
-        sy = target_h / orig_h
-        scaled = []
-        for d in detections:
-            sd = dict(d)
-            sd.pop("keypoints_data", None)
-            sd.pop("_classification_fresh", None)
-            if sd.get("person_bbox"):
-                b = sd["person_bbox"]
-                sd["person_bbox"] = [round(b[0]*sx), round(b[1]*sy), round(b[2]*sx), round(b[3]*sy)]
-            if sd.get("count_anchor"):
-                p = sd["count_anchor"]
-                sd["count_anchor"] = [round(p[0]*sx), round(p[1]*sy)]
-            if sd.get("display_anchor"):
-                p = sd["display_anchor"]
-                sd["display_anchor"] = [round(p[0]*sx), round(p[1]*sy)]
-            if sd.get("lower_bbox"):
-                b = sd["lower_bbox"]
-                sd["lower_bbox"] = [round(b[0]*sx), round(b[1]*sy), round(b[2]*sx), round(b[3]*sy)]
-            if sd.get("slipper_bbox"):
-                b = sd["slipper_bbox"]
-                sd["slipper_bbox"] = [round(b[0]*sx), round(b[1]*sy), round(b[2]*sx), round(b[3]*sy)]
-            scaled.append(sd)
-        return scaled
-
     # -----------------------------------------------------------------------
-    # Init buffer and state
+    # Feature runtime state: dress code, people counting, fall detection
     # -----------------------------------------------------------------------
+    # Step 5: Initialize per-runtime state caches used by downstream features.
     _set_runtime_stream_status(runtime_key, status="connecting", reason="awaiting_frames", clear_images=True)
 
     # FPS calculation
@@ -1924,6 +2007,7 @@ def video_producer(
         and source_meta.get("is_network_stream_source")
         and not sync_timeline_active
     )
+    # Step 6: For live/network sources, optionally decouple capture into its own reader thread.
     if use_async_capture:
         async_reader = _AsyncFrameReader(
             runtime_key=runtime_key,
@@ -1939,6 +2023,9 @@ def video_producer(
             f"queue_size={ASYNC_CAPTURE_QUEUE_SIZE}"
         )
 
+    # -----------------------------------------------------------------------
+    # Output/publish helper
+    # -----------------------------------------------------------------------
     def _write_nvenc_frame(view_key: str, img: np.ndarray) -> float:
         if not NVENC_OUTPUT_ENABLED:
             return 0.0
@@ -1986,7 +2073,7 @@ def video_producer(
             last_good_frame_signature = None
 
     # -----------------------------------------------------------------------
-    # Helper: get all views needing detection
+    # Detection/tracking view selection helpers
     # -----------------------------------------------------------------------
     def _get_all_detection_views(source_path: str):
         """Union of dress-code, people-counting, and fall-detection views."""
@@ -2001,8 +2088,12 @@ def video_producer(
             return []
         return [roi]
 
+    # -----------------------------------------------------------------------
+    # People counting
+    # -----------------------------------------------------------------------
     def _run_counting_for_view(view_key, detections_unscaled, frame_shape):
         """Run people counting on unscaled detections for a specific view."""
+        # Step 9: Apply counting logic for the current view and publish live counts.
         camera_id = get_counting_camera_id(runtime_key, view_key)
         if camera_id is None:
             return None
@@ -2135,12 +2226,30 @@ def video_producer(
         # Snapshot on change + periodic heartbeat to preserve timeline continuity.
         if counter.should_snapshot(heartbeat_interval=COUNTING_SNAPSHOT_HEARTBEAT_SEC):
             snap = counter.get_snapshot_data(camera_id)
+            snap["total_in"] = int(counting_data.get("total_in", snap.get("total_in", 0)) or 0)
+            snap["total_out"] = int(counting_data.get("total_out", snap.get("total_out", 0)) or 0)
+            snap["current_occupancy"] = int(
+                counting_data.get("occupancy", snap.get("current_occupancy", 0)) or 0
+            )
+            snap["foot_traffic_left"] = int(
+                counting_data.get("foot_traffic_left", snap.get("foot_traffic_left", 0)) or 0
+            )
+            snap["foot_traffic_right"] = int(
+                counting_data.get("foot_traffic_right", snap.get("foot_traffic_right", 0)) or 0
+            )
+            snap["foot_traffic_total"] = int(
+                counting_data.get("foot_traffic_total", snap.get("foot_traffic_total", 0)) or 0
+            )
             queue_counting_snapshot(snap)
 
         return counting_data
 
+    # -----------------------------------------------------------------------
+    # Fall detection
+    # -----------------------------------------------------------------------
     def _run_fall_detection_for_view(view_key, detections_unscaled, frame, source_path):
         """Run fall detection on unscaled detections for a specific view."""
+        # Step 8: Apply fall detection after person tracking on the current view.
         camera_id = get_fall_detection_camera_id(source_path, view_key)
         if camera_id is None:
             for det in detections_unscaled:
@@ -2221,6 +2330,9 @@ def video_producer(
 
         return detections_unscaled
 
+    # -----------------------------------------------------------------------
+    # Per-view detection/tracking + dress code + counting orchestration
+    # -----------------------------------------------------------------------
     def _process_view_frame(
         view_key: str,
         img: np.ndarray,
@@ -2236,6 +2348,7 @@ def video_producer(
         nonlocal detect_batch_size_sum
         nonlocal detect_batch_samples
 
+        # Step 7: For one view, run detection/tracking, dress code policy, fall detection, and counting.
         orig_h, orig_w = img.shape[:2]
         scaled_detections: list[dict] = []
         counting_data = None
@@ -2291,7 +2404,7 @@ def video_producer(
             if counting_data is not None:
                 cached_counting_data[view_key] = counting_data
 
-            scaled_detections = scale_detections(detections, orig_h, orig_w)
+            scaled_detections = _scale_detections(detections, orig_h, orig_w)
             cached_detections = scaled_detections
             cached_people_count = people_count
         elif view_key in all_views:
@@ -2301,7 +2414,7 @@ def video_producer(
         return scaled_detections, counting_data
 
     # -----------------------------------------------------------------------
-    # Main loop
+    # Main loop: acquire frame -> preprocess -> detect/features -> publish
     # -----------------------------------------------------------------------
     while True:
         if stop_event.is_set():
@@ -2315,6 +2428,8 @@ def video_producer(
                     break
 
         loop_start = time.time()
+        # Frame acquisition
+        # Step 6A: Acquire the next frame either from the async reader queue or directly from OpenCV.
         if use_async_capture:
             packet = async_reader.read(timeout=ASYNC_CAPTURE_READ_TIMEOUT_MS / 1000.0) if async_reader else None
             if packet is None:
@@ -2376,6 +2491,8 @@ def video_producer(
                     continue
                 last_good_frame_signature = frame_signature
 
+        # Shared per-frame bookkeeping
+        # Step 6B: Once a frame is available, update frame counters and perf state.
         frame_count += 1
 
         # FPS counter
@@ -2388,45 +2505,26 @@ def video_producer(
         run_detection_this_frame = (frame_count % detection_stride == 0)
         producer_started_at = time.perf_counter()
 
-        stage_ms = {
-            "capture_decode": decode_ms,
-            "fisheye": 0.0,
-            "infer_wait": 0.0,
-            "infer_queue_wait": 0.0,
-            "infer_predict": 0.0,
-            "infer_predict_total_batch": 0.0,
-            "infer_post": 0.0,
-            "classify": 0.0,
-            "policy_queue": 0.0,
-            "counting": 0.0,
-            "encode": 0.0,
-            "nvenc": 0.0,
-        }
+        stage_ms = _build_stage_metrics(decode_ms)
         classify_candidates = 0
         classified_count = 0
         detect_batch_size_sum = 0
         detect_batch_samples = 0
 
-        current_buffer = {}
-        current_buffer['__meta__'] = {
-            'fps': round(current_real_fps, 1),
-            'people_count': cached_people_count,
-            'detections': [],
-            'counting_data': {},
-            'stream_status': 'live',
-        }
+        current_buffer = _build_runtime_buffer(current_real_fps, cached_people_count)
         all_views = _get_all_detection_views(source_path)
         dresscode_views = _get_detection_views(runtime_key)
         fall_views = get_fall_detection_views(source_path)
 
+        # Frame preprocessing + feature logic
         if is_fisheye and processor:
             try:
-                # 1. Fisheye processing (full resolution)
+                # Step 7A: Convert one fisheye frame into the active dewarped views.
                 fisheye_started_at = time.perf_counter()
                 processed_frames, _, _ = processor.process_frame(frame, overlay=True, view_id=None)
                 stage_ms["fisheye"] += (time.perf_counter() - fisheye_started_at) * 1000.0
 
-                # 2. Process each view
+                # Step 7B: Process each active dewarped view independently.
                 view_detections = {}  # key -> scaled detections list
                 view_counting_data = {}  # key -> counting_data dict
 
@@ -2445,7 +2543,7 @@ def video_producer(
 
                         # Encode clean frame (no plot)
                         encode_started_at = time.perf_counter()
-                        current_buffer[key] = encode_frame(img)
+                        current_buffer[key] = _encode_frame(img, use_cuda=cuda_available)
                         stage_ms["encode"] += (time.perf_counter() - encode_started_at) * 1000.0
                         stage_ms["nvenc"] += _write_nvenc_frame(key, img)
 
@@ -2461,7 +2559,7 @@ def video_producer(
                 print(f"[Producer] Error: {e}")
 
         else:
-            # --- Normal (non-fisheye) video processing ---
+            # Step 7A: Process the normal single-frame path for non-fisheye sources.
             try:
                 scaled, counting_data = _process_view_frame(
                     "original",
@@ -2473,7 +2571,7 @@ def video_producer(
 
                 # Encode clean frame
                 encode_started_at = time.perf_counter()
-                current_buffer['original'] = encode_frame(frame)
+                current_buffer['original'] = _encode_frame(frame, use_cuda=cuda_available)
                 stage_ms["encode"] += (time.perf_counter() - encode_started_at) * 1000.0
                 stage_ms["nvenc"] += _write_nvenc_frame("original", frame)
                 current_buffer['__meta__']['detections'] = {'original': scaled}
@@ -2485,6 +2583,8 @@ def video_producer(
             except Exception as e:
                 print(f"[Producer] Normal video error: {e}")
 
+        # Output/publish
+        # Step 10: Publish the latest processed result for websocket consumers.
         producer_wall_ms = (time.perf_counter() - producer_started_at) * 1000.0
         if PERF_STAGE_LOGS and (frame_count % PERF_LOG_INTERVAL_FRAMES == 0):
             producer_stage_sum_ms = (
@@ -2521,6 +2621,7 @@ def video_producer(
         FRAME_BUFFERS[runtime_key] = current_buffer
 
         # --- Timing control ---
+        # Step 11: Sleep just enough to respect source timing before the next loop iteration.
         if sync_timeline_active and fps > 0:
             next_frame_deadline = sync_started_at + ((decoded_frame_index + 1) / fps)
             wait = next_frame_deadline - time.perf_counter()
@@ -2538,6 +2639,7 @@ def video_producer(
         async_reader.close()
     else:
         cap.release()
+    # Step 12: Mark the runtime offline and clear runtime-owned resources.
     final_reason = "finished" if reached_eof else "stopped"
     _set_runtime_stream_status(runtime_key, status="offline", reason=final_reason, clear_images=True)
     _cleanup_producer_state(runtime_key, clear_frame_buffer=True)
@@ -2545,7 +2647,7 @@ def video_producer(
 
 
 # ---------------------------------------------------------------------------
-# Policy helpers (read from in-memory cache, updated by policy_router)
+# Dress code policy and violation confirmation helpers
 # ---------------------------------------------------------------------------
 # Default policy -- overridden at runtime when policy is loaded from DB
 _current_policy = {
@@ -2764,6 +2866,9 @@ def _update_violation_confirmation_state(
     return dict(latest_display), [dict(item) for item in matched_violations]
 
 
+# ---------------------------------------------------------------------------
+# Dress code policy application and violation snapshot queueing
+# ---------------------------------------------------------------------------
 def _apply_policy_and_save(detections, track_state, frame, runtime_key, source_path, view_key=None):
     """
     Apply the current policy to mark violations and save snapshot evidence.
@@ -2842,3 +2947,28 @@ def _apply_policy_and_save(detections, track_state, frame, runtime_key, source_p
             det["violation"] = False
 
     return detections
+
+
+# ---------------------------------------------------------------------------
+# Fall detection compatibility helper
+# ---------------------------------------------------------------------------
+try:
+    _FALL_POSE_ACCEPTS_SENSITIVITY = "detection_sensitivity" in inspect.signature(
+        is_person_in_fall_pose
+    ).parameters
+except (TypeError, ValueError):
+    _FALL_POSE_ACCEPTS_SENSITIVITY = False
+
+
+def _is_person_in_fall_pose_compat(
+    person_bbox,
+    keypoints_data,
+    detection_sensitivity,
+):
+    if _FALL_POSE_ACCEPTS_SENSITIVITY:
+        return is_person_in_fall_pose(
+            person_bbox,
+            keypoints_data,
+            detection_sensitivity=detection_sensitivity,
+        )
+    return is_person_in_fall_pose(person_bbox, keypoints_data)

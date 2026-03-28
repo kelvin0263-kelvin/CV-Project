@@ -87,7 +87,7 @@ def _serialize_counting_config_row(row: PeopleCountingConfig) -> dict:
         "camera_id": row.camera_id,
         "enabled": row.enabled,
         "participate_in_building_count": row.participate_in_building_count,
-        "entrance_id": row.entrance_id,
+        "building_id": row.building_id,
         "cross_camera_enabled": row.cross_camera_enabled,
         "cross_camera_pair_id": row.cross_camera_pair_id,
         "cross_camera_role": row.cross_camera_role,
@@ -124,7 +124,7 @@ def _cache_config(camera_id: str, row: PeopleCountingConfig):
     _counting_configs[camera_id] = {
         "enabled": row.enabled,
         "participate_in_building_count": row.participate_in_building_count,
-        "entrance_id": row.entrance_id,
+        "building_id": row.building_id,
         "cross_camera_enabled": row.cross_camera_enabled,
         "cross_camera_pair_id": row.cross_camera_pair_id,
         "cross_camera_role": row.cross_camera_role,
@@ -211,6 +211,14 @@ _building_snapshot_queue: list[dict] = []
 _last_saved_building_snapshot_signature: tuple | None = None
 _last_queued_building_snapshot_signature: tuple | None = None
 _last_building_snapshot_time: float = 0.0
+
+
+def _normalize_query_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
 
 
 def queue_counting_snapshot(snapshot: dict):
@@ -379,7 +387,63 @@ def _queue_building_snapshot_if_needed(heartbeat_interval: float = BUILDING_SNAP
         _last_building_snapshot_time = now
 
 
-def reset_all_runtime_counts():
+async def _restart_rtsp_counting_runtimes():
+    """Restart RTSP counting producers so tracker state is refreshed at midnight."""
+    if not _rtsp_counting_camera_ids:
+        return
+
+    from app.services.video_processor import start_producer_thread, stop_producer_thread
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(StreamConfig).where(StreamConfig.camera_id.in_(sorted(_rtsp_counting_camera_ids)))
+        )
+        stream_rows = result.scalars().all()
+
+    runtime_groups: dict[str, list[StreamConfig]] = {}
+    for row in stream_rows:
+        runtime_key = (row.runtime_key or row.source_path or "").strip()
+        if not runtime_key or not row.source_path or not is_rtsp_source(row.source_path):
+            continue
+        runtime_groups.setdefault(runtime_key, []).append(row)
+
+    restarted = 0
+    for runtime_key, rows in runtime_groups.items():
+        first_row = rows[0]
+        is_fisheye = any(bool(row.is_fisheye) for row in rows)
+        active_views = None
+        if is_fisheye:
+            active_views = sorted(
+                {
+                    int(row.view_index)
+                    for row in rows
+                    if row.view_index is not None and int(row.view_index) >= 0
+                }
+            ) or None
+
+        stop_producer_thread(runtime_key)
+        start_producer_thread(
+            runtime_key,
+            first_row.source_path,
+            is_fisheye,
+            active_views,
+        )
+        restarted += 1
+
+    if restarted:
+        print(
+            " ".join(
+                [
+                    "[CountingReset]",
+                    "scope=daily_runtime_restart",
+                    f"runtime_count={restarted}",
+                    f"timestamp={datetime.now().astimezone().isoformat()}",
+                ]
+            )
+        )
+
+
+async def reset_all_runtime_counts():
     """
     Reset in-memory counting runtime across all cameras.
     Historical rows already stored in the database are preserved.
@@ -409,6 +473,8 @@ def reset_all_runtime_counts():
         )
     )
 
+    await _restart_rtsp_counting_runtimes()
+
 
 def _seconds_until_next_local_midnight(now: datetime | None = None) -> float:
     local_now = now or datetime.now().astimezone()
@@ -426,7 +492,7 @@ async def daily_runtime_reset_loop():
     while True:
         await asyncio.sleep(_seconds_until_next_local_midnight())
         try:
-            reset_all_runtime_counts()
+            await reset_all_runtime_counts()
         except Exception as e:
             print(f"[CountingReset] Daily runtime reset failed: {e}")
 
@@ -595,7 +661,7 @@ async def _get_or_create_building_config(session: AsyncSession) -> BuildingCount
     return row
 
 
-def _normalize_entrance_id(raw_value: str | None) -> str | None:
+def _normalize_building_id(raw_value: str | None) -> str | None:
     value = (raw_value or "").strip()
     return value or None
 
@@ -603,12 +669,12 @@ def _normalize_entrance_id(raw_value: str | None) -> str | None:
 def _validate_building_entrance_fields(
     *,
     participate_in_building_count: bool,
-    entrance_id: str | None,
+    building_id: str | None,
 ):
     if not participate_in_building_count:
         return
-    if not entrance_id:
-        raise HTTPException(status_code=400, detail="entrance_id is required when building counting is enabled for a camera.")
+    if not building_id:
+        raise HTTPException(status_code=400, detail="building_id is required when building counting is enabled for a camera.")
 
 
 def _normalize_cross_camera_role(raw_value: str | None) -> str:
@@ -685,7 +751,7 @@ async def sync_counting_runtime_from_db(session: AsyncSession):
         new_configs[row.camera_id] = {
             "enabled": row.enabled,
             "participate_in_building_count": row.participate_in_building_count,
-            "entrance_id": row.entrance_id,
+            "building_id": row.building_id,
             "cross_camera_enabled": row.cross_camera_enabled,
             "cross_camera_pair_id": row.cross_camera_pair_id,
             "cross_camera_role": row.cross_camera_role,
@@ -697,11 +763,11 @@ async def sync_counting_runtime_from_db(session: AsyncSession):
         if (
             row.enabled
             and row.participate_in_building_count
-            and row.entrance_id
+            and row.building_id
         ):
             building_sensor_configs[row.camera_id] = {
                 "enabled": True,
-                "entrance_id": row.entrance_id,
+                "building_id": row.building_id,
             }
 
     _counting_configs = new_configs
@@ -768,14 +834,14 @@ async def upsert_config(
         if update.participate_in_building_count is not None
         else (row.participate_in_building_count if row is not None else False)
     )
-    entrance_id = (
-        _normalize_entrance_id(update.entrance_id)
-        if update.entrance_id is not None
-        else (row.entrance_id if row is not None else None)
+    building_id = (
+        _normalize_building_id(update.building_id)
+        if update.building_id is not None
+        else (row.building_id if row is not None else None)
     )
     _validate_building_entrance_fields(
         participate_in_building_count=bool(participate_in_building_count),
-        entrance_id=entrance_id,
+        building_id=building_id,
     )
 
     cross_camera_enabled = (
@@ -789,7 +855,7 @@ async def upsert_config(
         else (row.cross_camera_pair_id if row is not None else None)
     )
     verification_camera_id = (
-        _normalize_entrance_id(update.verification_camera_id)
+        _normalize_building_id(update.verification_camera_id)
         if update.verification_camera_id is not None
         else (row.verification_camera_id if row is not None else None)
     )
@@ -823,7 +889,7 @@ async def upsert_config(
             camera_id=camera_id,
             enabled=update.enabled if update.enabled is not None else True,
             participate_in_building_count=bool(participate_in_building_count),
-            entrance_id=entrance_id,
+            building_id=building_id,
             cross_camera_enabled=bool(cross_camera_enabled),
             cross_camera_pair_id=cross_camera_pair_id,
             cross_camera_role=cross_camera_role,
@@ -839,8 +905,8 @@ async def upsert_config(
             row.enabled = update.enabled
         if update.participate_in_building_count is not None:
             row.participate_in_building_count = update.participate_in_building_count
-        if update.entrance_id is not None:
-            row.entrance_id = entrance_id
+        if update.building_id is not None:
+            row.building_id = building_id
         if update.cross_camera_enabled is not None:
             row.cross_camera_enabled = bool(cross_camera_enabled)
         if update.cross_camera_pair_id is not None:
@@ -857,7 +923,7 @@ async def upsert_config(
             row.frame_exclude_areas = frame_exclude_areas
 
     if not row.participate_in_building_count:
-        row.entrance_id = None
+        row.building_id = None
     if not row.cross_camera_enabled:
         row.cross_camera_pair_id = None
         row.cross_camera_role = "none"
@@ -888,14 +954,25 @@ async def delete_config(camera_id: str, db: AsyncSession = Depends(get_db)):
 @router.get("/api/people-counting-history", response_model=list[PeopleCountingSnapshotRead])
 async def get_history(
     camera_id: str | None = Query(None),
+    start: datetime | None = Query(None),
+    end: datetime | None = Query(None),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
 ):
     """Get historical counting snapshots, newest first."""
+    start = _normalize_query_datetime(start)
+    end = _normalize_query_datetime(end)
+    if start is not None and end is not None and start > end:
+        raise HTTPException(status_code=400, detail="start must be earlier than or equal to end")
+
     query = select(PeopleCountingSnapshot).order_by(desc(PeopleCountingSnapshot.timestamp))
     if camera_id:
         query = query.where(PeopleCountingSnapshot.camera_id == camera_id)
+    if start is not None:
+        query = query.where(PeopleCountingSnapshot.timestamp >= start)
+    if end is not None:
+        query = query.where(PeopleCountingSnapshot.timestamp <= end)
     query = query.offset(offset).limit(limit)
     result = await db.execute(query)
     return result.scalars().all()
@@ -954,16 +1031,23 @@ async def update_building_config(
 
 @router.get("/api/building-counting-history", response_model=list[BuildingCountingSnapshotRead])
 async def get_building_history(
+    start: datetime | None = Query(None),
+    end: datetime | None = Query(None),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
 ):
-    query = (
-        select(BuildingCountingSnapshot)
-        .order_by(desc(BuildingCountingSnapshot.timestamp))
-        .offset(offset)
-        .limit(limit)
-    )
+    start = _normalize_query_datetime(start)
+    end = _normalize_query_datetime(end)
+    if start is not None and end is not None and start > end:
+        raise HTTPException(status_code=400, detail="start must be earlier than or equal to end")
+
+    query = select(BuildingCountingSnapshot).order_by(desc(BuildingCountingSnapshot.timestamp))
+    if start is not None:
+        query = query.where(BuildingCountingSnapshot.timestamp >= start)
+    if end is not None:
+        query = query.where(BuildingCountingSnapshot.timestamp <= end)
+    query = query.offset(offset).limit(limit)
     result = await db.execute(query)
     return result.scalars().all()
 

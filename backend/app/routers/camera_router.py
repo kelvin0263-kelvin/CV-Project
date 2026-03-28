@@ -485,19 +485,21 @@ async def _get_uploaded_camera_stream(
     return stream_config
 
 
+
+# make the video sync at run time
 def _start_uploaded_runtime_members(members: list[dict]) -> int:
     if not members:
         return 0
 
-    sync_state = {"started_at": None}
     if len(members) > 1:
+        sync_state = {"started_at": None}
         sync_barrier = threading.Barrier(
             len(members),
             action=lambda: sync_state.__setitem__("started_at", time.perf_counter()),
         )
     else:
         sync_barrier = None
-        sync_state["started_at"] = time.perf_counter()
+        sync_state = None
 
     for member in members:
         start_producer_thread(

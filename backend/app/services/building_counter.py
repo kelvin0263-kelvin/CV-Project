@@ -34,7 +34,7 @@ def sync_building_runtime(building_config: dict, sensor_configs: dict[str, dict]
         _sensor_configs = {
             camera_id: {
                 "enabled": bool(cfg.get("enabled", True)),
-                "entrance_id": (cfg.get("entrance_id") or "").strip(),
+                "building_id": (cfg.get("building_id") or "").strip(),
             }
             for camera_id, cfg in sensor_configs.items()
         }
@@ -71,22 +71,22 @@ def ingest_sensor_events(camera_id: str, events: list[dict]):
         if not sensor_cfg or not sensor_cfg.get("enabled", True):
             return None
 
-        entrance_id = (sensor_cfg.get("entrance_id") or "").strip()
-        if not entrance_id:
+        building_id = (sensor_cfg.get("building_id") or "").strip()
+        if not building_id:
             return None
 
-        rollup = _entrance_rollups.get(entrance_id)
+        rollup = _entrance_rollups.get(building_id)
         if not rollup:
             rollup = _new_rollup()
-            _entrance_rollups[entrance_id] = rollup
+            _entrance_rollups[building_id] = rollup
         camera_rollup = _camera_rollups.get(camera_id)
         if not camera_rollup:
             camera_rollup = {"entrances": {}}
             _camera_rollups[camera_id] = camera_rollup
-        entrance_camera_rollup = camera_rollup["entrances"].get(entrance_id)
+        entrance_camera_rollup = camera_rollup["entrances"].get(building_id)
         if not entrance_camera_rollup:
             entrance_camera_rollup = _new_rollup()
-            camera_rollup["entrances"][entrance_id] = entrance_camera_rollup
+            camera_rollup["entrances"][building_id] = entrance_camera_rollup
 
         for event in events:
             direction = event.get("direction")
@@ -141,9 +141,9 @@ def get_building_summary() -> dict:
         capacity_exceeded = bool(max_capacity is not None and occupancy >= max_capacity)
 
         entrance_ids = {
-            cfg["entrance_id"]
+            cfg["building_id"]
             for cfg in _sensor_configs.values()
-            if cfg.get("enabled", True) and cfg.get("entrance_id")
+            if cfg.get("enabled", True) and cfg.get("building_id")
         }
         entrance_ids.update(_entrance_rollups.keys())
 
@@ -153,13 +153,24 @@ def get_building_summary() -> dict:
             camera_ids = [
                 camera_id
                 for camera_id, cfg in _sensor_configs.items()
-                if cfg.get("enabled", True) and (cfg.get("entrance_id") or "").strip() == entrance_id
+                if cfg.get("enabled", True) and (cfg.get("building_id") or "").strip() == entrance_id
             ]
+            camera_summaries = {}
+            for camera_id in camera_ids:
+                camera_rollup = (_camera_rollups.get(camera_id) or {}).get("entrances", {}).get(entrance_id) or _new_rollup()
+                camera_total_in = int(camera_rollup.get("total_in", 0) or 0)
+                camera_total_out = int(camera_rollup.get("total_out", 0) or 0)
+                camera_summaries[camera_id] = {
+                    "total_in": camera_total_in,
+                    "total_out": camera_total_out,
+                    "occupancy": max(0, camera_total_in - camera_total_out),
+                }
             entrance_summaries[entrance_id] = {
                 "camera_ids": camera_ids,
                 "total_in": rollup["total_in"],
                 "total_out": rollup["total_out"],
                 "occupancy": max(0, rollup["total_in"] - rollup["total_out"]),
+                "camera_summaries": camera_summaries,
             }
 
         return {

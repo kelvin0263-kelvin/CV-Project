@@ -10,7 +10,7 @@ class PeopleCountingConfig(Base):
     camera_id = Column(String, ForeignKey("cameras.id", ondelete="CASCADE"), unique=True, nullable=False)
     enabled = Column(Boolean, nullable=False, default=True)
     participate_in_building_count = Column(Boolean, nullable=False, default=False)
-    entrance_id = Column(String(100), nullable=True)
+    building_id = Column(String(100), nullable=True)
     cross_camera_enabled = Column(Boolean, nullable=False, default=False)
     cross_camera_pair_id = Column(String(100), nullable=True)
     cross_camera_role = Column(String(20), nullable=False, default="none")

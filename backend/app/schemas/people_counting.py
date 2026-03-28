@@ -27,7 +27,7 @@ class PeopleCountingConfigRead(BaseModel):
     camera_id: str
     enabled: bool
     participate_in_building_count: bool = False
-    entrance_id: Optional[str] = None
+    building_id: Optional[str] = None
     cross_camera_enabled: bool = False
     cross_camera_pair_id: Optional[str] = None
     cross_camera_role: Literal["none", "primary", "verifier"] = "none"
@@ -43,7 +43,7 @@ class PeopleCountingConfigUpdate(BaseModel):
     """Schema for creating/updating people counting config."""
     enabled: Optional[bool] = True
     participate_in_building_count: Optional[bool] = None
-    entrance_id: Optional[str] = None
+    building_id: Optional[str] = None
     cross_camera_enabled: Optional[bool] = None
     cross_camera_pair_id: Optional[str] = None
     cross_camera_role: Optional[Literal["none", "primary", "verifier"]] = None
