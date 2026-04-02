@@ -17,6 +17,41 @@ from app.schemas.dresscode_policy import DressCodePolicyRead, DressCodePolicyUpd
 from app.services.video_processor import update_policy
 
 router = APIRouter()
+DEFAULT_DRESSCODE_CONFIDENCE_THRESHOLD = 0.8
+
+
+def _resolve_thresholds(policy: DressCodePolicy) -> tuple[float, float, float]:
+    shared_threshold = float(
+        policy.confidence_threshold
+        if policy.confidence_threshold is not None
+        else DEFAULT_DRESSCODE_CONFIDENCE_THRESHOLD
+    )
+    pants_threshold = float(
+        policy.pants_confidence_threshold
+        if policy.pants_confidence_threshold is not None
+        else shared_threshold
+    )
+    slipper_threshold = float(
+        policy.slipper_confidence_threshold
+        if policy.slipper_confidence_threshold is not None
+        else shared_threshold
+    )
+    return shared_threshold, pants_threshold, slipper_threshold
+
+
+def _serialize_policy(policy: DressCodePolicy) -> dict:
+    shared_threshold, pants_threshold, slipper_threshold = _resolve_thresholds(policy)
+    return {
+        "id": policy.id,
+        "enabled_camera_ids": policy.enabled_camera_ids or [],
+        "restricted_labels": policy.restricted_labels or ["shorts"],
+        "confidence_threshold": shared_threshold,
+        "pants_confidence_threshold": pants_threshold,
+        "slipper_confidence_threshold": slipper_threshold,
+        "enabled": bool(policy.enabled),
+        "enable_pants_detection": bool(policy.enable_pants_detection),
+        "enable_slipper_detection": bool(policy.enable_slipper_detection),
+    }
 
 
 async def _get_or_create_policy(db: AsyncSession) -> DressCodePolicy:
@@ -27,7 +62,9 @@ async def _get_or_create_policy(db: AsyncSession) -> DressCodePolicy:
         policy = DressCodePolicy(
             enabled_camera_ids=[],
             restricted_labels=["shorts"],
-            confidence_threshold=0.8,
+            confidence_threshold=DEFAULT_DRESSCODE_CONFIDENCE_THRESHOLD,
+            pants_confidence_threshold=DEFAULT_DRESSCODE_CONFIDENCE_THRESHOLD,
+            slipper_confidence_threshold=DEFAULT_DRESSCODE_CONFIDENCE_THRESHOLD,
             enabled=True,
             enable_pants_detection=True,
             enable_slipper_detection=False,
@@ -67,10 +104,13 @@ async def _sync_policy_to_runtime(db: AsyncSession, policy: DressCodePolicy):
             detection_map[runtime_key].add(view_key)
             camera_id_map[(runtime_key, view_key)] = sc.camera_id
 
+    shared_threshold, pants_threshold, slipper_threshold = _resolve_thresholds(policy)
     update_policy({
         "enabled_camera_ids": policy.enabled_camera_ids or [],
         "restricted_labels": policy.restricted_labels or ["shorts"],
-        "confidence_threshold": policy.confidence_threshold or 0.8,
+        "confidence_threshold": shared_threshold,
+        "pants_confidence_threshold": pants_threshold,
+        "slipper_confidence_threshold": slipper_threshold,
         "enable_pants_detection": bool(policy.enable_pants_detection),
         "enable_slipper_detection": bool(policy.enable_slipper_detection),
         "detection_map": detection_map,
@@ -104,7 +144,7 @@ async def sync_policy_runtime_from_db(db: AsyncSession) -> DressCodePolicy:
 @router.get("/api/dresscode-policy", response_model=DressCodePolicyRead)
 async def get_policy(db: AsyncSession = Depends(get_db)):
     policy = await _get_or_create_policy(db)
-    return policy
+    return _serialize_policy(policy)
 
 
 @router.put("/api/dresscode-policy", response_model=DressCodePolicyRead)
@@ -121,6 +161,14 @@ async def update_policy_endpoint(
         policy.restricted_labels = update.restricted_labels
     if update.confidence_threshold is not None:
         policy.confidence_threshold = update.confidence_threshold
+        if update.pants_confidence_threshold is None:
+            policy.pants_confidence_threshold = update.confidence_threshold
+        if update.slipper_confidence_threshold is None:
+            policy.slipper_confidence_threshold = update.confidence_threshold
+    if update.pants_confidence_threshold is not None:
+        policy.pants_confidence_threshold = update.pants_confidence_threshold
+    if update.slipper_confidence_threshold is not None:
+        policy.slipper_confidence_threshold = update.slipper_confidence_threshold
     if update.enabled is not None:
         policy.enabled = update.enabled
     if update.enable_pants_detection is not None:
@@ -131,4 +179,5 @@ async def update_policy_endpoint(
     await db.flush()
     await db.refresh(policy)
 
-    return await sync_policy_runtime_from_db(db)
+    synced_policy = await sync_policy_runtime_from_db(db)
+    return _serialize_policy(synced_policy)

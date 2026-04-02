@@ -44,22 +44,25 @@ from app.services.dresscode_detector import (
     crop_full_person,
 )
 from app.services.fall_detector import is_person_in_fall_pose
-from app.services.building_counter import ingest_sensor_events
+from app.services.building_counter import ingest_sensor_events, revert_sensor_in_events
 from app.services.cross_camera_verifier import (
     apply_primary_camera_correction,
     get_verifier_camera_status,
     observe_verifier_tracks,
     register_primary_in_events,
+    register_primary_in_reversions,
     register_primary_out_events,
     reset_cross_camera_state,
 )
 from app.services.people_counter import PeopleCounter
 from app.services.source_roi_registry import get_source_detection_roi
 from app.routers.counting_router import (
+    _build_empty_live_count,
     consume_counting_reset,
     get_counting_views,
     get_counting_camera_id,
     get_counting_config,
+    get_live_counts,
     update_live_counts,
     queue_counting_snapshot,
 )
@@ -81,7 +84,7 @@ os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
 # Fixed runtime tuning for the current project.
 # POSE_MODEL_PT_PATH = os.path.join(BACKEND_ROOT, "yolov8l-pose.pt")
-POSE_MODEL_ENGINE_PATH = os.path.join(BACKEND_ROOT, "yolov8m-pose.engine")
+POSE_MODEL_ENGINE_PATH = os.path.join(BACKEND_ROOT, "yolo26m-pose.engine")
 POSE_MODEL_PT_PATH = "yolov8m-pose.pt"
 # POSE_MODEL_ENGINE_PATH = ""
 
@@ -1610,6 +1613,14 @@ def _cleanup_producer_state(runtime_key: str, clear_frame_buffer: bool):
         FRAME_BUFFERS.pop(runtime_key, None)
 
 
+def _clear_uploaded_eof_live_counts(runtime_key: str) -> None:
+    for view_key in get_counting_views(runtime_key):
+        camera_id = get_counting_camera_id(runtime_key, view_key)
+        if not camera_id:
+            continue
+        update_live_counts(camera_id, _build_empty_live_count(camera_id))
+
+
 # ---------------------------------------------------------------------------
 # Main producer loop
 # ---------------------------------------------------------------------------
@@ -2153,6 +2164,24 @@ def video_producer(
         # Get or create PeopleCounter for this view
         if view_key not in people_counters:
             people_counters[view_key] = PeopleCounter(config)
+            restored_counts = get_live_counts(camera_id)
+            if restored_counts:
+                people_counters[view_key].restore_counts(
+                    total_in=restored_counts.get("total_in", 0),
+                    total_out=restored_counts.get("total_out", 0),
+                    foot_traffic_left=restored_counts.get("foot_traffic_left", 0),
+                    foot_traffic_right=restored_counts.get("foot_traffic_right", 0),
+                )
+                counting_event_state[view_key] = {
+                    "total_in": int(restored_counts.get("total_in", 0) or 0),
+                    "total_out": int(restored_counts.get("total_out", 0) or 0),
+                    "raw_total_in": int(
+                        restored_counts.get("raw_total_in", restored_counts.get("total_in", 0)) or 0
+                    ),
+                    "raw_total_out": int(
+                        restored_counts.get("raw_total_out", restored_counts.get("total_out", 0)) or 0
+                    ),
+                }
             print(f"[Counting] Created counter for {view_key} (camera={camera_id}), "
                   f"lines={len(config.get('lines', []))}, "
                   f"frame_exclude_areas={len(config.get('frame_exclude_areas', []))}")
@@ -2184,8 +2213,12 @@ def video_producer(
         raw_total_out = int(raw_counting_data.get("total_out", 0) or 0)
         raw_delta_in = max(0, raw_total_in - int(prev_state.get("raw_total_in", 0) or 0))
         raw_delta_out = max(0, raw_total_out - int(prev_state.get("raw_total_out", 0) or 0))
+        reverted_in = int(raw_counting_data.get("in_reversions", 0) or 0)
+        if reverted_in > 0:
+            revert_sensor_in_events(camera_id, reverted_in)
 
         register_primary_in_events(camera_id, raw_delta_in, now_ts)
+        register_primary_in_reversions(camera_id, reverted_in, now_ts)
         register_primary_out_events(camera_id, raw_delta_out, now_ts)
         observe_verifier_tracks(camera_id, detections_unscaled, config, frame_shape, now_ts)
         counting_data, _ = apply_primary_camera_correction(camera_id, raw_counting_data, now_ts)
@@ -2421,6 +2454,7 @@ def video_producer(
             print(f"[Producer] Stop requested for runtime_key={runtime_key}, source={source_path}")
             break
 
+        # only use by video file to ensure 2 video run together 
         if sync_timeline_active and fps > 0:
             target_frame_index = max(0, int((time.perf_counter() - sync_started_at) * fps))
             while decoded_frame_index < target_frame_index - 1:
@@ -2428,13 +2462,14 @@ def video_producer(
                     break
 
         loop_start = time.time()
-        # Frame acquisition
-        # Step 6A: Acquire the next frame either from the async reader queue or directly from OpenCV.
+        # Read Frame 
+        # Step 6A (RTSP Stream): Acquire the next frame either from the async reader queue or directly from OpenCV.
         if use_async_capture:
             packet = async_reader.read(timeout=ASYNC_CAPTURE_READ_TIMEOUT_MS / 1000.0) if async_reader else None
             if packet is None:
                 continue
 
+            # check wthether the frame is good or bad
             packet_type = packet.get("type")
             if packet_type == "fatal":
                 print(
@@ -2453,7 +2488,9 @@ def video_producer(
             if frame is None:
                 continue
             decode_ms = float(packet.get("decode_ms", 0.0))
+        # Step 6A (Video source): Acquire the next frame from OpenCV.
         else:
+            # the time calculate at here is for next loop of sync_timeline_active
             read_started_at = time.perf_counter()
             ret, frame = cap.read()
             decode_ms = (time.perf_counter() - read_started_at) * 1000.0
@@ -2516,6 +2553,7 @@ def video_producer(
         dresscode_views = _get_detection_views(runtime_key)
         fall_views = get_fall_detection_views(source_path)
 
+        # step 7
         # Frame preprocessing + feature logic
         if is_fisheye and processor:
             try:
@@ -2641,6 +2679,8 @@ def video_producer(
         cap.release()
     # Step 12: Mark the runtime offline and clear runtime-owned resources.
     final_reason = "finished" if reached_eof else "stopped"
+    if source_meta.get("is_uploaded_source") and source_meta.get("is_file_source"):
+        _clear_uploaded_eof_live_counts(runtime_key)
     _set_runtime_stream_status(runtime_key, status="offline", reason=final_reason, clear_images=True)
     _cleanup_producer_state(runtime_key, clear_frame_buffer=True)
     print(f"[Producer] Stopped loop for runtime_key={runtime_key}, source={source_path}")
@@ -2654,6 +2694,8 @@ _current_policy = {
     "enabled_camera_ids": [],
     "restricted_labels": ["shorts"],
     "confidence_threshold": 0.8,
+    "pants_confidence_threshold": 0.8,
+    "slipper_confidence_threshold": 0.8,
     "enable_pants_detection": True,
     "enable_slipper_detection": False,
     "detection_map": {},       # runtime_key -> set of view_keys
@@ -2678,6 +2720,26 @@ def update_policy(policy: dict):
 def get_policy() -> dict:
     with _policy_lock:
         return dict(_current_policy)
+
+
+def _coerce_policy_threshold(value, fallback: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(fallback)
+
+
+def _get_policy_classifier_thresholds(policy: dict) -> tuple[float, float]:
+    shared_threshold = _coerce_policy_threshold(policy.get("confidence_threshold"), 0.8)
+    pants_threshold = _coerce_policy_threshold(
+        policy.get("pants_confidence_threshold"),
+        shared_threshold,
+    )
+    slipper_threshold = _coerce_policy_threshold(
+        policy.get("slipper_confidence_threshold"),
+        shared_threshold,
+    )
+    return pants_threshold, slipper_threshold
 
 
 def _get_detection_views(runtime_key: str) -> set:
@@ -2747,7 +2809,24 @@ def _get_cached_classification_for_enabled_models(cached: dict, *, enable_pants:
     }
 
 
-def _collect_violation_classifications(det: dict, restricted: set[str], threshold: float) -> list[dict]:
+def _get_violation_threshold_for_classification(
+    classification: dict,
+    *,
+    pants_threshold: float,
+    slipper_threshold: float,
+) -> float:
+    if classification.get("region") == "footwear":
+        return slipper_threshold
+    return pants_threshold
+
+
+def _collect_violation_classifications(
+    det: dict,
+    restricted: set[str],
+    *,
+    pants_threshold: float,
+    slipper_threshold: float,
+) -> list[dict]:
     classifications = list(det.get("classifications") or [])
 
     if not classifications and det.get("label") is not None and det.get("confidence") is not None:
@@ -2765,6 +2844,11 @@ def _collect_violation_classifications(det: dict, restricted: set[str], threshol
         confidence = item.get("confidence")
         if label is None or confidence is None:
             continue
+        threshold = _get_violation_threshold_for_classification(
+            item,
+            pants_threshold=pants_threshold,
+            slipper_threshold=slipper_threshold,
+        )
         if label in restricted and confidence >= threshold:
             candidates.append(dict(item))
 
@@ -2876,14 +2960,19 @@ def _apply_policy_and_save(detections, track_state, frame, runtime_key, source_p
     """
     policy = get_policy()
     restricted = set(policy.get("restricted_labels", []))
-    threshold = policy.get("confidence_threshold", 0.8)
+    pants_threshold, slipper_threshold = _get_policy_classifier_thresholds(policy)
 
     # Resolve camera_id from the runtime key + view key
     camera_id = _get_camera_id(runtime_key, view_key) if view_key else None
 
     for det in detections:
         track_id = det.get("track_id")
-        matched_violations = _collect_violation_classifications(det, restricted, threshold)
+        matched_violations = _collect_violation_classifications(
+            det,
+            restricted,
+            pants_threshold=pants_threshold,
+            slipper_threshold=slipper_threshold,
+        )
         det["matched_violations"] = [dict(item) for item in matched_violations]
 
         track_entry = None

@@ -182,6 +182,40 @@ def register_primary_in_events(camera_id: str, delta_in: int, now: float | None 
     _register_primary_events(camera_id, delta_in, "in", now)
 
 
+def register_primary_in_reversions(camera_id: str, reverted_count: int, now: float | None = None) -> None:
+    if reverted_count <= 0:
+        return
+    if now is None:
+        now = time.time()
+
+    active_key, _, primary_count_key, _ = _event_state_keys("in")
+
+    with _runtime_lock:
+        pair_state = _pair_states.get(camera_id)
+        if not pair_state:
+            return
+
+        pair_state["last_raw_total_in"] = max(
+            0,
+            int(pair_state.get("last_raw_total_in", 0) or 0) - int(reverted_count),
+        )
+
+        active_event = pair_state.get(active_key)
+        if active_event is None:
+            return
+
+        remaining = max(
+            0,
+            int(active_event.get(primary_count_key, 0) or 0) - int(reverted_count),
+        )
+        if remaining <= 0:
+            pair_state[active_key] = None
+            return
+
+        active_event[primary_count_key] = remaining
+        active_event["last_activity_time"] = now
+
+
 def register_primary_out_events(camera_id: str, delta_out: int, now: float | None = None) -> None:
     _register_primary_events(camera_id, delta_out, "out", now)
 

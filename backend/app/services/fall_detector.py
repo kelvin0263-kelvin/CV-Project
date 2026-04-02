@@ -1,11 +1,8 @@
 import math
 from typing import Optional
-
 import numpy as np
 
-# Same as user's code
 CONFIDENCE_THRESHOLD = 0.3
-
 
 def calculate_angle(p1: tuple[float, float], p2: tuple[float, float]) -> float:
     """Angle in degrees between horizontal and the line p1->p2 (vertical=90)."""
@@ -25,23 +22,28 @@ def is_person_in_fall_pose(
 ) -> bool:
     """
     Determine if one person is in fall pose using shoulder/hip angle and bbox ratio.
-    keypoints_data: shape (17, 3) with (x, y, confidence). Indices 5,6 = shoulders, 11,12 = hips.
-    Returns True if condition1 or condition2 (user's algorithm, unchanged).
     """
+    if person_bbox is None or len(person_bbox) < 4:
+        return False
+        
     if keypoints_data is None or keypoints_data.shape[0] < 17:
         return False
 
     x1, y1, x2, y2 = person_bbox
     w = x2 - x1
     h = y2 - y1
-    ratio = w / h if h > 0 else 0
+    if h <= 0 or w <= 0:
+        return False
+        
+    ratio = w / h
 
-    # Keypoints: 5=left_shoulder, 6=right_shoulder, 11=left_hip, 12=right_hip
+    # Extract keypoints: 5=left shoulder, 6=right shoulder, 11=left hip, 12=right hip
     l_shoulder = keypoints_data[5]
     r_shoulder = keypoints_data[6]
     l_hip = keypoints_data[11]
     r_hip = keypoints_data[12]
 
+    # Calculate shoulder midpoint (as long as at least one side is visible/confident)
     s_x, s_y, s_count = 0.0, 0.0, 0
     if l_shoulder[2] >= CONFIDENCE_THRESHOLD:
         s_x += l_shoulder[0]
@@ -52,6 +54,7 @@ def is_person_in_fall_pose(
         s_y += r_shoulder[1]
         s_count += 1
 
+    # Calculate hip midpoint (as long as at least one side is visible/confident)
     h_x, h_y, h_count = 0.0, 0.0, 0
     if l_hip[2] >= CONFIDENCE_THRESHOLD:
         h_x += l_hip[0]
@@ -62,17 +65,24 @@ def is_person_in_fall_pose(
         h_y += r_hip[1]
         h_count += 1
 
+    # If neither a single shoulder nor a single hip can be found, 
+    # it means the target is severely occluded or is not a human (e.g., animal/vehicle)
     if s_count == 0 or h_count == 0:
         return False
 
     shoulder_mid = (s_x / s_count, s_y / s_count)
     hip_mid = (h_x / h_count, h_y / h_count)
+    
     current_angle = calculate_angle(shoulder_mid, hip_mid)
 
-    # User's rules (unchanged)
     condition1 = (current_angle < 40) and (ratio > 0.7)
     condition2 = (current_angle < 55) and (ratio > 1.15)
-    return bool(condition1 or condition2)
+    
+    # If the person falls completely flat on the ground, the bounding box ratio will be extremely large.
+    # In this case, ignore the angle and directly count as a fall.
+    condition3 = (ratio > 1.3)
+
+    return bool(condition1 or condition2 or condition3)
 
 
 def process_detections(detections: list[dict]) -> dict[int | None, bool]:
@@ -89,6 +99,7 @@ def process_detections(detections: list[dict]) -> dict[int | None, bool]:
             continue
         if kp is not None and not isinstance(kp, np.ndarray):
             kp = np.array(kp, dtype=np.float32)
+            
         is_fall = is_person_in_fall_pose(bbox, kp)
         key = det.get("track_id") if det.get("track_id") is not None else i
         result[key] = is_fall

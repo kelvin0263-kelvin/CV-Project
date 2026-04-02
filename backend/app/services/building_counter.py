@@ -102,6 +102,56 @@ def ingest_sensor_events(camera_id: str, events: list[dict]):
         return _maybe_building_capacity_alert_locked()
 
 
+def revert_sensor_in_events(camera_id: str, reverted_count: int):
+    """Subtract reverted IN events from the camera and building rollups."""
+    global _raw_in, _capacity_alert_fired
+
+    reverted_count = max(0, int(reverted_count or 0))
+    if reverted_count <= 0:
+        return
+
+    with _runtime_lock:
+        if not _building_config.get("enabled", True):
+            return
+
+        sensor_cfg = _sensor_configs.get(camera_id)
+        if not sensor_cfg or not sensor_cfg.get("enabled", True):
+            return
+
+        building_id = (sensor_cfg.get("building_id") or "").strip()
+        if not building_id:
+            return
+
+        camera_rollup = _camera_rollups.get(camera_id)
+        if not camera_rollup:
+            return
+
+        entrance_camera_rollup = camera_rollup.get("entrances", {}).get(building_id)
+        if not entrance_camera_rollup:
+            return
+
+        reverted = min(reverted_count, int(entrance_camera_rollup.get("total_in", 0) or 0))
+        if reverted <= 0:
+            return
+
+        entrance_camera_rollup["total_in"] = max(0, int(entrance_camera_rollup.get("total_in", 0) or 0) - reverted)
+        _raw_in = max(0, _raw_in - reverted)
+
+        entrance_rollup = _entrance_rollups.get(building_id)
+        if entrance_rollup:
+            entrance_rollup["total_in"] = max(0, int(entrance_rollup.get("total_in", 0) or 0) - reverted)
+            if not entrance_rollup["total_in"] and not entrance_rollup["total_out"]:
+                _entrance_rollups.pop(building_id, None)
+
+        if not entrance_camera_rollup["total_in"] and not entrance_camera_rollup["total_out"]:
+            camera_rollup.get("entrances", {}).pop(building_id, None)
+        if not camera_rollup.get("entrances"):
+            _camera_rollups.pop(camera_id, None)
+
+        if not _is_capacity_exceeded_locked():
+            _capacity_alert_fired = False
+
+
 def reset_camera_rollup(camera_id: str):
     """Remove one camera's historical contribution from building totals."""
     global _raw_in, _raw_out, _capacity_alert_fired

@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete as sa_delete, desc
+from sqlalchemy import and_, func, select, delete as sa_delete, desc
 
 from app.core.database import get_db, AsyncSessionLocal
 from app.core.video_capture import is_rtsp_source
@@ -199,6 +199,81 @@ def _build_empty_live_count(camera_id: str) -> dict:
         "cross_camera_last_out_event": None,
         "lines": config.get("lines", []),
         "frame_exclude_areas": config.get("frame_exclude_areas", []),
+    }
+
+
+def _is_current_local_day_snapshot(timestamp: datetime | None) -> bool:
+    if timestamp is None:
+        return False
+    if timestamp.tzinfo is None:
+        local_timestamp = timestamp.replace(tzinfo=timezone.utc).astimezone()
+    else:
+        local_timestamp = timestamp.astimezone()
+    return local_timestamp.date() == datetime.now().astimezone().date()
+
+
+def _build_restored_live_count(camera_id: str, snapshot: PeopleCountingSnapshot) -> dict:
+    restored = _build_empty_live_count(camera_id)
+    total_in = int(snapshot.total_in or 0)
+    total_out = int(snapshot.total_out or 0)
+    restored.update(
+        {
+            "total_in": total_in,
+            "total_out": total_out,
+            "occupancy": int(snapshot.current_occupancy or 0),
+            "foot_traffic_left": int(snapshot.foot_traffic_left or 0),
+            "foot_traffic_right": int(snapshot.foot_traffic_right or 0),
+            "foot_traffic_total": int(snapshot.foot_traffic_total or 0),
+            "raw_total_in": total_in,
+            "raw_total_out": total_out,
+        }
+    )
+    return restored
+
+
+async def _load_latest_snapshot_by_camera(
+    session: AsyncSession,
+    camera_ids: list[str],
+) -> dict[str, PeopleCountingSnapshot]:
+    if not camera_ids:
+        return {}
+
+    latest_timestamp_subquery = (
+        select(
+            PeopleCountingSnapshot.camera_id.label("camera_id"),
+            func.max(PeopleCountingSnapshot.timestamp).label("latest_timestamp"),
+        )
+        .where(PeopleCountingSnapshot.camera_id.in_(camera_ids))
+        .group_by(PeopleCountingSnapshot.camera_id)
+        .subquery()
+    )
+
+    result = await session.execute(
+        select(PeopleCountingSnapshot)
+        .join(
+            latest_timestamp_subquery,
+            and_(
+                PeopleCountingSnapshot.camera_id == latest_timestamp_subquery.c.camera_id,
+                PeopleCountingSnapshot.timestamp == latest_timestamp_subquery.c.latest_timestamp,
+            ),
+        )
+        .order_by(
+            PeopleCountingSnapshot.camera_id.asc(),
+            PeopleCountingSnapshot.timestamp.desc(),
+            PeopleCountingSnapshot.id.desc(),
+        )
+    )
+
+    latest_by_camera: dict[str, PeopleCountingSnapshot] = {}
+    for snapshot in result.scalars():
+        existing = latest_by_camera.get(snapshot.camera_id)
+        if existing is None or snapshot.timestamp > existing.timestamp:
+            latest_by_camera[snapshot.camera_id] = snapshot
+
+    return {
+        camera_id: snapshot
+        for camera_id, snapshot in latest_by_camera.items()
+        if _is_current_local_day_snapshot(snapshot.timestamp)
     }
 
 
@@ -772,12 +847,33 @@ async def sync_counting_runtime_from_db(session: AsyncSession):
 
     _counting_configs = new_configs
     sync_cross_camera_runtime(new_configs)
-    _live_counts = {
-        camera_id: data
-        for camera_id, data in _live_counts.items()
-        if camera_id in valid_camera_ids
-    }
     await _rebuild_source_map(session)
+
+    latest_rtsp_snapshots = await _load_latest_snapshot_by_camera(
+        session,
+        sorted(_rtsp_counting_camera_ids),
+    )
+
+    next_live_counts: dict[str, dict] = {}
+    for camera_id in valid_camera_ids:
+        existing = _live_counts.get(camera_id)
+        if existing is not None:
+            merged = _build_empty_live_count(camera_id)
+            merged.update(
+                {
+                    key: value
+                    for key, value in existing.items()
+                    if key not in {"lines", "frame_exclude_areas"}
+                }
+            )
+            next_live_counts[camera_id] = merged
+            continue
+
+        latest_snapshot = latest_rtsp_snapshots.get(camera_id)
+        if latest_snapshot is not None:
+            next_live_counts[camera_id] = _build_restored_live_count(camera_id, latest_snapshot)
+
+    _live_counts = next_live_counts
 
     building_config = await _get_or_create_building_config(session)
     sync_building_runtime(

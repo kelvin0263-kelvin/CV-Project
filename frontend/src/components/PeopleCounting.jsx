@@ -162,7 +162,7 @@ const PeopleCounting = () => {
     const [frameExcludeAreas, setFrameExcludeAreas] = useState([]);
     const [enabled, setEnabled] = useState(true);
     const [participateInBuildingCount, setParticipateInBuildingCount] = useState(false);
-    const [entranceId, setEntranceId] = useState('');
+    const [buildingId, setBuildingId] = useState('');
     const [crossCameraEnabled, setCrossCameraEnabled] = useState(false);
     const [crossCameraPairId, setCrossCameraPairId] = useState('');
     const [crossCameraRole, setCrossCameraRole] = useState('none');
@@ -189,7 +189,7 @@ const PeopleCounting = () => {
         setFrameExcludeAreas([]);
         setEnabled(true);
         setParticipateInBuildingCount(false);
-        setEntranceId('');
+        setBuildingId('');
         setCrossCameraEnabled(false);
         setCrossCameraPairId('');
         setCrossCameraRole('none');
@@ -246,7 +246,7 @@ const PeopleCounting = () => {
                 setFrameExcludeAreas(filterValidFrameExcludeAreas(data.frame_exclude_areas));
                 setEnabled(data.enabled ?? true);
                 setParticipateInBuildingCount(data.participate_in_building_count ?? false);
-                setEntranceId(data.building_id || data.entrance_id || '');
+                setBuildingId(data.building_id || data.entrance_id || '');
                 setCrossCameraEnabled(data.cross_camera_enabled ?? false);
                 setCrossCameraPairId(data.cross_camera_pair_id || '');
                 setCrossCameraRole(data.cross_camera_role || 'none');
@@ -321,7 +321,7 @@ const PeopleCounting = () => {
             ? (crossCameraRole === 'none' ? 'primary' : crossCameraRole)
             : 'none';
 
-        if (participateInBuildingCount && !entranceId.trim()) {
+        if (participateInBuildingCount && !buildingId.trim()) {
             setSaveMessage('Error: building ID is required for building counting.');
             setTimeout(() => setSaveMessage(''), 3000);
             return;
@@ -346,7 +346,7 @@ const PeopleCounting = () => {
             const body = {
                 enabled,
                 participate_in_building_count: participateInBuildingCount,
-                building_id: participateInBuildingCount ? entranceId.trim() : null,
+                building_id: participateInBuildingCount ? buildingId.trim() : null,
                 cross_camera_enabled: crossCameraEnabled,
                 cross_camera_pair_id: crossCameraEnabled ? crossCameraPairId.trim() : null,
                 cross_camera_role: effectiveCrossCameraRole,
@@ -371,7 +371,7 @@ const PeopleCounting = () => {
             setFrameExcludeAreas(filterValidFrameExcludeAreas(savedConfig.frame_exclude_areas));
             setEnabled(savedConfig.enabled ?? true);
             setParticipateInBuildingCount(savedConfig.participate_in_building_count ?? false);
-            setEntranceId(savedConfig.building_id || savedConfig.entrance_id || '');
+            setBuildingId(savedConfig.building_id || savedConfig.entrance_id || '');
             setCrossCameraEnabled(savedConfig.cross_camera_enabled ?? false);
             setCrossCameraPairId(savedConfig.cross_camera_pair_id || '');
             setCrossCameraRole(savedConfig.cross_camera_role || 'none');
@@ -549,7 +549,7 @@ const PeopleCounting = () => {
     const occupancyLineCount = lines.filter((line) => getLineType(line) !== 'foot_traffic').length;
     const footTrafficLineCount = lines.filter((line) => getLineType(line) === 'foot_traffic').length;
     const buildingCapacityExceeded = buildingSummary.capacity_exceeded ?? false;
-    const buildingEntranceSummaries = buildingSummary.entrance_summaries ?? {};
+    const buildingGroupSummaries = buildingSummary.entrance_summaries ?? {};
     const showStoppedUploadPreview = Boolean(selectedCam?.is_uploaded && !selectedCam?.producer_running);
 
     useEffect(() => {
@@ -752,7 +752,7 @@ const PeopleCounting = () => {
                 {drawingMode === 'frame_exclude' && <p className="text-xs text-muted-foreground">Click around the preview to place points, then double-click to close the area.</p>}
             </SectionShell>
 
-            <SectionShell title="Building Entrance Group" description="Only cameras with the same building ID are merged into one building entrance total.">
+            <SectionShell title="Building Group" description="Only cameras with the same building ID are merged into one building total group.">
                 <div className="flex items-center justify-between rounded-2xl border border-border/70 bg-background px-4 py-3">
                     <div>
                         <div className="text-sm font-medium">Use Building ID</div>
@@ -763,7 +763,7 @@ const PeopleCounting = () => {
                 {participateInBuildingCount && (
                     <div className="space-y-2">
                         <label className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Building ID</label>
-                        <input type="text" className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm" value={entranceId} onChange={(e) => setEntranceId(e.target.value)} placeholder="building_1" />
+                        <input type="text" className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm" value={buildingId} onChange={(e) => setBuildingId(e.target.value)} placeholder="building_1" />
                     </div>
                 )}
             </SectionShell>
@@ -859,12 +859,12 @@ const PeopleCounting = () => {
                 </Button>
             </SectionShell>
 
-            {Object.keys(buildingEntranceSummaries).length > 0 && (
-                <SectionShell title="Entrance Rollups" description="These grouped entrance totals feed the building occupancy summary.">
+            {Object.keys(buildingGroupSummaries).length > 0 && (
+                <SectionShell title="Building Rollups" description="These grouped building-ID totals feed the building occupancy summary.">
                     <div className="grid gap-3">
-                        {Object.entries(buildingEntranceSummaries).map(([entranceIdValue, entrance]) => (
-                            <div key={entranceIdValue} className="rounded-2xl border border-border/70 bg-background px-4 py-3">
-                                <div className="text-sm font-medium">{entranceIdValue}</div>
+                        {Object.entries(buildingGroupSummaries).map(([buildingGroupId, entrance]) => (
+                            <div key={buildingGroupId} className="rounded-2xl border border-border/70 bg-background px-4 py-3">
+                                <div className="text-sm font-medium">{buildingGroupId}</div>
                                 <div className="mt-2 grid gap-2 text-xs text-muted-foreground sm:grid-cols-3">
                                     <div>Cameras: {(entrance.camera_ids || []).length}</div>
                                     <div>IN / OUT: {entrance.total_in ?? 0} / {entrance.total_out ?? 0}</div>

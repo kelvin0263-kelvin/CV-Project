@@ -138,6 +138,49 @@ async def lifespan(app: FastAPI):
                     "ADD COLUMN IF NOT EXISTS foot_traffic_total INTEGER NOT NULL DEFAULT 0"
                 )
             )
+            await conn.execute(
+                sa.text(
+                    "ALTER TABLE dresscode_policies "
+                    "ADD COLUMN IF NOT EXISTS pants_confidence_threshold DOUBLE PRECISION"
+                )
+            )
+            await conn.execute(
+                sa.text(
+                    "ALTER TABLE dresscode_policies "
+                    "ADD COLUMN IF NOT EXISTS slipper_confidence_threshold DOUBLE PRECISION"
+                )
+            )
+            await conn.execute(
+                sa.text(
+                    "UPDATE dresscode_policies "
+                    "SET pants_confidence_threshold = COALESCE(pants_confidence_threshold, confidence_threshold, 0.8), "
+                    "slipper_confidence_threshold = COALESCE(slipper_confidence_threshold, confidence_threshold, 0.8)"
+                )
+            )
+            await conn.execute(
+                sa.text(
+                    "ALTER TABLE dresscode_policies "
+                    "ALTER COLUMN pants_confidence_threshold SET DEFAULT 0.8"
+                )
+            )
+            await conn.execute(
+                sa.text(
+                    "ALTER TABLE dresscode_policies "
+                    "ALTER COLUMN slipper_confidence_threshold SET DEFAULT 0.8"
+                )
+            )
+            await conn.execute(
+                sa.text(
+                    "ALTER TABLE dresscode_policies "
+                    "ALTER COLUMN pants_confidence_threshold SET NOT NULL"
+                )
+            )
+            await conn.execute(
+                sa.text(
+                    "ALTER TABLE dresscode_policies "
+                    "ALTER COLUMN slipper_confidence_threshold SET NOT NULL"
+                )
+            )
 
     # Ensure the default admin account exists when the database is reachable.
     try:

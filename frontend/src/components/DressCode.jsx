@@ -80,6 +80,20 @@ const normalizeConfidencePercent = (value) => {
     return Math.round(numeric * 100);
 };
 
+const getPolicyThresholdPercent = (policy, key, fallback = 0.8) => {
+    const directValue = normalizeConfidencePercent(policy?.[key]);
+    if (directValue != null) {
+        return directValue;
+    }
+
+    const sharedValue = normalizeConfidencePercent(policy?.confidence_threshold);
+    if (sharedValue != null) {
+        return sharedValue;
+    }
+
+    return Math.round(fallback * 100);
+};
+
 const buildDetectionItems = (detections) => {
     const items = [];
 
@@ -138,6 +152,52 @@ const ToggleRow = ({ title, description, enabled, onToggle, accent = 'blue' }) =
     );
 };
 
+const ThresholdSlider = ({ title, description, value, onChange, accent = 'blue' }) => {
+    const accentStyles = {
+        blue: {
+            badge: 'bg-blue-100 text-blue-700',
+            slider: 'accent-blue-600',
+        },
+        emerald: {
+            badge: 'bg-emerald-100 text-emerald-700',
+            slider: 'accent-emerald-600',
+        },
+    };
+
+    const styles = accentStyles[accent] || accentStyles.blue;
+
+    return (
+        <div className="rounded-3xl border border-slate-200 bg-slate-50/70 p-4">
+            <div className="flex items-center justify-between gap-4">
+                <div className="pr-3">
+                    <div className="flex items-center gap-2">
+                        <div className={cn('rounded-full px-2.5 py-1 text-[11px] font-semibold', styles.badge)}>
+                            <SlidersHorizontal className="mr-1 inline h-3.5 w-3.5" />
+                            {title}
+                        </div>
+                    </div>
+                    <p className="mt-2 text-xs leading-relaxed text-slate-500">{description}</p>
+                </div>
+                <div className="rounded-full bg-white px-3 py-1 text-sm font-semibold text-slate-900 shadow-sm">
+                    {value}%
+                </div>
+            </div>
+            <input
+                type="range"
+                min="50"
+                max="100"
+                step="1"
+                value={value}
+                onChange={(event) => onChange(Number(event.target.value))}
+                className={cn(
+                    'mt-4 h-2 w-full cursor-pointer appearance-none rounded-full bg-slate-200',
+                    styles.slider,
+                )}
+            />
+        </div>
+    );
+};
+
 const DressCode = () => {
     const apiUrl = getApiBaseUrl();
 
@@ -149,7 +209,8 @@ const DressCode = () => {
     const [saveMessage, setSaveMessage] = useState('');
 
     const [enabledCameraIds, setEnabledCameraIds] = useState([]);
-    const [confidence, setConfidence] = useState(80);
+    const [pantsConfidence, setPantsConfidence] = useState(80);
+    const [slipperConfidence, setSlipperConfidence] = useState(80);
     const [restrictedLabels, setRestrictedLabels] = useState([]);
     const [policyEnabled, setPolicyEnabled] = useState(true);
     const [enablePantsDetection, setEnablePantsDetection] = useState(true);
@@ -189,7 +250,8 @@ const DressCode = () => {
 
             setCameras(enabledCameras);
             setEnabledCameraIds(Array.isArray(policyData.enabled_camera_ids) ? policyData.enabled_camera_ids : []);
-            setConfidence(Math.round((policyData.confidence_threshold || 0.8) * 100));
+            setPantsConfidence(getPolicyThresholdPercent(policyData, 'pants_confidence_threshold'));
+            setSlipperConfidence(getPolicyThresholdPercent(policyData, 'slipper_confidence_threshold'));
             setRestrictedLabels(Array.isArray(policyData.restricted_labels) ? policyData.restricted_labels : []);
             setPolicyEnabled(policyData.enabled !== false);
             setEnablePantsDetection(policyData.enable_pants_detection !== false);
@@ -316,7 +378,9 @@ const DressCode = () => {
                 body: JSON.stringify({
                     enabled_camera_ids: enabledCameraIds,
                     restricted_labels: restrictedLabels,
-                    confidence_threshold: confidence / 100,
+                    confidence_threshold: pantsConfidence / 100,
+                    pants_confidence_threshold: pantsConfidence / 100,
+                    slipper_confidence_threshold: slipperConfidence / 100,
                     enabled: policyEnabled,
                     enable_pants_detection: enablePantsDetection,
                     enable_slipper_detection: enableSlipperDetection,
@@ -330,7 +394,8 @@ const DressCode = () => {
 
             setEnabledCameraIds(Array.isArray(updatedPolicy.enabled_camera_ids) ? updatedPolicy.enabled_camera_ids : enabledCameraIds);
             setRestrictedLabels(Array.isArray(updatedPolicy.restricted_labels) ? updatedPolicy.restricted_labels : restrictedLabels);
-            setConfidence(Math.round((updatedPolicy.confidence_threshold || confidence / 100) * 100));
+            setPantsConfidence(getPolicyThresholdPercent(updatedPolicy, 'pants_confidence_threshold', pantsConfidence / 100));
+            setSlipperConfidence(getPolicyThresholdPercent(updatedPolicy, 'slipper_confidence_threshold', slipperConfidence / 100));
             setPolicyEnabled(updatedPolicy.enabled !== false);
             setEnablePantsDetection(updatedPolicy.enable_pants_detection !== false);
             setEnableSlipperDetection(Boolean(updatedPolicy.enable_slipper_detection));
@@ -637,31 +702,26 @@ const DressCode = () => {
                                 accent="emerald"
                             />
 
-                            <div className="rounded-3xl border border-slate-200 bg-slate-50/70 p-4">
-                                <div className="flex items-center justify-between gap-4">
-                                    <div>
-                                        <p className="text-sm font-semibold text-slate-900">Confidence Threshold</p>
-                                        <p className="mt-1 text-xs text-slate-500">
-                                            Minimum confidence required before a predicted label is treated as a violation.
-                                        </p>
-                                    </div>
-                                    <div className="rounded-full bg-white px-3 py-1 text-sm font-semibold text-slate-900 shadow-sm">
-                                        {confidence}%
-                                    </div>
-                                </div>
-                                <input
-                                    type="range"
-                                    min="50"
-                                    max="100"
-                                    step="1"
-                                    value={confidence}
-                                    onChange={(event) => {
-                                        setConfidence(Number(event.target.value));
-                                        setSaved(false);
-                                    }}
-                                    className="mt-4 h-2 w-full cursor-pointer appearance-none rounded-full bg-slate-200 accent-blue-600"
-                                />
-                            </div>
+                            <ThresholdSlider
+                                title="Pants Threshold"
+                                description="Minimum confidence required before a shorts or long pants label is treated as a violation."
+                                value={pantsConfidence}
+                                onChange={(value) => {
+                                    setPantsConfidence(value);
+                                    setSaved(false);
+                                }}
+                                accent="blue"
+                            />
+                            <ThresholdSlider
+                                title="Slipper Threshold"
+                                description="Minimum confidence required before a slipper or non-slipper label is treated as a violation."
+                                value={slipperConfidence}
+                                onChange={(value) => {
+                                    setSlipperConfidence(value);
+                                    setSaved(false);
+                                }}
+                                accent="emerald"
+                            />
                         </CardContent>
                     </Card>
 
@@ -669,7 +729,7 @@ const DressCode = () => {
                         <CardHeader>
                             <CardTitle className="text-2xl">Restricted Categories</CardTitle>
                             <CardDescription>
-                                Choose which predictions are not allowed. Matching labels above the threshold will trigger a violation.
+                                Choose which predictions are not allowed. Matching labels above their classifier threshold will trigger a violation.
                             </CardDescription>
                         </CardHeader>
                         <CardContent className="grid auto-rows-fr gap-3 sm:grid-cols-2">
