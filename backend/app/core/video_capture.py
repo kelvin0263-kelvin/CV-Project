@@ -15,7 +15,7 @@ RTSP_BUFFER_SIZE = 8
 RTSP_OPEN_TIMEOUT_MS = 5000
 RTSP_READ_TIMEOUT_MS = 5000
 RTSP_ENABLE_NVDEC = False
-RTSP_NVDEC_CODEC = ""
+RTSP_NVDEC_CODEC = "hevc_cuvid"
 RTSP_HW_DEVICE = -1
 RTSP_FFMPEG_CAPTURE_OPTIONS: list[tuple[str, str]] = []
 
@@ -74,7 +74,7 @@ def _build_rtsp_ffmpeg_capture_options(*, enable_hwaccel: bool | None = None) ->
     if enable_nvdec:
         # FFmpeg CUDA decode path (NVDEC). Keep codec selection optional.
         defaults.append(("hwaccel", "cuda"))
-        defaults.append(("hwaccel_output_format", "cuda"))
+        # defaults.append(("hwaccel_output_format", "cuda"))
         nvdec_codec = RTSP_NVDEC_CODEC
         if nvdec_codec and nvdec_codec.lower() != "auto":
             defaults.append(("video_codec", nvdec_codec))
@@ -114,6 +114,17 @@ def _build_capture_open_params(
     return params
 
 
+def _build_cudacodec_source_params() -> list[int]:
+    params: list[int] = []
+
+    if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
+        params.extend([cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, RTSP_OPEN_TIMEOUT_MS])
+    if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+        params.extend([cv2.CAP_PROP_READ_TIMEOUT_MSEC, RTSP_READ_TIMEOUT_MS])
+
+    return params
+
+
 def _apply_rtsp_capture_fallback_props(
     cap: cv2.VideoCapture,
     *,
@@ -136,6 +147,110 @@ def _apply_rtsp_capture_fallback_props(
         cap.set(cv2.CAP_PROP_HW_ACCELERATION, int(accel_any))
     if enable_nvdec and hw_device >= 0 and hasattr(cv2, "CAP_PROP_HW_DEVICE"):
         cap.set(cv2.CAP_PROP_HW_DEVICE, hw_device)
+
+
+def _describe_hw_accel_value(value: float | None) -> str:
+    if value is None:
+        return "unknown"
+
+    try:
+        accel_value = int(round(float(value)))
+    except (TypeError, ValueError):
+        return str(value)
+
+    accel_names = {
+        getattr(cv2, "VIDEO_ACCELERATION_NONE", 0): "none",
+        getattr(cv2, "VIDEO_ACCELERATION_ANY", 1): "any",
+        getattr(cv2, "VIDEO_ACCELERATION_D3D11", 2): "d3d11",
+        getattr(cv2, "VIDEO_ACCELERATION_VAAPI", 3): "vaapi",
+        getattr(cv2, "VIDEO_ACCELERATION_MFX", 4): "mfx",
+    }
+    return accel_names.get(accel_value, str(accel_value))
+
+
+class _CudaVideoCaptureAdapter:
+    """Small read()/get()/release() adapter over cv2.cudacodec.VideoReader."""
+
+    def __init__(self, source_path: str):
+        self._source_path = source_path
+        self._reader = None
+        self._opened = False
+        self._released = False
+        self._format = None
+        self._backend_name = "FFMPEG+CUDA"
+
+        source_params = _build_cudacodec_source_params()
+        reader = cv2.cudacodec.createVideoReader(source_path, source_params)
+        reader.set(cv2.cudacodec.ColorFormat_BGR)
+
+        fmt = reader.format()
+        if not getattr(fmt, "valid", False):
+            raise RuntimeError("cudacodec returned invalid stream format")
+
+        self._reader = reader
+        self._format = fmt
+        self._opened = True
+
+    def isOpened(self) -> bool:
+        return bool(self._opened and not self._released and self._reader is not None)
+
+    def read(self):
+        if not self.isOpened():
+            return False, None
+
+        try:
+            ok, gpu_frame = self._reader.nextFrame()
+        except Exception:
+            return False, None
+
+        if not ok or gpu_frame is None:
+            return False, None
+
+        try:
+            frame = gpu_frame.download()
+        except Exception:
+            return False, None
+        return True, frame
+
+    def grab(self) -> bool:
+        ok, _ = self.read()
+        return bool(ok)
+
+    def release(self):
+        self._released = True
+        self._opened = False
+        self._reader = None
+        self._format = None
+
+    def get(self, prop_id: int) -> float:
+        if prop_id == getattr(cv2, "CAP_PROP_BACKEND", -1):
+            ffmpeg_backend = getattr(cv2, "CAP_FFMPEG", 0)
+            return float(ffmpeg_backend)
+        if prop_id == getattr(cv2, "CAP_PROP_HW_ACCELERATION", -1):
+            accel_any = getattr(cv2, "VIDEO_ACCELERATION_ANY", 1)
+            return float(accel_any)
+        if self._format is None:
+            return 0.0
+        if prop_id == getattr(cv2, "CAP_PROP_FRAME_WIDTH", -1):
+            return float(getattr(self._format, "width", 0))
+        if prop_id == getattr(cv2, "CAP_PROP_FRAME_HEIGHT", -1):
+            return float(getattr(self._format, "height", 0))
+        if prop_id == getattr(cv2, "CAP_PROP_FPS", -1):
+            return float(getattr(self._format, "fps", 0.0))
+        if prop_id == getattr(cv2, "CAP_PROP_FRAME_COUNT", -1):
+            return 0.0
+        return 0.0
+
+    def set(self, prop_id: int, value: float) -> bool:
+        if prop_id in (
+            getattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC", -1),
+            getattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC", -1),
+            getattr(cv2, "CAP_PROP_BUFFERSIZE", -1),
+            getattr(cv2, "CAP_PROP_HW_ACCELERATION", -1),
+            getattr(cv2, "CAP_PROP_HW_DEVICE", -1),
+        ):
+            return True
+        return False
 
 
 def _is_opened(cap: cv2.VideoCapture | None) -> bool:
@@ -162,19 +277,20 @@ def _log_capture_backend_info(
     rtsp: bool,
     ffmpeg_options: str = "",
     enable_hwaccel: bool = False,
+    open_params: list[int] | None = None,
 ):
     global _CAPTURE_BACKEND_INFO_LOGGED
     if _CAPTURE_BACKEND_INFO_LOGGED or not rtsp or not _is_opened(cap):
         return
 
-    backend_name = "unknown"
+    backend_name = getattr(cap, "_backend_name", "unknown")
     hw_accel_value = None
 
     try:
         backend_id = int(cap.get(cv2.CAP_PROP_BACKEND))
-        if hasattr(cv2, "videoio_registry"):
+        if backend_name == "unknown" and hasattr(cv2, "videoio_registry"):
             backend_name = cv2.videoio_registry.getBackendName(backend_id) or "unknown"
-        else:
+        elif backend_name == "unknown":
             backend_name = str(backend_id)
     except Exception:
         pass
@@ -189,9 +305,12 @@ def _log_capture_backend_info(
         "[VideoCapture] Opened RTSP capture: "
         f"backend={backend_name}, "
         f"hwaccel_requested={enable_hwaccel}, "
-        f"reported_hw_accel={hw_accel_value}, "
+        f"reported_hw_accel={hw_accel_value}({_describe_hw_accel_value(hw_accel_value)}), "
+        f"open_params_applied={bool(open_params)}, "
         f"ffmpeg_options_applied={bool(ffmpeg_options)}"
     )
+    if open_params:
+        print(f"[VideoCapture] Active capture open params: {open_params}")
     if ffmpeg_options:
         print(f"[VideoCapture] Active FFmpeg capture options: {ffmpeg_options}")
     _CAPTURE_BACKEND_INFO_LOGGED = True
@@ -215,13 +334,17 @@ def _temporary_ffmpeg_capture_options(options: str | None):
                 os.environ[env_key] = previous
 
 
-def open_video_capture(source_path: str,*,is_rtsp: bool | None = None,
+def open_video_capture(
+    source_path: str,
+    *,
+    is_rtsp: bool | None = None,
     allow_hwaccel: bool | None = None,
 ) -> cv2.VideoCapture:
     global _NVDEC_CONFIG_LOGGED
     rtsp = is_rtsp_source(source_path) if is_rtsp is None else is_rtsp
     backend = getattr(cv2, "CAP_FFMPEG", None) if rtsp else None
     enable_nvdec = RTSP_ENABLE_NVDEC if allow_hwaccel is None else allow_hwaccel
+    capture_open_params = []
 
     with _CAPTURE_OPEN_LOCK:
         ffmpeg_options = ""
@@ -235,6 +358,23 @@ def open_video_capture(source_path: str,*,is_rtsp: bool | None = None,
                 _NVDEC_CONFIG_LOGGED = True
 
         cap = None
+        if rtsp and enable_nvdec and hasattr(cv2, "cudacodec"):
+            cudacodec_options = _build_rtsp_ffmpeg_capture_options(enable_hwaccel=False)
+            with _temporary_ffmpeg_capture_options(cudacodec_options):
+                try:
+                    cap = _CudaVideoCaptureAdapter(source_path)
+                    _log_capture_backend_info(
+                        cap,
+                        rtsp=rtsp,
+                        ffmpeg_options=cudacodec_options,
+                        enable_hwaccel=enable_nvdec,
+                        open_params=[],
+                    )
+                    return cap
+                except Exception as e:
+                    print(f"[VideoCapture] cudacodec open failed; falling back to VideoCapture: {e}")
+                    cap = None
+
         if backend is not None:
             with _temporary_ffmpeg_capture_options(ffmpeg_options):
                 try:
@@ -251,13 +391,18 @@ def open_video_capture(source_path: str,*,is_rtsp: bool | None = None,
                     rtsp=rtsp,
                     ffmpeg_options=ffmpeg_options,
                     enable_hwaccel=enable_nvdec,
+                    open_params=capture_open_params,
                 )
             elif not _is_opened(cap):
                 _release_if_needed(cap)
                 cap = None
 
         if cap is None:
-            cap = cv2.VideoCapture(source_path)
+            with _temporary_ffmpeg_capture_options(ffmpeg_options):
+                try:
+                    cap = cv2.VideoCapture(source_path)
+                except cv2.error:
+                    cap = cv2.VideoCapture(source_path)
             if rtsp:
                 _apply_rtsp_capture_fallback_props(cap, enable_hwaccel=enable_nvdec)
                 _log_capture_backend_info(
@@ -265,6 +410,7 @@ def open_video_capture(source_path: str,*,is_rtsp: bool | None = None,
                     rtsp=rtsp,
                     ffmpeg_options=ffmpeg_options,
                     enable_hwaccel=enable_nvdec,
+                    open_params=capture_open_params,
                 )
 
     return cap

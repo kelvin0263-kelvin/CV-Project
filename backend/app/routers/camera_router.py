@@ -988,11 +988,13 @@ async def update_camera(camera_id: str, camera: CameraCreate, db: AsyncSession =
     stream_config = await _get_stream_config(db, camera_id)
     old_source_path = stream_config.source_path if stream_config is not None else None
     old_runtime_key = _get_runtime_key(stream_config) if stream_config is not None else None
+    old_view_index = stream_config.view_index if stream_config is not None else None
+    old_is_fisheye = bool(stream_config.is_fisheye) if stream_config is not None else False
 
     source_path = (camera.source_path or "").strip() or None
-    if old_source_path and _is_uploaded_source_path(old_source_path):
+    if old_source_path:
         if source_path and source_path != old_source_path:
-            raise HTTPException(status_code=400, detail="Uploaded video path cannot be changed.")
+            raise HTTPException(status_code=400, detail="Stream source_path cannot be changed after creation.")
         source_path = old_source_path
     if camera.type.upper().startswith(("RTSP", "NETWORK")) and not source_path:
         raise HTTPException(status_code=400, detail="Stream camera requires a source_path.")
@@ -1036,6 +1038,20 @@ async def update_camera(camera_id: str, camera: CameraCreate, db: AsyncSession =
 
     if old_runtime_key and (old_source_path != source_path or stream_config is None):
         await _stop_producer_if_unused(db, old_runtime_key)
+
+    new_runtime_key = _get_runtime_key(stream_config) if stream_config is not None else None
+    runtime_requires_restart = (
+        stream_config is not None
+        and new_runtime_key is not None
+        and old_runtime_key == new_runtime_key
+        and not _is_uploaded_source_path(source_path)
+        and (
+            old_view_index != stream_config.view_index
+            or old_is_fisheye != bool(stream_config.is_fisheye)
+        )
+    )
+    if runtime_requires_restart:
+        stop_producer_thread(new_runtime_key)
 
     if stream_config is not None and db_camera.enabled and not _is_uploaded_source_path(source_path):
         await _ensure_stream_running(db, stream_config)

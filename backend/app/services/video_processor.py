@@ -1,11 +1,3 @@
-"""
-Video Producer Service
-
-Reads video frames, runs YOLO-Pose tracking (BoT-SORT), classifies
-lower-body clothing via dresscode_detector, and streams clean frames
-+ detection metadata to FRAME_BUFFERS for WebSocket consumption.
-"""
-
 import threading
 import cv2
 import time
@@ -101,17 +93,21 @@ DRESSCODE_VIOLATION_CONFIRMATIONS = 2
 DRESSCODE_VIOLATION_WINDOW_SEC = 5.0
 PERF_LOG_INTERVAL_FRAMES = 30
 PERF_STAGE_LOGS = True
+
 MULTI_STREAM_BATCH_INFER = True
 BATCH_INFER_WINDOW_MS = 2
-BATCH_INFER_MAX_BATCH = 6
-BATCH_INFER_WAIT_MS = 1500
+BATCH_INFER_MAX_BATCH = 4
+BATCH_INFER_WAIT_MS = 150
 BATCH_INFER_LOG_INTERVAL = 30
+
 ASYNC_CAPTURE_ENABLED = True
 ASYNC_CAPTURE_QUEUE_SIZE = 2
 ASYNC_CAPTURE_READ_TIMEOUT_MS = 1000
-RTSP_ENABLE_NVDEC = False
-RTSP_MAX_CONSECUTIVE_READ_FAILURES = 120
+
+RTSP_ENABLE_NVDEC = True
+RTSP_MAX_CONSECUTIVE_READ_FAILURES = 1200
 RTSP_READ_FAILURE_BACKOFF_MS = 50
+
 RTSP_CORRUPT_FRAME_DETECTION_ENABLED = False
 RTSP_CORRUPT_FRAME_RECOVERY_THRESHOLD = 999
 RTSP_KEEP_LAST_FRAME_ON_RECOVERY = True
@@ -122,6 +118,7 @@ RTSP_CORRUPT_FRAME_DIFF_MIN = 18.0
 RTSP_CORRUPT_FRAME_EDGE_VAR_MAX = 0.0
 RTSP_HW_FALLBACK_FAILURE_WINDOW_SEC = 10.0
 RTSP_HW_FALLBACK_FAILURE_THRESHOLD = 3
+
 NVENC_OUTPUT_ENABLED = False
 NVENC_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "temp_video_uploads", "nvenc_outputs")
 NVENC_OUTPUT_CONTAINER = "mp4"
@@ -872,6 +869,7 @@ class _BatchInferenceEngine:
             self._process_batch(batch)
 
     def _predict_images(self, images: list[np.ndarray]):
+        #keyword arguments
         predict_kwargs = {
             "source": images,
             "verbose": False,
@@ -3060,4 +3058,4 @@ def _is_person_in_fall_pose_compat(
             keypoints_data,
             detection_sensitivity=detection_sensitivity,
         )
-    return is_person_in_fall_pose(person_bbox, keypoints_data)
+    return is_person_in_fall_pose(person_bbox, keypoints_data,detection_sensitivity)

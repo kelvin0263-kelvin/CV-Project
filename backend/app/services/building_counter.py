@@ -42,6 +42,51 @@ def sync_building_runtime(building_config: dict, sensor_configs: dict[str, dict]
             _capacity_alert_fired = False
 
 
+def restore_building_runtime(snapshot: dict | None):
+    """
+    Restore in-memory building rollups from a persisted snapshot.
+
+    The active building config is not replaced here; startup loads config from the
+    dedicated config table first, then this function restores the latest raw counts
+    and entrance/camera rollups underneath that config.
+    """
+    global _raw_in, _raw_out, _entrance_rollups, _camera_rollups, _capacity_alert_fired
+
+    if not isinstance(snapshot, dict):
+        return
+
+    restored_entrance_rollups: dict[str, dict] = {}
+    restored_camera_rollups: dict[str, dict] = {}
+
+    for raw_entrance_id, raw_entrance_summary in (snapshot.get("entrance_summaries") or {}).items():
+        entrance_id = str(raw_entrance_id or "").strip()
+        if not entrance_id or not isinstance(raw_entrance_summary, dict):
+            continue
+
+        restored_entrance_rollups[entrance_id] = {
+            "total_in": max(0, int(raw_entrance_summary.get("total_in", 0) or 0)),
+            "total_out": max(0, int(raw_entrance_summary.get("total_out", 0) or 0)),
+        }
+
+        for raw_camera_id, raw_camera_summary in (raw_entrance_summary.get("camera_summaries") or {}).items():
+            camera_id = str(raw_camera_id or "").strip()
+            if not camera_id or not isinstance(raw_camera_summary, dict):
+                continue
+
+            camera_rollup = restored_camera_rollups.setdefault(camera_id, {"entrances": {}})
+            camera_rollup["entrances"][entrance_id] = {
+                "total_in": max(0, int(raw_camera_summary.get("total_in", 0) or 0)),
+                "total_out": max(0, int(raw_camera_summary.get("total_out", 0) or 0)),
+            }
+
+    with _runtime_lock:
+        _raw_in = max(0, int(snapshot.get("raw_in", 0) or 0))
+        _raw_out = max(0, int(snapshot.get("raw_out", 0) or 0))
+        _entrance_rollups = defaultdict(dict, restored_entrance_rollups)
+        _camera_rollups = restored_camera_rollups
+        _capacity_alert_fired = _is_capacity_exceeded_locked()
+
+
 def reset_building_runtime(manual_offset: int | None = None):
     """Clear all aggregated counters, optionally replacing the manual offset."""
     global _raw_in, _raw_out, _entrance_rollups, _camera_rollups, _capacity_alert_fired

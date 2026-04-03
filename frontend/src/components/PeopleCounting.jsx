@@ -181,7 +181,7 @@ const PeopleCounting = () => {
     const [buildingSummary, setBuildingSummary] = useState(EMPTY_BUILDING_SUMMARY);
     const [resettingBuilding, setResettingBuilding] = useState(false);
     const [resettingCamera, setResettingCamera] = useState(false);
-    const [confirmResetTarget, setConfirmResetTarget] = useState(null);
+    const [confirmDialog, setConfirmDialog] = useState(null);
     const [activeTab, setActiveTab] = useState('setup');
 
     const resetCountingConfig = useCallback(() => {
@@ -460,11 +460,76 @@ const PeopleCounting = () => {
     };
 
     const openResetConfirmation = (target) => {
-        setConfirmResetTarget(target);
+        setConfirmDialog({
+            kind: target === 'building' ? 'reset_building' : 'reset_camera',
+        });
     };
 
-    const closeResetConfirmation = () => {
-        setConfirmResetTarget(null);
+    const openFormResetConfirmation = () => {
+        setConfirmDialog({
+            kind: 'reset_form',
+        });
+    };
+
+    const openLineDeleteConfirmation = (lineId) => {
+        const targetLine = lines.find((line) => line.id === lineId);
+        setConfirmDialog({
+            kind: 'delete_line',
+            lineId,
+            name: targetLine?.name || 'this line',
+        });
+    };
+
+    const openAreaDeleteConfirmation = (areaId) => {
+        const targetArea = frameExcludeAreas.find((area) => area.id === areaId);
+        setConfirmDialog({
+            kind: 'delete_area',
+            areaId,
+            name: targetArea?.name || 'this active zone',
+        });
+    };
+
+    const closeConfirmationDialog = () => {
+        if (resettingBuilding || resettingCamera) {
+            return;
+        }
+        setConfirmDialog(null);
+    };
+
+    const handleConfirmDialogConfirm = async () => {
+        if (!confirmDialog) {
+            return;
+        }
+
+        if (confirmDialog.kind === 'reset_building') {
+            await handleResetBuildingTotals();
+            setConfirmDialog(null);
+            return;
+        }
+
+        if (confirmDialog.kind === 'reset_camera') {
+            await handleResetSelectedCamera();
+            setConfirmDialog(null);
+            return;
+        }
+
+        if (confirmDialog.kind === 'reset_form') {
+            resetCountingConfig();
+            setSaveMessage('');
+            setConfirmDialog(null);
+            return;
+        }
+
+        if (confirmDialog.kind === 'delete_line') {
+            setLines((prevLines) => prevLines.filter((line) => line.id !== confirmDialog.lineId));
+            setConfirmDialog(null);
+            return;
+        }
+
+        if (confirmDialog.kind === 'delete_area') {
+            setFrameExcludeAreas((prevAreas) => prevAreas.filter((area) => area.id !== confirmDialog.areaId));
+            setConfirmDialog(null);
+        }
     };
 
     const handleLineDrawn = useCallback(({ points, direction }) => {
@@ -500,8 +565,8 @@ const PeopleCounting = () => {
         setDrawingMode(null);
     }, []);
 
-    const deleteLine = (lineId) => setLines((prevLines) => prevLines.filter((line) => line.id !== lineId));
-    const deleteFrameExcludeArea = (areaId) => setFrameExcludeAreas((prevAreas) => prevAreas.filter((area) => area.id !== areaId));
+    const deleteLine = (lineId) => openLineDeleteConfirmation(lineId);
+    const deleteFrameExcludeArea = (areaId) => openAreaDeleteConfirmation(areaId);
     const toggleDirection = (lineId) => setLines((prevLines) => prevLines.map((line) => (
         line.id === lineId
             ? { ...line, direction: line.direction === 'left_to_right' ? 'right_to_left' : 'left_to_right' }
@@ -517,10 +582,7 @@ const PeopleCounting = () => {
             ? { ...line, line_type: getLineType(line) === 'foot_traffic' ? 'occupancy' : 'foot_traffic' }
             : line
     )));
-    const handleReset = () => {
-        resetCountingConfig();
-        setSaveMessage('');
-    };
+    const handleReset = () => openFormResetConfirmation();
     const handleStats = useCallback((nextStats) => setStats(nextStats), []);
     const handleCountingData = useCallback((nextData) => {
         if (nextData && typeof nextData === 'object') {
@@ -1021,37 +1083,65 @@ const PeopleCounting = () => {
                         </div>
                     )}
                 </div>
-                <div className="border-t border-white/10 bg-black/85 px-4 py-3">
+                {/* <div className="border-t border-white/10 bg-black/85 px-4 py-3">
                     <div className="text-sm text-white/75">
                         Draw directly on the preview. The primary save and reset actions are pinned above the workspace so they stay visible while you configure the page.
                     </div>
-                </div>
+                </div> */}
             </Card>
         </div>
     );
 
+    const confirmDialogTitle = !confirmDialog
+        ? ''
+        : confirmDialog.kind === 'reset_building'
+            ? 'Reset Building Totals?'
+            : confirmDialog.kind === 'reset_camera'
+                ? 'Reset Camera Totals?'
+                : confirmDialog.kind === 'reset_form'
+                    ? 'Reset Counting Form?'
+                    : confirmDialog.kind === 'delete_line'
+                        ? `Delete ${confirmDialog.name}?`
+                        : 'Delete Active Zone?';
+
+    const confirmDialogDescription = !confirmDialog
+        ? ''
+        : confirmDialog.kind === 'reset_building'
+            ? 'This will clear the grouped building occupancy totals. Continue?'
+            : confirmDialog.kind === 'reset_camera'
+                ? 'This will clear the totals for the selected camera. Continue?'
+                : confirmDialog.kind === 'reset_form'
+                    ? 'This will clear all unsaved lines, active zones, and form changes for the selected camera.'
+                    : confirmDialog.kind === 'delete_line'
+                        ? 'This line will be removed from the current setup immediately.'
+                        : 'This active zone will be removed from the current setup immediately.';
+
+    const confirmDialogLabel = !confirmDialog
+        ? 'Confirm'
+        : confirmDialog.kind === 'delete_line'
+            ? 'Delete Line'
+            : confirmDialog.kind === 'delete_area'
+                ? 'Delete Zone'
+                : 'Confirm Reset';
+
+    const confirmDialogLoading = confirmDialog?.kind === 'reset_building'
+        ? resettingBuilding
+        : confirmDialog?.kind === 'reset_camera'
+            ? resettingCamera
+            : false;
+
     return (
         <div className="flex h-full flex-col gap-6 overflow-auto bg-[radial-gradient(circle_at_top_left,_rgba(59,130,246,0.08),_transparent_32%),linear-gradient(180deg,_rgba(248,250,252,0.95),_rgba(255,255,255,1))] p-6">
             <ConfirmationDialog
-                open={Boolean(confirmResetTarget)}
-                title={confirmResetTarget === 'building' ? 'Reset Building Totals?' : 'Reset Camera Totals?'}
-                description={confirmResetTarget === 'building'
-                    ? 'This will clear the grouped building occupancy totals. Continue?'
-                    : 'This will clear the totals for the selected camera. Continue?'}
-                confirmLabel="Confirm Reset"
+                open={Boolean(confirmDialog)}
+                title={confirmDialogTitle}
+                description={confirmDialogDescription}
+                confirmLabel={confirmDialogLabel}
                 confirmVariant="destructive"
-                loading={resettingBuilding || resettingCamera}
-                loadingIcon={<RotateCcw className="mr-2 h-3.5 w-3.5 animate-spin" />}
-                onCancel={closeResetConfirmation}
-                onConfirm={async () => {
-                    const pendingTarget = confirmResetTarget;
-                    closeResetConfirmation();
-                    if (pendingTarget === 'building') {
-                        await handleResetBuildingTotals();
-                        return;
-                    }
-                    await handleResetSelectedCamera();
-                }}
+                loading={confirmDialogLoading}
+                loadingIcon={confirmDialogLoading ? <RotateCcw className="mr-2 h-3.5 w-3.5 animate-spin" /> : null}
+                onCancel={closeConfirmationDialog}
+                onConfirm={handleConfirmDialogConfirm}
             />
 
             <section className="relative overflow-hidden rounded-[28px] border border-slate-200/80 bg-white/90 p-6 shadow-sm backdrop-blur">

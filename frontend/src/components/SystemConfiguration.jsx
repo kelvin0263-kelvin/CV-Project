@@ -64,6 +64,7 @@ const SYSTEM_SURFACE_CARD_CLASS = 'border-slate-200/80 bg-white/95 shadow-sm';
 const SystemConfiguration = () => {
     const apiUrl = getApiBaseUrl();
     const previewContainerRef = useRef(null);
+    const submitInFlightRef = useRef(false);
     const [searchParams, setSearchParams] = useSearchParams();
     const [cameras, setCameras] = useState([]);
     const [activeManagementTab, setActiveManagementTab] = useState(
@@ -77,6 +78,7 @@ const SystemConfiguration = () => {
     const [showUpload, setShowUpload] = useState(false);
     const [isUploading, setIsUploading] = useState(false);
     const [isTestingConnection, setIsTestingConnection] = useState(false);
+    const [isSaving, setIsSaving] = useState(false);
     const [testResult, setTestResult] = useState(null);
 
     // File Upload State
@@ -172,6 +174,8 @@ const SystemConfiguration = () => {
         setIsDrawingSourceRoi(false);
         setStreamPreview(null);
         setUploadPreviewImage('');
+        setIsSaving(false);
+        submitInFlightRef.current = false;
     };
 
     const handleAddClick = () => {
@@ -303,97 +307,100 @@ const SystemConfiguration = () => {
 
     const handleSave = async (e) => {
         e.preventDefault();
-
-        if (showUpload) {
-            if (!selectedFile) return alert("Please select a file");
-
-            setIsUploading(true);
-            setUploadMessage(null);
-            const uploadData = new FormData();
-            uploadData.append('file', selectedFile);
-            uploadData.append('enable_fisheye', enableFisheye);
-            if (enableFisheye) {
-                // Convert Set to comma separated string "0,3,5"
-                const views = Array.from(selectedViews).join(',');
-                uploadData.append('selected_views', views);
-            }
-            if (sourceRoi?.points?.length >= 3) {
-                uploadData.append('detection_roi', JSON.stringify(sourceRoi));
-            }
-            uploadData.append('camera_name_prefix', formData.name || 'Uploaded Camera');
-            uploadData.append('sync_start', syncStart);
-            if (syncStart) {
-                uploadData.append('sync_group_id', syncGroupId.trim());
-            }
-
-            try {
-                if (syncStart && !syncGroupId.trim()) {
-                    throw new Error("Please enter a sync group ID.");
-                }
-                // Large files need a generous timeout (10 minutes)
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 10 * 60 * 1000);
-                const res = await fetch(`${apiUrl}/api/upload_and_process`, {
-                    method: 'POST',
-                    body: uploadData,
-                    signal: controller.signal,
-                });
-                clearTimeout(timeoutId);
-                if (!res.ok) throw new Error("Upload failed");
-                const data = await res.json();
-                console.log("Upload success:", data);
-                await fetchCameras(); // Refresh list
-                await fetchSyncGroups();
-                if (syncStart) {
-                    setSelectedFile(null);
-                    setUploadMessage({
-                        type: 'success',
-                        text: `Uploaded to sync group "${data.sync_group_id}". Pending sources: ${data.pending_sources}.`,
-                    });
-                } else {
-                    resetForm();
-                }
-            } catch (err) {
-                setUploadMessage({
-                    type: 'error',
-                    text: `Error Uploading: ${err.message}`,
-                });
-            } finally {
-                setIsUploading(false);
-            }
+        if (submitInFlightRef.current) {
             return;
         }
-
-        // Standard Add/Edit
-        const payload = {
-            id: selectedCamera ? selectedCamera.id : Date.now().toString(),
-            name: formData.name,
-            location: formData.location,
-            type: inferSourceType(formData.streamUrl, false),
-            status: formData.enabled ? 'Online' : 'Disabled',
-            mode: selectedCamera?.mode || 'Unassigned',
-            source_path: formData.streamUrl.trim(),
-            resolution: formData.resolution,
-            fps: parseInt(formData.frameRate, 10) || 30,
-            enabled: formData.enabled,
-            image: '',
-            view_index: -1,
-            is_fisheye: false,
-            detection_roi: sourceRoi?.points?.length >= 3 ? sourceRoi : null,
-        };
+        submitInFlightRef.current = true;
+        setIsSaving(true);
 
         try {
+            if (showUpload) {
+                if (!selectedFile) {
+                    alert("Please select a file");
+                    return;
+                }
+
+                setIsUploading(true);
+                setUploadMessage(null);
+                const uploadData = new FormData();
+                uploadData.append('file', selectedFile);
+                uploadData.append('enable_fisheye', enableFisheye);
+                if (enableFisheye) {
+                    // Convert Set to comma separated string "0,3,5"
+                    const views = Array.from(selectedViews).join(',');
+                    uploadData.append('selected_views', views);
+                }
+                if (sourceRoi?.points?.length >= 3) {
+                    uploadData.append('detection_roi', JSON.stringify(sourceRoi));
+                }
+                uploadData.append('camera_name_prefix', formData.name || 'Uploaded Camera');
+                uploadData.append('sync_start', syncStart);
+                if (syncStart) {
+                    uploadData.append('sync_group_id', syncGroupId.trim());
+                }
+
+                try {
+                    if (syncStart && !syncGroupId.trim()) {
+                        throw new Error("Please enter a sync group ID.");
+                    }
+                    // Large files need a generous timeout (10 minutes)
+                    const controller = new AbortController();
+                    const timeoutId = setTimeout(() => controller.abort(), 10 * 60 * 1000);
+                    const res = await fetch(`${apiUrl}/api/upload_and_process`, {
+                        method: 'POST',
+                        body: uploadData,
+                        signal: controller.signal,
+                    });
+                    clearTimeout(timeoutId);
+                    if (!res.ok) throw new Error("Upload failed");
+                    const data = await res.json();
+                    console.log("Upload success:", data);
+                    await fetchCameras(); // Refresh list
+                    await fetchSyncGroups();
+                    if (syncStart) {
+                        setSelectedFile(null);
+                        setUploadMessage({
+                            type: 'success',
+                            text: `Uploaded to sync group "${data.sync_group_id}". Pending sources: ${data.pending_sources}.`,
+                        });
+                    } else {
+                        resetForm();
+                    }
+                } catch (err) {
+                    setUploadMessage({
+                        type: 'error',
+                        text: `Error Uploading: ${err.message}`,
+                    });
+                } finally {
+                    setIsUploading(false);
+                }
+                return;
+            }
+
+            // Standard Add/Edit
+            const payload = {
+                id: selectedCamera ? selectedCamera.id : Date.now().toString(),
+                name: formData.name,
+                location: formData.location,
+                type: inferSourceType(formData.streamUrl, enableFisheye),
+                status: formData.enabled ? 'Online' : 'Disabled',
+                mode: selectedCamera?.mode || 'Unassigned',
+                source_path: formData.streamUrl.trim(),
+                resolution: formData.resolution,
+                fps: parseInt(formData.frameRate, 10) || 30,
+                enabled: formData.enabled,
+                image: '',
+                view_index: enableFisheye ? (Array.from(selectedViews)[0] ?? DEFAULT_FISHEYE_VIEW) : -1,
+                is_fisheye: enableFisheye,
+                detection_roi: sourceRoi?.points?.length >= 3 ? sourceRoi : null,
+            };
+
             if (!payload.source_path) {
                 alert("Please enter a stream URL.");
                 return;
             }
 
-            if (enableFisheye) {
-                if (isEditMode) {
-                    alert("Editing fisheye stream sources is not supported yet. Delete and recreate the source.");
-                    return;
-                }
-
+            if (enableFisheye && !isEditMode) {
                 const res = await fetch(`${apiUrl}/api/cameras/stream-source`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -446,6 +453,9 @@ const SystemConfiguration = () => {
         } catch (error) {
             console.error("Save error:", error);
             alert("Failed to save camera");
+        } finally {
+            submitInFlightRef.current = false;
+            setIsSaving(false);
         }
     };
 
@@ -633,11 +643,9 @@ const SystemConfiguration = () => {
                                             )}
 
                                             <div className="absolute top-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                                                {!cam.is_fisheye && (
-                                                    <Button size="icon" variant="secondary" className="h-8 w-8" onClick={() => handleEditClick(cam)}>
-                                                        <Edit2 className="w-4 h-4" />
-                                                    </Button>
-                                                )}
+                                                <Button size="icon" variant="secondary" className="h-8 w-8" onClick={() => handleEditClick(cam)}>
+                                                    <Edit2 className="w-4 h-4" />
+                                                </Button>
                                                 <Button size="icon" variant="destructive" className="h-8 w-8" onClick={() => handleDelete(cam.id)}>
                                                     <Trash2 className="w-4 h-4" />
                                                 </Button>
@@ -872,15 +880,22 @@ const SystemConfiguration = () => {
                                                 <input
                                                     type="text"
                                                     name="streamUrl"
-                                                        value={formData.streamUrl}
-                                                        onChange={handleInputChange}
-                                                        className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                                                        placeholder="rtsp://camera/stream"
-                                                    />
-                                                    <Button type="button" variant="secondary" onClick={handleTestConnection} disabled={isTestingConnection}>
+                                                    value={formData.streamUrl}
+                                                    onChange={handleInputChange}
+                                                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm disabled:cursor-not-allowed disabled:bg-muted"
+                                                    placeholder="rtsp://camera/stream"
+                                                    disabled={isEditMode}
+                                                    readOnly={isEditMode}
+                                                />
+                                                <Button type="button" variant="secondary" onClick={handleTestConnection} disabled={isTestingConnection || isSaving}>
                                                     {isTestingConnection ? 'Testing...' : 'Test'}
                                                 </Button>
                                             </div>
+                                            {isEditMode && (
+                                                <p className="text-xs text-muted-foreground">
+                                                    Stream URL is locked after creation so the camera keeps the same source identity.
+                                                </p>
+                                            )}
                                             {testResult && (
                                                 <div className={cn(
                                                     "rounded-md border px-3 py-2 text-sm",
@@ -974,9 +989,9 @@ const SystemConfiguration = () => {
 
                                     {/* Footer Actions */}
                                     <div className="flex justify-end gap-2 pt-4">
-                                        <Button type="button" variant="ghost" onClick={resetForm} disabled={isUploading || isTestingConnection}>Cancel</Button>
-                                        <Button type="submit" disabled={isUploading || isTestingConnection}>
-                                            {isUploading ? (
+                                        <Button type="button" variant="ghost" onClick={resetForm} disabled={isSaving || isUploading || isTestingConnection}>Cancel</Button>
+                                        <Button type="submit" disabled={isSaving || isUploading || isTestingConnection}>
+                                            {isUploading || isSaving ? (
                                                 <>
                                                     <Loader2 className="w-4 h-4 mr-2 animate-spin" /> Processing...
                                                 </>

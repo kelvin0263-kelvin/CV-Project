@@ -39,6 +39,7 @@ from app.services.building_counter import (
     get_building_summary,
     reset_camera_rollup,
     reset_building_runtime,
+    restore_building_runtime,
     sync_building_runtime,
 )
 from app.services.cross_camera_verifier import (
@@ -275,6 +276,21 @@ async def _load_latest_snapshot_by_camera(
         for camera_id, snapshot in latest_by_camera.items()
         if _is_current_local_day_snapshot(snapshot.timestamp)
     }
+
+
+async def _load_latest_building_snapshot(
+    session: AsyncSession,
+) -> BuildingCountingSnapshot | None:
+    latest_snapshot = await session.scalar(
+        select(BuildingCountingSnapshot)
+        .order_by(desc(BuildingCountingSnapshot.timestamp))
+        .limit(1)
+    )
+    if latest_snapshot is None:
+        return None
+    if not _is_current_local_day_snapshot(latest_snapshot.timestamp):
+        return None
+    return latest_snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -894,6 +910,19 @@ async def load_counting_configs_from_db():
     try:
         async with AsyncSessionLocal() as session:
             await sync_counting_runtime_from_db(session)
+            latest_building_snapshot = await _load_latest_building_snapshot(session)
+            if latest_building_snapshot is not None:
+                restore_building_runtime(
+                    {
+                        "raw_in": latest_building_snapshot.raw_in,
+                        "raw_out": latest_building_snapshot.raw_out,
+                        "entrance_summaries": latest_building_snapshot.entrance_summaries or {},
+                    }
+                )
+                print(
+                    "[Startup] Restored building summary from snapshot "
+                    f"timestamp={latest_building_snapshot.timestamp}"
+                )
             print(f"[Startup] Loaded {len(_counting_configs)} people counting config(s)")
     except Exception as e:
         print(f"[Startup] Warning: Could not load counting configs: {e}")

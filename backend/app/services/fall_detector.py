@@ -19,10 +19,12 @@ def calculate_angle(p1: tuple[float, float], p2: tuple[float, float]) -> float:
 def is_person_in_fall_pose(
     person_bbox: list[float],
     keypoints_data: Optional[np.ndarray],
+    conf
 ) -> bool:
     """
     Determine if one person is in fall pose using shoulder/hip angle and bbox ratio.
     """
+    CONFIDENCE_THRESHOLD = conf
     if person_bbox is None or len(person_bbox) < 4:
         return False
         

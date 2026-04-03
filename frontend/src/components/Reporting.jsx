@@ -15,6 +15,8 @@ import { cn } from '../lib/utils';
 import { getApiBaseUrl } from '../apiConfig';
 
 const HAS_TZ_SUFFIX = /(Z|[+-]\d{2}:\d{2})$/i;
+const DETECTION_EVENT_PAGE_SIZE = 500;
+const MAX_DETECTION_EVENT_ROWS = 20000;
 const SNAPSHOT_PAGE_SIZE = 1000;
 const MAX_COUNTING_HISTORY_ROWS = 20000;
 const BUILDING_HISTORY_PAGE_SIZE = 1000;
@@ -3193,23 +3195,45 @@ const Reporting = () => {
     const fetchEvents = useCallback(async () => {
         setLoading(true);
         try {
-            const params = new URLSearchParams();
-            appendQueryParam(params, 'limit', 200);
-            if (selectedCategory === 'Dress Code') {
-                appendQueryParam(params, 'event_type', 'Dress Code Violation');
-            } else if (selectedCategory === 'Fall Detection') {
-                appendQueryParam(params, 'event_type', 'Fall Detected');
-            } else if (selectedCategory === 'People Counting') {
-                appendQueryParam(params, 'event_type', 'Capacity Exceeded');
+            const allEvents = [];
+            let offset = 0;
+
+            while (offset < MAX_DETECTION_EVENT_ROWS) {
+                const params = new URLSearchParams();
+                appendQueryParam(params, 'limit', DETECTION_EVENT_PAGE_SIZE);
+                appendQueryParam(params, 'offset', offset);
+                if (selectedCategory === 'Dress Code') {
+                    appendQueryParam(params, 'event_type', 'Dress Code Violation');
+                } else if (selectedCategory === 'Fall Detection') {
+                    appendQueryParam(params, 'event_type', 'Fall Detected');
+                } else if (selectedCategory === 'People Counting') {
+                    appendQueryParam(params, 'event_type', 'Capacity Exceeded');
+                }
+                if (selectedCameraFilter !== 'all') {
+                    appendQueryParam(params, 'camera_id', selectedCameraFilter);
+                }
+                appendQueryParam(params, 'start', reportingStartParam);
+                appendQueryParam(params, 'end', reportingEndParam);
+
+                const res = await fetch(`${apiUrl}/api/detection-events?${params.toString()}`);
+                if (!res.ok) break;
+
+                const data = await res.json();
+                if (!Array.isArray(data) || data.length === 0) break;
+
+                allEvents.push(...data);
+                offset += data.length;
+
+                if (data.length < DETECTION_EVENT_PAGE_SIZE) break;
             }
-            if (selectedCameraFilter !== 'all') {
-                appendQueryParam(params, 'camera_id', selectedCameraFilter);
+
+            if (allEvents.length >= MAX_DETECTION_EVENT_ROWS) {
+                console.warn(
+                    `[Reporting] Detection event history reached cap (${MAX_DETECTION_EVENT_ROWS} rows).`,
+                );
             }
-            appendQueryParam(params, 'start', reportingStartParam);
-            appendQueryParam(params, 'end', reportingEndParam);
-            const res = await fetch(`${apiUrl}/api/detection-events?${params.toString()}`);
-            const data = await res.json();
-            setEvents(data);
+
+            setEvents(allEvents);
         } catch (err) {
             console.error("Failed to fetch events:", err);
         } finally {
