@@ -9,12 +9,20 @@ const StreamPlayer = ({
     onStats,
     onDetections,
     onCountingData,
+    onMediaLayout,
+    onStreamState,
     showCountingAnchors = false,
     overlayMode = 'auto',
 }) => {
+    const wrapperRef = useRef(null);
     const imgRef = useRef(null);
     const canvasRef = useRef(null);
     const wsRef = useRef(null);
+    const onStatsRef = useRef(onStats);
+    const onDetectionsRef = useRef(onDetections);
+    const onCountingDataRef = useRef(onCountingData);
+    const onMediaLayoutRef = useRef(onMediaLayout);
+    const onStreamStateRef = useRef(onStreamState);
     const detectionsRef = useRef([]);
     const latestPayloadRef = useRef(null);
     const renderRafRef = useRef(null);
@@ -28,15 +36,39 @@ const StreamPlayer = ({
         setStatus(nextStatus);
     }, []);
 
+    useEffect(() => {
+        onStatsRef.current = onStats;
+    }, [onStats]);
+
+    useEffect(() => {
+        onDetectionsRef.current = onDetections;
+    }, [onDetections]);
+
+    useEffect(() => {
+        onCountingDataRef.current = onCountingData;
+    }, [onCountingData]);
+
+    useEffect(() => {
+        onMediaLayoutRef.current = onMediaLayout;
+    }, [onMediaLayout]);
+
+    useEffect(() => {
+        onStreamStateRef.current = onStreamState;
+    }, [onStreamState]);
+
+
     // --- Compute actual image display area within object-contain ---
     const getImageDisplayArea = useCallback(() => {
         const img = imgRef.current;
-        if (!img) return null;
-        const rect = img.getBoundingClientRect();
+        const wrapper = wrapperRef.current;
+        if (!img || !wrapper) return null;
+        const rect = wrapper.getBoundingClientRect();
         const containerW = rect.width;
         const containerH = rect.height;
-        // Backend always sends 640x360 (16:9)
-        const imgAspect = 640 / 360;
+        if (!containerW || !containerH) return null;
+        const naturalWidth = Number(img.naturalWidth) > 0 ? Number(img.naturalWidth) : 640;
+        const naturalHeight = Number(img.naturalHeight) > 0 ? Number(img.naturalHeight) : 360;
+        const imgAspect = naturalWidth / naturalHeight;
         const containerAspect = containerW / containerH;
 
         let displayW, displayH, offsetX, offsetY;
@@ -53,8 +85,24 @@ const StreamPlayer = ({
             offsetX = 0;
             offsetY = (containerH - displayH) / 2;
         }
-        return { displayW, displayH, offsetX, offsetY };
+        return {
+            displayW,
+            displayH,
+            offsetX,
+            offsetY,
+            mediaWidth: naturalWidth,
+            mediaHeight: naturalHeight,
+            containerWidth: containerW,
+            containerHeight: containerH,
+        };
     }, []);
+
+    const publishMediaLayout = useCallback(() => {
+        if (!onMediaLayoutRef.current) return;
+        const area = getImageDisplayArea();
+        if (!area) return;
+        onMediaLayoutRef.current(area);
+    }, [getImageDisplayArea]);
 
     const getOverlayVisual = useCallback((det) => {
         const normalizedMode = String(overlayMode || 'auto').toLowerCase();
@@ -160,12 +208,11 @@ const StreamPlayer = ({
         // Compute actual visible image area (accounting for object-contain letterboxing)
         const area = getImageDisplayArea();
         if (!area) return;
-        const { displayW, displayH, offsetX, offsetY } = area;
+        const { displayW, displayH, offsetX, offsetY, mediaWidth, mediaHeight } = area;
 
-        // The detections have coords scaled to 640x360 by the backend.
-        // Scale to the actual displayed image size, with offset for letterboxing.
-        const scaleX = displayW / 640;
-        const scaleY = displayH / 360;
+        // Keep the overlay locked to the exact visible media area inside object-contain.
+        const scaleX = displayW / mediaWidth;
+        const scaleY = displayH / mediaHeight;
 
         detections.forEach((det) => {
             if (!det.person_bbox) return;
@@ -242,14 +289,23 @@ const StreamPlayer = ({
             setStatusSafe('connected');
         } else if (imgRef.current) {
             imgRef.current.removeAttribute('src');
+
             drawDetections([]);
             setStatusSafe(data.stream_status === 'offline' ? 'disconnected' : 'recovering');
         }
 
-        if (onStats) {
-            onStats({
+        if (onStatsRef.current) {
+            onStatsRef.current({
                 fps: data.fps || 0,
                 people_count: data.people_count || 0,
+            });
+        }
+
+        if (onStreamStateRef.current) {
+            onStreamStateRef.current({
+                status: data.stream_status || (data.image ? 'live' : 'recovering'),
+                reason: data.stream_reason || null,
+                hasImage: Boolean(data.image),
             });
         }
 
@@ -257,14 +313,14 @@ const StreamPlayer = ({
         detectionsRef.current = detections;
         drawDetections(detections);
 
-        if (onDetections) {
-            onDetections(detections);
+        if (onDetectionsRef.current) {
+            onDetectionsRef.current(detections);
         }
 
-        if (onCountingData && data.counting_data) {
-            onCountingData(data.counting_data);
+        if (onCountingDataRef.current && data.counting_data) {
+            onCountingDataRef.current(data.counting_data);
         }
-    }, [drawDetections, onCountingData, onDetections, onStats, setStatusSafe]);
+    }, [drawDetections, setStatusSafe]);
 
     const scheduleLatestRender = useCallback(() => {
         if (renderRafRef.current !== null) return;
@@ -349,12 +405,36 @@ const StreamPlayer = ({
         };
     }, [drawDetections, scheduleLatestRender, setStatusSafe, wsUrl]);
 
+    useEffect(() => {
+        if (!onMediaLayoutRef.current) return undefined;
+        const wrapper = wrapperRef.current;
+        const img = imgRef.current;
+        if (!wrapper || typeof ResizeObserver === 'undefined') {
+            publishMediaLayout();
+            return undefined;
+        }
+
+        const observer = new ResizeObserver(() => {
+            publishMediaLayout();
+        });
+        observer.observe(wrapper);
+        if (img) {
+            observer.observe(img);
+        }
+        publishMediaLayout();
+
+        return () => {
+            observer.disconnect();
+        };
+    }, [publishMediaLayout]);
+
     return (
-        <div className={`relative bg-black flex items-center justify-center overflow-hidden ${className}`}>
+        <div ref={wrapperRef} className={`relative bg-black flex items-center justify-center overflow-hidden ${className}`}>
             <img
                 ref={imgRef}
                 className="w-full h-full object-contain"
                 alt={alt}
+                onLoad={publishMediaLayout}
             />
             <canvas
                 ref={canvasRef}

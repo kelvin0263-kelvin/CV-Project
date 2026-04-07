@@ -49,7 +49,8 @@ const parseApiTimestamp = (value) => {
 };
 
 const getTimestampMs = (value) => parseApiTimestamp(value)?.getTime() ?? 0;
-const getTimestampIsoDate = (value) => parseApiTimestamp(value)?.toISOString().split('T')[0] ?? '';
+// Currently unused.
+// const getTimestampIsoDate = (value) => parseApiTimestamp(value)?.toISOString().split('T')[0] ?? '';
 const formatTimestamp = (value) => parseApiTimestamp(value)?.toLocaleString() ?? '-';
 const getCameraLabel = (item) => {
     if (item?.details?.scope === 'building') return 'Building';
@@ -157,10 +158,11 @@ const formatDateTimeLocal = (date) => {
     return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 };
 
-const formatDateOnlyLocal = (date) => {
-    const pad = (n) => String(n).padStart(2, '0');
-    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
-};
+// Currently unused.
+// const formatDateOnlyLocal = (date) => {
+//     const pad = (n) => String(n).padStart(2, '0');
+//     return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+// };
 
 const toApiDateTimeParam = (value) => {
     if (value == null) return null;
@@ -247,17 +249,18 @@ const getDateRangeBounds = (startDate, endDate) => {
     return { startMs, endMs };
 };
 
-const getLatestSnapshotInRange = (rows, { startMs = null, endMs = null } = {}) => {
-    let latest = null;
-    normalizeSnapshotRows(rows).forEach((row) => {
-        if (startMs != null && row.tsMs < startMs) return;
-        if (endMs != null && row.tsMs > endMs) return;
-        if (!latest || row.tsMs > latest.tsMs) {
-            latest = row;
-        }
-    });
-    return latest;
-};
+// Currently unused.
+// const getLatestSnapshotInRange = (rows, { startMs = null, endMs = null } = {}) => {
+//     let latest = null;
+//     normalizeSnapshotRows(rows).forEach((row) => {
+//         if (startMs != null && row.tsMs < startMs) return;
+//         if (endMs != null && row.tsMs > endMs) return;
+//         if (!latest || row.tsMs > latest.tsMs) {
+//             latest = row;
+//         }
+//     });
+//     return latest;
+// };
 
 const getLatestSnapshotsByCamera = (rows, { startMs = null, endMs = null } = {}) => {
     const latestByCamera = new Map();
@@ -308,6 +311,41 @@ const summarizeLatestSnapshots = (rows, { startMs = null, endMs = null } = {}) =
         foot_traffic_right: footTrafficRight,
         foot_traffic_total: footTrafficTotal,
     };
+};
+
+const calculateCombinedPeakOccupancy = (rows, { startMs = null, endMs = null } = {}) => {
+    const sortedRows = normalizeSnapshotRows(rows)
+        .filter((row) => row.camera_id)
+        .sort((a, b) => a.tsMs - b.tsMs);
+
+    const occupancyByCamera = new Map();
+    let currentTotal = 0;
+    let peakOccupancy = 0;
+    let enteredRange = startMs == null;
+
+    for (const row of sortedRows) {
+        if (endMs != null && row.tsMs > endMs) break;
+
+        if (!enteredRange && row.tsMs >= startMs) {
+            peakOccupancy = Math.max(peakOccupancy, currentTotal);
+            enteredRange = true;
+        }
+
+        const previousOccupancy = Number(occupancyByCamera.get(row.camera_id) ?? 0);
+        const nextOccupancy = Number(row.current_occupancy ?? 0);
+        occupancyByCamera.set(row.camera_id, nextOccupancy);
+        currentTotal += nextOccupancy - previousOccupancy;
+
+        if (enteredRange && (startMs == null || row.tsMs >= startMs)) {
+            peakOccupancy = Math.max(peakOccupancy, currentTotal);
+        }
+    }
+
+    if (!enteredRange && (startMs != null || endMs != null)) {
+        peakOccupancy = Math.max(peakOccupancy, currentTotal);
+    }
+
+    return peakOccupancy;
 };
 
 const isWholeSingleLocalDayRange = (startValue, endValue) => {
@@ -1336,6 +1374,13 @@ const ExportDialog = ({ isOpen, onClose, onExport }) => {
     );
 };
 
+const escapeExportHtml = (value) => String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+
 const FlowTrendPanel = ({ snapshots, cameraLabel }) => {
     const [timeRange, setTimeRange] = useState('24h');
     const [customStart, setCustomStart] = useState(() => createDefaultCustomRange().start);
@@ -1572,7 +1617,7 @@ const TrafficAnalyticsPanel = ({ snapshots, cameraLabel, startMs, endMs, isAllCa
 
             {trafficSummary.resetCount > 0 && (
                 <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-700">
-                    Traffic counter resets were detected in the selected report range. Foot-traffic and capture-rate trends are rebuilt from changes between saved snapshots.
+                    {/* Traffic counter resets were detected in the selected report range. Foot-traffic and capture-rate trends are rebuilt from changes between saved snapshots. */}
                 </div>
             )}
 
@@ -2937,6 +2982,11 @@ const AllOverviewPanel = ({ events, snapshots, startMs, endMs, cameraOptions, ca
             ? (Number(latestSnapshotSummary.totalIn ?? 0) / Number(latestSnapshotSummary.footTrafficTotal ?? 0)) * 100
             : 0)
         : Number(trafficSummary.captureRate ?? 0);
+    const displayedOverviewPeakOccupancy = useMemo(() => (
+        cameraFilter === 'all'
+            ? calculateCombinedPeakOccupancy(snapshots, { startMs, endMs })
+            : Number(peopleSummary.peakOccupancy ?? 0)
+    ), [cameraFilter, endMs, peopleSummary.peakOccupancy, snapshots, startMs]);
 
     const dressCodeSummary = useMemo(() => aggregateDressCodeAnalytics(events, snapshots, {
         startMs,
@@ -3045,7 +3095,7 @@ const AllOverviewPanel = ({ events, snapshots, startMs, endMs, cameraOptions, ca
                     </div>
                     <div className="rounded-xl border border-blue-500/20 bg-blue-500/10 p-4">
                         <div className="text-sm text-muted-foreground">Peak Occupancy</div>
-                        <div className="mt-2 text-3xl font-bold text-blue-700">{formatNumber(peopleSummary.peakOccupancy)}</div>
+                        <div className="mt-2 text-3xl font-bold text-blue-700">{formatNumber(displayedOverviewPeakOccupancy)}</div>
                         <div className="mt-1 text-xs text-muted-foreground">{peopleSummary.peakPeriodLabel}</div>
                     </div>
                 </CardContent>
@@ -3417,6 +3467,20 @@ const Reporting = () => {
     const displayedPeopleCountingOccupancy = shouldUseLatestSnapshotTotals
         ? Number(latestSelectedSnapshotSummary.estimatedOccupancy ?? 0)
         : Number(peopleCountingSummary.estimatedOccupancy ?? 0);
+    const displayedPeopleCountingPeakOccupancy = useMemo(() => (
+        selectedCameraFilter === 'all'
+            ? calculateCombinedPeakOccupancy(selectedCountingSnapshots, {
+                startMs: reportingDateBounds.startMs,
+                endMs: reportingDateBounds.endMs,
+            })
+            : Number(peopleCountingSummary.peakOccupancy ?? 0)
+    ), [
+        peopleCountingSummary.peakOccupancy,
+        reportingDateBounds.endMs,
+        reportingDateBounds.startMs,
+        selectedCameraFilter,
+        selectedCountingSnapshots,
+    ]);
 
     // Build combined display rows for log table
     const displayRows = (() => {
@@ -3544,7 +3608,82 @@ const Reporting = () => {
             link.click();
             URL.revokeObjectURL(url);
         } else {
-            alert('PDF export not implemented yet.');
+            if (isPeopleCountingBuildingView) {
+                alert('Building view export is not implemented yet.');
+                return;
+            }
+
+            const isCounting = isPeopleCountingCategory;
+            const title = `${selectedCategory} Report`;
+            const filters = [
+                `Generated: ${new Date().toLocaleString()}`,
+                `Category: ${selectedCategory}`,
+                `Quick Range: ${selectedQuickRange}`,
+                selectedCameraFilter !== 'all' ? `Camera Filter: ${selectedCameraFilter}` : null,
+                isCounting ? `Mode: ${selectedPeopleCountingView}` : null,
+                `Rows: ${isCounting ? filteredSnapshots.length : filteredEvents.length}`,
+            ].filter(Boolean);
+            const headers = isCounting
+                ? ['Timestamp', 'Camera Name', 'Camera ID', 'Total In', 'Total Out', 'Occupancy']
+                : ['ID', 'Timestamp', 'Event Type', 'Camera Name', 'Camera ID', 'Label', 'Confidence'];
+            const rows = isCounting
+                ? filteredSnapshots.map((s) => [
+                    s.timestamp,
+                    getCameraLabel(s),
+                    s.camera_id,
+                    s.total_in,
+                    s.total_out,
+                    s.current_occupancy,
+                ])
+                : filteredEvents.map((e) => [
+                    e.id,
+                    e.timestamp,
+                    e.event_type,
+                    getCameraLabel(e),
+                    e.camera_id,
+                    e.details?.label || '',
+                    e.details?.confidence || '',
+                ]);
+
+            const printWindow = window.open('', '_blank', 'width=1100,height=800');
+            if (!printWindow) {
+                alert('Unable to open print window for PDF export.');
+                return;
+            }
+
+            const tableHead = headers.map((header) => `<th>${escapeExportHtml(header)}</th>`).join('');
+            const tableRows = rows.length
+                ? rows.map((row) => `<tr>${row.map((cell) => `<td>${escapeExportHtml(cell)}</td>`).join('')}</tr>`).join('')
+                : `<tr><td colspan="${headers.length}">No data available for the current filters.</td></tr>`;
+
+            printWindow.document.write(`<!DOCTYPE html>
+<html>
+<head>
+  <title>${escapeExportHtml(title)}</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 24px; color: #0f172a; }
+    h1 { margin: 0 0 8px; font-size: 24px; }
+    .meta { margin: 0 0 18px; color: #475569; font-size: 12px; line-height: 1.6; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { border: 1px solid #cbd5e1; padding: 8px; text-align: left; vertical-align: top; }
+    th { background: #f8fafc; }
+    tr:nth-child(even) td { background: #f8fafc; }
+  </style>
+</head>
+<body>
+  <h1>${escapeExportHtml(title)}</h1>
+  <div class="meta">${filters.map((item) => `<div>${escapeExportHtml(item)}</div>`).join('')}</div>
+  <table>
+    <thead><tr>${tableHead}</tr></thead>
+    <tbody>${tableRows}</tbody>
+  </table>
+</body>
+</html>`);
+            printWindow.document.close();
+            printWindow.focus();
+            window.setTimeout(() => {
+                printWindow.print();
+            }, 150);
         }
     };
 
@@ -3825,7 +3964,7 @@ const Reporting = () => {
                                             <Users className="h-4 w-4 text-blue-600" />
                                             Peak Occupancy
                                         </div>
-                                        <div className="mt-2 text-3xl font-bold text-blue-700">{formatNumber(peopleCountingSummary.peakOccupancy)}</div>
+                                        <div className="mt-2 text-3xl font-bold text-blue-700">{formatNumber(displayedPeopleCountingPeakOccupancy)}</div>
                                     </div>
                                     <div className="rounded-xl border border-indigo-500/20 bg-indigo-500/10 p-4">
                                         <div className="flex items-center gap-2 text-sm text-muted-foreground">

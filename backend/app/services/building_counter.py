@@ -1,9 +1,11 @@
 from collections import defaultdict
 import threading
+import time
 import uuid
 
 
 _runtime_lock = threading.Lock()
+CAPACITY_ALERT_PERSIST_SEC = 5.0
 _building_config = {
     "enabled": True,
     "max_capacity": None,
@@ -14,6 +16,7 @@ _entrance_rollups: dict[str, dict] = defaultdict(dict)
 _camera_rollups: dict[str, dict] = {}
 _raw_in = 0
 _raw_out = 0
+_capacity_exceeded_since: float | None = None
 _capacity_alert_fired = False
 
 
@@ -23,7 +26,7 @@ def sync_building_runtime(building_config: dict, sensor_configs: dict[str, dict]
     Aggregated counts are preserved so config changes do not wipe the current
     building total.
     """
-    global _building_config, _sensor_configs, _capacity_alert_fired
+    global _building_config, _sensor_configs, _capacity_alert_fired, _capacity_exceeded_since
 
     with _runtime_lock:
         _building_config = {
@@ -38,7 +41,13 @@ def sync_building_runtime(building_config: dict, sensor_configs: dict[str, dict]
             }
             for camera_id, cfg in sensor_configs.items()
         }
-        if not _is_capacity_exceeded_locked():
+        if _is_capacity_exceeded_locked():
+            if _capacity_alert_fired:
+                _capacity_exceeded_since = time.monotonic() - CAPACITY_ALERT_PERSIST_SEC
+            elif _capacity_exceeded_since is None:
+                _capacity_exceeded_since = time.monotonic()
+        else:
+            _capacity_exceeded_since = None
             _capacity_alert_fired = False
 
 
@@ -50,7 +59,7 @@ def restore_building_runtime(snapshot: dict | None):
     dedicated config table first, then this function restores the latest raw counts
     and entrance/camera rollups underneath that config.
     """
-    global _raw_in, _raw_out, _entrance_rollups, _camera_rollups, _capacity_alert_fired
+    global _raw_in, _raw_out, _entrance_rollups, _camera_rollups, _capacity_alert_fired, _capacity_exceeded_since
 
     if not isinstance(snapshot, dict):
         return
@@ -85,11 +94,16 @@ def restore_building_runtime(snapshot: dict | None):
         _entrance_rollups = defaultdict(dict, restored_entrance_rollups)
         _camera_rollups = restored_camera_rollups
         _capacity_alert_fired = _is_capacity_exceeded_locked()
+        _capacity_exceeded_since = (
+            time.monotonic() - CAPACITY_ALERT_PERSIST_SEC
+            if _capacity_alert_fired
+            else None
+        )
 
 
 def reset_building_runtime(manual_offset: int | None = None):
     """Clear all aggregated counters, optionally replacing the manual offset."""
-    global _raw_in, _raw_out, _entrance_rollups, _camera_rollups, _capacity_alert_fired
+    global _raw_in, _raw_out, _entrance_rollups, _camera_rollups, _capacity_alert_fired, _capacity_exceeded_since
 
     with _runtime_lock:
         if manual_offset is not None:
@@ -98,6 +112,7 @@ def reset_building_runtime(manual_offset: int | None = None):
         _raw_out = 0
         _entrance_rollups = defaultdict(dict)
         _camera_rollups = {}
+        _capacity_exceeded_since = None
         _capacity_alert_fired = False
 
 
@@ -144,12 +159,13 @@ def ingest_sensor_events(camera_id: str, events: list[dict]):
                 entrance_camera_rollup["total_out"] += 1
                 _raw_out += 1
 
-        return _maybe_building_capacity_alert_locked()
+        _maybe_building_capacity_alert_locked()
+        return None
 
 
 def revert_sensor_in_events(camera_id: str, reverted_count: int):
     """Subtract reverted IN events from the camera and building rollups."""
-    global _raw_in, _capacity_alert_fired
+    global _raw_in, _capacity_alert_fired, _capacity_exceeded_since
 
     reverted_count = max(0, int(reverted_count or 0))
     if reverted_count <= 0:
@@ -194,12 +210,13 @@ def revert_sensor_in_events(camera_id: str, reverted_count: int):
             _camera_rollups.pop(camera_id, None)
 
         if not _is_capacity_exceeded_locked():
+            _capacity_exceeded_since = None
             _capacity_alert_fired = False
 
 
 def reset_camera_rollup(camera_id: str):
     """Remove one camera's historical contribution from building totals."""
-    global _raw_in, _raw_out, _capacity_alert_fired
+    global _raw_in, _raw_out, _capacity_alert_fired, _capacity_exceeded_since
 
     with _runtime_lock:
         camera_rollup = _camera_rollups.pop(camera_id, None)
@@ -223,7 +240,14 @@ def reset_camera_rollup(camera_id: str):
                 _entrance_rollups.pop(entrance_id, None)
 
         if not _is_capacity_exceeded_locked():
+            _capacity_exceeded_since = None
             _capacity_alert_fired = False
+
+
+def poll_building_capacity_alert():
+    """Return a building capacity alert once the exceeded state persists long enough."""
+    with _runtime_lock:
+        return _maybe_building_capacity_alert_locked()
 
 
 def get_building_summary() -> dict:
@@ -316,16 +340,23 @@ def _is_capacity_exceeded_locked() -> bool:
 
 
 def _maybe_building_capacity_alert_locked():
-    global _capacity_alert_fired
+    global _capacity_alert_fired, _capacity_exceeded_since
 
     max_capacity = _normalize_max_capacity(_building_config.get("max_capacity"))
     if max_capacity is None:
+        _capacity_exceeded_since = None
         _capacity_alert_fired = False
         return None
 
     occupancy = _current_occupancy_locked()
     if occupancy >= max_capacity:
         if _capacity_alert_fired:
+            return None
+        now = time.monotonic()
+        if _capacity_exceeded_since is None:
+            _capacity_exceeded_since = now
+            return None
+        if (now - _capacity_exceeded_since) < CAPACITY_ALERT_PERSIST_SEC:
             return None
         _capacity_alert_fired = True
         return {
@@ -337,5 +368,6 @@ def _maybe_building_capacity_alert_locked():
             "max_capacity": max_capacity,
         }
 
+    _capacity_exceeded_since = None
     _capacity_alert_fired = False
     return None

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
     PenTool,
     Save,
@@ -10,6 +10,9 @@ import {
     ArrowUpFromLine,
     AlertTriangle,
     Building2,
+    ChevronLeft,
+    ChevronDown,
+    ChevronRight,
 } from 'lucide-react';
 
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
@@ -67,10 +70,16 @@ const getFootTrafficLabelsForLine = (line) => {
         const dx = Number(end?.[0] ?? 0) - Number(start?.[0] ?? 0);
         const dy = Number(end?.[1] ?? 0) - Number(start?.[1] ?? 0);
         if (Math.abs(dy) >= Math.abs(dx)) {
-            return { negative: 'Left', positive: 'Right', shortNegative: 'L', shortPositive: 'R', mode: 'left_right' };
+            return dy >= 0
+                ? { negative: 'Right', positive: 'Left', shortNegative: 'R', shortPositive: 'L', mode: 'left_right' }
+                : { negative: 'Left', positive: 'Right', shortNegative: 'L', shortPositive: 'R', mode: 'left_right' };
         }
     }
-    return { negative: 'Down', positive: 'Up', shortNegative: 'D', shortPositive: 'U', mode: 'up_down' };
+    const [start, end] = points;
+    const dx = Number(end?.[0] ?? 0) - Number(start?.[0] ?? 0);
+    return dx >= 0
+        ? { negative: 'Up', positive: 'Down', shortNegative: 'U', shortPositive: 'D', mode: 'up_down' }
+        : { negative: 'Down', positive: 'Up', shortNegative: 'D', shortPositive: 'U', mode: 'up_down' };
 };
 
 const getFootTrafficSummaryLabels = (lines) => {
@@ -87,12 +96,29 @@ const getFootTrafficSummaryLabels = (lines) => {
     return { ...labels[0], mixed: false };
 };
 
+const getLineDirectionDisplay = (line) => {
+    if (getLineType(line) === 'foot_traffic') {
+        const labels = getFootTrafficLabelsForLine(line);
+        return line.direction === 'left_to_right'
+            ? `${labels.negative} only`
+            : `${labels.positive} only`;
+    }
+
+    return line.direction === 'left_to_right' ? 'Right to Left' : 'Left to Right';
+};
+
 const sortCamerasAlphabetically = (cameraList) => [...cameraList].sort((left, right) => (
     String(left?.name || '').localeCompare(String(right?.name || ''), undefined, {
         numeric: true,
         sensitivity: 'base',
     })
 ));
+
+const getCameraOptionLabel = (camera) => {
+    const name = String(camera?.name || '').trim() || 'Unnamed camera';
+    const location = String(camera?.location || '').trim();
+    return location ? `${name} - ${location}` : name;
+};
 
 const Toggle = ({ checked, onClick, disabled = false }) => (
     <button
@@ -114,17 +140,18 @@ const Toggle = ({ checked, onClick, disabled = false }) => (
     </button>
 );
 
-const StatTile = ({ label, value, icon: Icon, tone = 'default', subtitle = null }) => {
+const StatTile = ({ label, value, icon: Icon, tone = 'default', subtitle = null, className = '' }) => {
     const toneClasses = {
         green: 'border-green-500/20 bg-green-500/10 text-green-500',
         red: 'border-red-500/20 bg-red-500/10 text-red-500',
         cyan: 'border-cyan-500/20 bg-cyan-500/10 text-cyan-500',
         amber: 'border-amber-500/20 bg-amber-500/10 text-amber-500',
-        default: 'border-primary/20 bg-primary/10 text-primary',
+        blue: 'border-blue-500/20 bg-blue-500/10 text-blue-500',
+        default: 'border-blue-500/20 bg-blue-500/10 text-blue-500',
     };
 
     return (
-        <div className={cn('rounded-2xl border p-3', toneClasses[tone] || toneClasses.default)}>
+        <div className={cn('rounded-2xl border p-3 shadow-sm', toneClasses[tone] || toneClasses.default, className)}>
             <div className="flex items-center gap-2">
                 <Icon className="h-4 w-4" />
                 <span className="text-[11px] font-medium uppercase tracking-[0.16em] text-muted-foreground">
@@ -137,24 +164,51 @@ const StatTile = ({ label, value, icon: Icon, tone = 'default', subtitle = null 
     );
 };
 
-const SectionShell = ({ title, description = null, action = null, children }) => (
+const SectionShell = ({
+    title,
+    description = null,
+    action = null,
+    children,
+    collapsible = false,
+    collapsed = false,
+    onToggle = null,
+}) => (
     <Card className="border-slate-200/80 bg-white/95 shadow-sm">
         <CardHeader className="space-y-2 pb-3">
             <div className="flex items-start justify-between gap-3">
-                <div>
-                    <CardTitle className="text-base">{title}</CardTitle>
+                <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                        {collapsible && (
+                            <button
+                                type="button"
+                                onClick={onToggle}
+                                className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 transition hover:bg-slate-50 hover:text-slate-700"
+                                aria-label={`${collapsed ? 'Expand' : 'Collapse'} ${title}`}
+                            >
+                                {collapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                            </button>
+                        )}
+                        <CardTitle className="text-base">{title}</CardTitle>
+                    </div>
                     {description && <p className="mt-1 text-sm text-muted-foreground">{description}</p>}
                 </div>
-                {action}
+                {!collapsed && action}
             </div>
         </CardHeader>
-        <CardContent className="space-y-3">{children}</CardContent>
+        {!collapsed && <CardContent className="space-y-3">{children}</CardContent>}
     </Card>
 );
 
 const PeopleCounting = () => {
     const apiUrl = getApiBaseUrl();
-    const videoContainerRef = useRef(null);
+    const singleVideoContainerRef = useRef(null);
+    const primaryVideoContainerRef = useRef(null);
+    const verifierVideoContainerRef = useRef(null);
+    const stoppedPreviewStateRef = useRef({});
+    const stoppedPreviewRequestRef = useRef({});
+    const pairedPrimaryLookupCacheRef = useRef({});
+    const cameraConfigCacheRef = useRef({});
+    const cameraConfigRequestRef = useRef({});
 
     const [cameras, setCameras] = useState([]);
     const [selectedCamera, setSelectedCamera] = useState('');
@@ -167,14 +221,20 @@ const PeopleCounting = () => {
     const [crossCameraPairId, setCrossCameraPairId] = useState('');
     const [crossCameraRole, setCrossCameraRole] = useState('none');
     const [verificationCameraId, setVerificationCameraId] = useState('');
+    const [primaryInEventIdleTimeoutSec, setPrimaryInEventIdleTimeoutSec] = useState('7');
+    const [primaryOutEventIdleTimeoutSec, setPrimaryOutEventIdleTimeoutSec] = useState('7');
     const [drawingMode, setDrawingMode] = useState(null);
     const [countingData, setCountingData] = useState({});
     const [stats, setStats] = useState({ fps: 0, people_count: 0 });
+    const [panelStatsByCamera, setPanelStatsByCamera] = useState({});
+    const [panelCountingDataByCamera, setPanelCountingDataByCamera] = useState({});
     const [saving, setSaving] = useState(false);
     const [saveMessage, setSaveMessage] = useState('');
-    const [runtimePreviewImage, setRuntimePreviewImage] = useState('');
-    const [runtimePreviewFrameSize, setRuntimePreviewFrameSize] = useState(null);
-    const [loadingRuntimePreview, setLoadingRuntimePreview] = useState(false);
+    const [stoppedPreviewStateByCamera, setStoppedPreviewStateByCamera] = useState({});
+    const [livePreviewLayout, setLivePreviewLayout] = useState(null);
+    const [panelLivePreviewLayouts, setPanelLivePreviewLayouts] = useState({});
+    const [pairedPrimaryCameraId, setPairedPrimaryCameraId] = useState('');
+    const [resolvingPairedPrimary, setResolvingPairedPrimary] = useState(false);
     const [buildingEnabled, setBuildingEnabled] = useState(true);
     const [buildingMaxCapacity, setBuildingMaxCapacity] = useState('');
     const [buildingManualOffset, setBuildingManualOffset] = useState('0');
@@ -183,6 +243,17 @@ const PeopleCounting = () => {
     const [resettingCamera, setResettingCamera] = useState(false);
     const [confirmDialog, setConfirmDialog] = useState(null);
     const [activeTab, setActiveTab] = useState('setup');
+    const [collapsedConfigurationPanel, setCollapsedConfigurationPanel] = useState(false);
+    const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+    const [showSidebarRestoreHint, setShowSidebarRestoreHint] = useState(false);
+    const [isSidebarRestoreHovered, setIsSidebarRestoreHovered] = useState(false);
+    const [comparisonCameraConfig, setComparisonCameraConfig] = useState(null);
+    const [collapsedSetupSections, setCollapsedSetupSections] = useState({
+        geometry: false,
+        activeZone: true,
+        buildingGroup: true,
+        crossCamera: true,
+    });
 
     const resetCountingConfig = useCallback(() => {
         setLines([]);
@@ -194,8 +265,126 @@ const PeopleCounting = () => {
         setCrossCameraPairId('');
         setCrossCameraRole('none');
         setVerificationCameraId('');
+        setPrimaryInEventIdleTimeoutSec('7');
+        setPrimaryOutEventIdleTimeoutSec('7');
         setDrawingMode(null);
     }, []);
+
+    const toggleSetupSection = useCallback((sectionKey) => {
+        setCollapsedSetupSections((current) => ({
+            ...current,
+            [sectionKey]: !current[sectionKey],
+        }));
+    }, []);
+
+    const loadStoppedPreviewForCamera = useCallback(async (camera) => {
+        const cameraId = camera?.id;
+        const runtimeKey = String(camera?.runtime_key || '').trim();
+        if (!cameraId || !runtimeKey) {
+            return null;
+        }
+
+        const cachedState = stoppedPreviewStateRef.current[cameraId];
+        if (cachedState?.image) {
+            return cachedState;
+        }
+
+        if (stoppedPreviewRequestRef.current[cameraId]) {
+            return stoppedPreviewRequestRef.current[cameraId];
+        }
+
+        setStoppedPreviewStateByCamera((current) => ({
+            ...current,
+            [cameraId]: {
+                image: current[cameraId]?.image || '',
+                frameSize: current[cameraId]?.frameSize || null,
+                loading: true,
+            },
+        }));
+
+        const request = fetch(`${apiUrl}/api/upload-videos/preview`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                runtime_key: runtimeKey,
+                camera_id: cameraId,
+            }),
+        })
+            .then(async (res) => {
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok || !data.preview_image) {
+                    throw new Error(data.detail || 'Preview unavailable.');
+                }
+
+                const nextState = {
+                    image: `data:image/jpeg;base64,${data.preview_image}`,
+                    frameSize: Number(data.frame_width) > 0 && Number(data.frame_height) > 0
+                        ? { width: Number(data.frame_width), height: Number(data.frame_height) }
+                        : null,
+                    loading: false,
+                };
+
+                setStoppedPreviewStateByCamera((current) => ({
+                    ...current,
+                    [cameraId]: nextState,
+                }));
+                return nextState;
+            })
+            .catch((err) => {
+                console.error('Failed to load people counting preview:', err);
+                const failedState = {
+                    image: '',
+                    frameSize: null,
+                    loading: false,
+                };
+                setStoppedPreviewStateByCamera((current) => ({
+                    ...current,
+                    [cameraId]: failedState,
+                }));
+                return failedState;
+            })
+            .finally(() => {
+                delete stoppedPreviewRequestRef.current[cameraId];
+            });
+
+        stoppedPreviewRequestRef.current[cameraId] = request;
+        return request;
+    }, [apiUrl]);
+
+    const getCameraCountingConfig = useCallback(async (cameraId) => {
+        if (!cameraId) {
+            return null;
+        }
+
+        if (Object.prototype.hasOwnProperty.call(cameraConfigCacheRef.current, cameraId)) {
+            return cameraConfigCacheRef.current[cameraId];
+        }
+
+        if (cameraConfigRequestRef.current[cameraId]) {
+            return cameraConfigRequestRef.current[cameraId];
+        }
+
+        const request = fetch(`${apiUrl}/api/people-counting-config/${cameraId}`)
+            .then(async (res) => {
+                if (res.status === 404) {
+                    cameraConfigCacheRef.current[cameraId] = null;
+                    return null;
+                }
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    throw new Error(err.detail || `Failed to fetch counting config for camera ${cameraId}`);
+                }
+                const data = await res.json().catch(() => null);
+                cameraConfigCacheRef.current[cameraId] = data;
+                return data;
+            })
+            .finally(() => {
+                delete cameraConfigRequestRef.current[cameraId];
+            });
+
+        cameraConfigRequestRef.current[cameraId] = request;
+        return request;
+    }, [apiUrl]);
 
     useEffect(() => {
         const fetchCameras = async () => {
@@ -211,33 +400,39 @@ const PeopleCounting = () => {
                 console.error('Failed to fetch cameras:', err);
             }
         };
-
-        fetchCameras();
+            
+            fetchCameras();
     }, [apiUrl]);
+
 
     useEffect(() => {
         if (!selectedCamera) {
             resetCountingConfig();
             setCountingData({});
             setStats({ fps: 0, people_count: 0 });
+            setPanelStatsByCamera({});
+            setPanelCountingDataByCamera({});
+            setLivePreviewLayout(null);
+            setPanelLivePreviewLayouts({});
             return;
         }
 
         let cancelled = false;
         setCountingData({});
         setStats({ fps: 0, people_count: 0 });
+        setPanelStatsByCamera({});
+        setPanelCountingDataByCamera({});
+        setPanelLivePreviewLayouts({});
 
         const fetchConfig = async () => {
             try {
-                const res = await fetch(`${apiUrl}/api/people-counting-config/${selectedCamera}`);
-                if (!res.ok) {
+                const data = await getCameraCountingConfig(selectedCamera);
+                if (!data) {
                     if (!cancelled) {
                         resetCountingConfig();
                     }
                     return;
                 }
-
-                const data = await res.json();
                 if (cancelled) {
                     return;
                 }
@@ -251,6 +446,8 @@ const PeopleCounting = () => {
                 setCrossCameraPairId(data.cross_camera_pair_id || '');
                 setCrossCameraRole(data.cross_camera_role || 'none');
                 setVerificationCameraId(data.verification_camera_id || '');
+                setPrimaryInEventIdleTimeoutSec(String(data.primary_in_event_idle_timeout_sec ?? 7));
+                setPrimaryOutEventIdleTimeoutSec(String(data.primary_out_event_idle_timeout_sec ?? 7));
             } catch (err) {
                 console.error('Failed to fetch counting config:', err);
                 if (!cancelled) {
@@ -263,7 +460,12 @@ const PeopleCounting = () => {
         return () => {
             cancelled = true;
         };
-    }, [selectedCamera, apiUrl, resetCountingConfig]);
+    }, [selectedCamera, apiUrl, getCameraCountingConfig, resetCountingConfig]);
+
+    useEffect(() => {
+        setLivePreviewLayout(null);
+        setPanelLivePreviewLayouts({});
+    }, [selectedCamera, crossCameraRole, crossCameraEnabled]);
 
     useEffect(() => {
         const fetchBuildingConfig = async () => {
@@ -283,6 +485,10 @@ const PeopleCounting = () => {
 
         fetchBuildingConfig();
     }, [apiUrl]);
+
+    useEffect(() => {
+        stoppedPreviewStateRef.current = stoppedPreviewStateByCamera;
+    }, [stoppedPreviewStateByCamera]);
 
     useEffect(() => {
         let isMounted = true;
@@ -343,6 +549,17 @@ const PeopleCounting = () => {
         setSaveMessage('');
 
         try {
+            const parsedPrimaryInEventIdleTimeoutSec = Number.parseFloat(primaryInEventIdleTimeoutSec);
+            const parsedPrimaryOutEventIdleTimeoutSec = Number.parseFloat(primaryOutEventIdleTimeoutSec);
+
+            if (!Number.isFinite(parsedPrimaryInEventIdleTimeoutSec) || parsedPrimaryInEventIdleTimeoutSec < 0) {
+                throw new Error('Primary IN idle timeout must be 0 or greater.');
+            }
+
+            if (!Number.isFinite(parsedPrimaryOutEventIdleTimeoutSec) || parsedPrimaryOutEventIdleTimeoutSec < 0) {
+                throw new Error('Primary OUT idle timeout must be 0 or greater.');
+            }
+
             const body = {
                 enabled,
                 participate_in_building_count: participateInBuildingCount,
@@ -351,6 +568,8 @@ const PeopleCounting = () => {
                 cross_camera_pair_id: crossCameraEnabled ? crossCameraPairId.trim() : null,
                 cross_camera_role: effectiveCrossCameraRole,
                 verification_camera_id: crossCameraEnabled && effectiveCrossCameraRole === 'primary' ? verificationCameraId : null,
+                primary_in_event_idle_timeout_sec: parsedPrimaryInEventIdleTimeoutSec,
+                primary_out_event_idle_timeout_sec: parsedPrimaryOutEventIdleTimeoutSec,
                 lines,
                 frame_exclude_areas: validFrameExcludeAreas,
             };
@@ -367,6 +586,7 @@ const PeopleCounting = () => {
             }
 
             const savedConfig = await countingRes.json();
+            cameraConfigCacheRef.current[selectedCamera] = savedConfig;
             setLines(Array.isArray(savedConfig.lines) ? savedConfig.lines : []);
             setFrameExcludeAreas(filterValidFrameExcludeAreas(savedConfig.frame_exclude_areas));
             setEnabled(savedConfig.enabled ?? true);
@@ -376,6 +596,8 @@ const PeopleCounting = () => {
             setCrossCameraPairId(savedConfig.cross_camera_pair_id || '');
             setCrossCameraRole(savedConfig.cross_camera_role || 'none');
             setVerificationCameraId(savedConfig.verification_camera_id || '');
+            setPrimaryInEventIdleTimeoutSec(String(savedConfig.primary_in_event_idle_timeout_sec ?? 7));
+            setPrimaryOutEventIdleTimeoutSec(String(savedConfig.primary_out_event_idle_timeout_sec ?? 7));
 
             const buildingRes = await fetch(`${apiUrl}/api/building-counting-config`, {
                 method: 'PUT',
@@ -572,138 +794,349 @@ const PeopleCounting = () => {
             ? { ...line, direction: line.direction === 'left_to_right' ? 'right_to_left' : 'left_to_right' }
             : line
     )));
-    const toggleLineEvent = (lineId) => setLines((prevLines) => prevLines.map((line) => (
-        line.id === lineId
-            ? { ...line, count_event: line.count_event === 'out' ? 'in' : 'out' }
-            : line
-    )));
-    const toggleLineType = (lineId) => setLines((prevLines) => prevLines.map((line) => (
-        line.id === lineId
-            ? { ...line, line_type: getLineType(line) === 'foot_traffic' ? 'occupancy' : 'foot_traffic' }
-            : line
-    )));
+    const cycleLineMode = (lineId) => setLines((prevLines) => prevLines.map((line) => {
+        if (line.id !== lineId) {
+            return line;
+        }
+
+        const currentType = getLineType(line);
+        if (currentType === 'foot_traffic') {
+            return {
+                ...line,
+                line_type: 'occupancy',
+                count_event: 'in',
+            };
+        }
+
+        if (line.count_event === 'in') {
+            return {
+                ...line,
+                count_event: 'out',
+            };
+        }
+
+        return {
+            ...line,
+            line_type: 'foot_traffic',
+        };
+    }));
     const handleReset = () => openFormResetConfirmation();
-    const handleStats = useCallback((nextStats) => setStats(nextStats), []);
+    const handleStats = useCallback((nextStats) => {
+        setStats(nextStats);
+        setPanelStatsByCamera((current) => ({
+            ...current,
+            [selectedCamera]: nextStats,
+        }));
+    }, [selectedCamera]);
     const handleCountingData = useCallback((nextData) => {
         if (nextData && typeof nextData === 'object') {
             setCountingData(nextData);
+            setPanelCountingDataByCamera((current) => ({
+                ...current,
+                [selectedCamera]: nextData,
+            }));
         }
+    }, [selectedCamera]);
+
+    const handlePanelStats = useCallback((cameraId, nextStats) => {
+        if (!cameraId) {
+            return;
+        }
+        setPanelStatsByCamera((current) => ({
+            ...current,
+            [cameraId]: nextStats,
+        }));
     }, []);
 
-    const wsUrl = selectedCamera ? getWSUrl(`/ws/${selectedCamera}`) : null;
+    const handlePanelCountingData = useCallback((cameraId, nextData) => {
+        if (!cameraId || !nextData || typeof nextData !== 'object') {
+            return;
+        }
+        setPanelCountingDataByCamera((current) => ({
+            ...current,
+            [cameraId]: nextData,
+        }));
+    }, []);
+
+    const handlePanelMediaLayout = useCallback((cameraId, nextLayout) => {
+        if (!cameraId || !nextLayout) {
+            return;
+        }
+        setPanelLivePreviewLayouts((current) => ({
+            ...current,
+            [cameraId]: nextLayout,
+        }));
+    }, []);
+
     const selectedCam = cameras.find((camera) => camera.id === selectedCamera);
     const verificationCameraOptions = cameras.filter((camera) => camera.id !== selectedCamera);
+    const selectedCameraLocation = String(selectedCam?.location || '').trim();
+    const selectedCameraLabel = selectedCam?.name || 'Select a camera';
     const occupancy = countingData.occupancy ?? 0;
     const footTrafficLeft = countingData.foot_traffic_left ?? 0;
     const footTrafficRight = countingData.foot_traffic_right ?? 0;
     const footTrafficTotal = countingData.foot_traffic_total ?? 0;
     const footTrafficLabels = getFootTrafficSummaryLabels((Array.isArray(countingData.lines) && countingData.lines.length) ? countingData.lines : lines);
-    const isVerifierMode = crossCameraEnabled && crossCameraRole === 'verifier';
-    const verifierObservedTracks = countingData.verifier_observed_tracks ?? 0;
     const verifierActiveInEvent = countingData.verifier_active_in_event ?? null;
     const verifierActiveOutEvent = countingData.verifier_active_out_event ?? null;
     const verifierLastInEvent = countingData.verifier_last_in_event ?? null;
     const verifierLastOutEvent = countingData.verifier_last_out_event ?? null;
     const verifierPrimaryCameraIds = Array.isArray(countingData.verifier_primary_camera_ids) ? countingData.verifier_primary_camera_ids : [];
-    const linkedPrimaryNames = verifierPrimaryCameraIds
-        .map((cameraId) => cameras.find((camera) => camera.id === cameraId)?.name || cameraId)
-        .join(', ');
+    const verifierPrimaryCameraIdsKey = verifierPrimaryCameraIds.filter(Boolean).sort().join('|');
     const occupancyLineCount = lines.filter((line) => getLineType(line) !== 'foot_traffic').length;
     const footTrafficLineCount = lines.filter((line) => getLineType(line) === 'foot_traffic').length;
     const buildingCapacityExceeded = buildingSummary.capacity_exceeded ?? false;
     const buildingGroupSummaries = buildingSummary.entrance_summaries ?? {};
-    const showStoppedUploadPreview = Boolean(selectedCam?.is_uploaded && !selectedCam?.producer_running);
+    const verificationLayoutEnabled = crossCameraEnabled && (crossCameraRole === 'primary' || crossCameraRole === 'verifier');
+    const selectedCameraRole = crossCameraRole === 'primary' ? 'primary' : crossCameraRole === 'verifier' ? 'verifier' : 'single';
+    const primaryCameraId = selectedCameraRole === 'primary'
+        ? selectedCamera
+        : (verifierPrimaryCameraIds.find((cameraId) => cameraId && cameraId !== selectedCamera) || pairedPrimaryCameraId || '');
+    const verifierCameraId = selectedCameraRole === 'primary' ? verificationCameraId : selectedCamera;
+    const primaryCamera = cameras.find((camera) => camera.id === primaryCameraId) || (selectedCameraRole === 'primary' ? selectedCam : null);
+    const verifierCamera = cameras.find((camera) => camera.id === verifierCameraId) || (selectedCameraRole === 'verifier' ? selectedCam : null);
+    const comparisonCamera = verificationLayoutEnabled
+        ? (selectedCameraRole === 'primary' ? verifierCamera : primaryCamera)
+        : null;
+    const primarySummaryData = verificationLayoutEnabled
+        ? (selectedCameraRole === 'primary' ? countingData : (panelCountingDataByCamera[primaryCameraId] || {}))
+        : countingData;
+    const verifierSummaryData = verificationLayoutEnabled
+        ? (selectedCameraRole === 'verifier' ? countingData : (panelCountingDataByCamera[verifierCameraId] || {}))
+        : {};
+    const primarySummaryFootTrafficLeft = primarySummaryData.foot_traffic_left ?? 0;
+    const primarySummaryFootTrafficRight = primarySummaryData.foot_traffic_right ?? 0;
+    const primarySummaryFootTrafficTotal = primarySummaryData.foot_traffic_total ?? 0;
+    const primarySummaryFootTrafficLabels = getFootTrafficSummaryLabels(
+        (Array.isArray(primarySummaryData.lines) && primarySummaryData.lines.length)
+            ? primarySummaryData.lines
+            : (selectedCameraRole === 'primary' ? lines : []),
+    );
+    const verifierSummaryActiveInEvent = verifierSummaryData.verifier_active_in_event ?? verifierActiveInEvent ?? null;
+    const verifierSummaryActiveOutEvent = verifierSummaryData.verifier_active_out_event ?? verifierActiveOutEvent ?? null;
+    const verifierSummaryLastInEvent = verifierSummaryData.verifier_last_in_event ?? verifierLastInEvent ?? null;
+    const verifierSummaryLastOutEvent = verifierSummaryData.verifier_last_out_event ?? verifierLastOutEvent ?? null;
+    const verificationPairLabel = crossCameraPairId || verifierSummaryData.cross_camera_pair_id || countingData.cross_camera_pair_id || '-';
+
+    const shouldUseStoppedUploadPreview = useCallback(
+        (camera) => Boolean(camera?.is_uploaded && !camera?.producer_running),
+        [],
+    );
+
+    const getStoppedPreviewState = useCallback(
+        (cameraId) => stoppedPreviewStateByCamera[cameraId] || { image: '', frameSize: null, loading: false },
+        [stoppedPreviewStateByCamera],
+    );
+
+    const displayedSplitCameras = useMemo(() => [
+        primaryCamera,
+        verifierCamera,
+    ].filter((camera, index, current) => camera && current.findIndex((item) => item?.id === camera.id) === index), [primaryCamera, verifierCamera]);
+
+    const displayedStoppedPreviewCameras = useMemo(
+        () => (verificationLayoutEnabled ? displayedSplitCameras : [selectedCam])
+            .filter((camera) => camera?.runtime_key && shouldUseStoppedUploadPreview(camera)),
+        [displayedSplitCameras, selectedCam, shouldUseStoppedUploadPreview, verificationLayoutEnabled],
+    );
 
     useEffect(() => {
         let cancelled = false;
 
-        const loadRuntimePreview = async () => {
-            if (!selectedCam?.runtime_key || !showStoppedUploadPreview) {
-                setRuntimePreviewImage('');
-                setRuntimePreviewFrameSize(null);
-                setLoadingRuntimePreview(false);
+        const resolvePairedPrimaryCamera = async () => {
+            if (!selectedCamera || !crossCameraEnabled || crossCameraRole !== 'verifier' || !crossCameraPairId) {
+                setPairedPrimaryCameraId('');
+                setResolvingPairedPrimary(false);
                 return;
             }
 
-            setLoadingRuntimePreview(true);
+            const livePrimaryCameraId = verifierPrimaryCameraIds.find((cameraId) => cameraId && cameraId !== selectedCamera);
+            if (livePrimaryCameraId) {
+                setPairedPrimaryCameraId(livePrimaryCameraId);
+                setResolvingPairedPrimary(false);
+                return;
+            }
+
+            const candidateCameras = cameras.filter((camera) => camera.id !== selectedCamera);
+            if (!candidateCameras.length) {
+                setPairedPrimaryCameraId('');
+                setResolvingPairedPrimary(false);
+                return;
+            }
+
+            const lookupCacheKey = JSON.stringify({
+                selectedCamera,
+                crossCameraPairId,
+                candidateCameraIds: candidateCameras.map((camera) => camera.id).sort(),
+            });
+            if (Object.prototype.hasOwnProperty.call(pairedPrimaryLookupCacheRef.current, lookupCacheKey)) {
+                setPairedPrimaryCameraId(pairedPrimaryLookupCacheRef.current[lookupCacheKey] || '');
+                setResolvingPairedPrimary(false);
+                return;
+            }
+
+            setResolvingPairedPrimary(true);
             try {
-                const res = await fetch(`${apiUrl}/api/upload-videos/preview`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        runtime_key: selectedCam.runtime_key,
-                        camera_id: selectedCam.id,
-                    }),
-                });
-                const data = await res.json().catch(() => ({}));
-                if (cancelled) {
-                    return;
+                const candidateIds = await Promise.all(candidateCameras.map(async (camera) => {
+                    try {
+                        const data = await getCameraCountingConfig(camera.id);
+                        if (!data) {
+                            return null;
+                        }
+                        const isMatchingPrimary = Boolean(data.cross_camera_enabled)
+                            && data.cross_camera_role === 'primary'
+                            && data.cross_camera_pair_id === crossCameraPairId
+                            && data.verification_camera_id === selectedCamera;
+                        return isMatchingPrimary ? camera.id : null;
+                    } catch {
+                        return null;
+                    }
+                }));
+
+                if (!cancelled) {
+                    const resolvedPrimaryCameraId = candidateIds.find(Boolean) || '';
+                    pairedPrimaryLookupCacheRef.current[lookupCacheKey] = resolvedPrimaryCameraId;
+                    setPairedPrimaryCameraId(resolvedPrimaryCameraId);
                 }
-                if (!res.ok || !data.preview_image) {
-                    throw new Error(data.detail || 'Preview unavailable.');
-                }
-                setRuntimePreviewImage(`data:image/jpeg;base64,${data.preview_image}`);
-                setRuntimePreviewFrameSize(
-                    Number(data.frame_width) > 0 && Number(data.frame_height) > 0
-                        ? { width: Number(data.frame_width), height: Number(data.frame_height) }
-                        : null
-                );
             } catch (err) {
                 if (!cancelled) {
-                    console.error('Failed to load people counting preview:', err);
-                    setRuntimePreviewImage('');
-                    setRuntimePreviewFrameSize(null);
+                    console.error('Failed to resolve paired primary camera:', err);
+                    pairedPrimaryLookupCacheRef.current[lookupCacheKey] = '';
+                    setPairedPrimaryCameraId('');
                 }
             } finally {
                 if (!cancelled) {
-                    setLoadingRuntimePreview(false);
+                    setResolvingPairedPrimary(false);
                 }
             }
         };
 
-        loadRuntimePreview();
+        resolvePairedPrimaryCamera();
         return () => {
             cancelled = true;
         };
-    }, [apiUrl, selectedCam, showStoppedUploadPreview]);
+    }, [apiUrl, cameras, crossCameraEnabled, crossCameraPairId, crossCameraRole, getCameraCountingConfig, selectedCamera, verifierPrimaryCameraIdsKey]);
 
-    const topSummary = isVerifierMode ? (
-        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
-            <StatTile label="Verifier Tracks" value={verifierObservedTracks} icon={Users} tone="cyan" subtitle="Tracks currently observed by verifier" />
-            <StatTile
-                label="Active IN"
-                value={verifierActiveInEvent?.verifier_count ?? 0}
-                icon={ArrowDownToLine}
-                tone="green"
-                subtitle={verifierActiveInEvent ? `Primary ${verifierActiveInEvent.primary_count ?? 0}` : 'No active IN event'}
-            />
-            <StatTile
-                label="Active OUT"
-                value={verifierActiveOutEvent?.verifier_count ?? 0}
-                icon={ArrowUpFromLine}
-                tone="red"
-                subtitle={verifierActiveOutEvent ? `Primary ${verifierActiveOutEvent.primary_count ?? 0}` : 'No active OUT event'}
-            />
-            <StatTile
-                label="Last IN"
-                value={verifierLastInEvent?.verifier_count ?? 0}
-                icon={ArrowDownToLine}
-                tone="green"
-                subtitle={verifierLastInEvent ? `Primary ${verifierLastInEvent.primary_count ?? 0}` : 'No completed IN event'}
-            />
-            <StatTile
-                label="Last OUT"
-                value={verifierLastOutEvent?.verifier_count ?? 0}
-                icon={ArrowUpFromLine}
-                tone="red"
-                subtitle={verifierLastOutEvent ? `Primary ${verifierLastOutEvent.primary_count ?? 0}` : 'No completed OUT event'}
-            />
-            <StatTile label="Pair" value={countingData.cross_camera_pair_id || '-'} icon={Building2} tone="amber" subtitle={linkedPrimaryNames ? `Primary ${linkedPrimaryNames}` : 'No linked primary camera'} />
+    useEffect(() => {
+        const loadStoppedPreviews = async () => {
+            if (!displayedStoppedPreviewCameras.length) {
+                return;
+            }
+
+            await Promise.all(displayedStoppedPreviewCameras.map(async (camera) => {
+                await loadStoppedPreviewForCamera(camera);
+            }));
+        };
+
+        loadStoppedPreviews();
+    }, [displayedStoppedPreviewCameras, loadStoppedPreviewForCamera]);
+
+    useEffect(() => {
+        if (!verificationLayoutEnabled || !comparisonCamera?.id || comparisonCamera.id === selectedCamera) {
+            setComparisonCameraConfig(null);
+            return;
+        }
+
+        let cancelled = false;
+
+        const fetchComparisonConfig = async () => {
+            try {
+                const data = await getCameraCountingConfig(comparisonCamera.id);
+                if (!cancelled) {
+                    setComparisonCameraConfig(data);
+                }
+            } catch (err) {
+                console.error('Failed to fetch paired camera counting config:', err);
+                if (!cancelled) {
+                    setComparisonCameraConfig(null);
+                }
+            }
+        };
+
+        fetchComparisonConfig();
+        return () => {
+            cancelled = true;
+        };
+    }, [comparisonCamera?.id, getCameraCountingConfig, selectedCamera, verificationLayoutEnabled]);
+
+    const topSummary = verificationLayoutEnabled ? (
+        <div className="grid gap-4 xl:grid-cols-2">
+            <div className="rounded-3xl border border-slate-200 bg-white/70 p-4 shadow-sm">
+                <div className="mb-3 flex flex-wrap items-center gap-2">
+                    <span className="rounded-full border border-blue-400/40 bg-blue-500/15 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-blue-700">
+                        Primary Camera Stats
+                    </span>
+                    <span className="rounded-full border border-amber-400/30 bg-amber-500/10 px-3 py-1 text-[11px] font-semibold text-amber-700">
+                        Pair: {verificationPairLabel}
+                    </span>
+                    {selectedCameraRole === 'primary' && (
+                        <span className="rounded-full border border-emerald-400/35 bg-emerald-500/12 px-2.5 py-1 text-[11px] font-semibold text-emerald-700">
+                            Selected
+                        </span>
+                    )}
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                    <StatTile label="Door In" value={primarySummaryData.total_in ?? 0} icon={ArrowDownToLine} tone="green" subtitle="Cross inward counts" />
+                    <StatTile label="Door Out" value={primarySummaryData.total_out ?? 0} icon={ArrowUpFromLine} tone="red" subtitle="Cross outward counts" />
+                    <StatTile label="Inside Now" value={primarySummaryData.occupancy ?? 0} icon={Users} tone="default" subtitle="Camera-level occupancy" />
+                    <StatTile
+                        label="Foot Traffic"
+                        value={primarySummaryFootTrafficTotal}
+                        icon={ArrowRightLeft}
+                        tone="cyan"
+                        subtitle={primarySummaryFootTrafficLabels.mixed
+                            ? 'Mixed FT line orientations'
+                            : `${primarySummaryFootTrafficLabels.negative} ${primarySummaryFootTrafficLeft} / ${primarySummaryFootTrafficLabels.positive} ${primarySummaryFootTrafficRight}`}
+                    />
+                </div>
+            </div>
+
+            <div className="rounded-3xl border border-slate-200 bg-white/70 p-4 shadow-sm">
+                <div className="mb-3 flex flex-wrap items-center gap-2">
+                    <span className="rounded-full border border-emerald-400/45 bg-emerald-500/15 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-emerald-700">
+                        Verifier Camera Stats
+                    </span>
+                    {selectedCameraRole === 'verifier' && (
+                        <span className="rounded-full border border-emerald-400/35 bg-emerald-500/12 px-2.5 py-1 text-[11px] font-semibold text-emerald-700">
+                            Selected
+                        </span>
+                    )}
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                    <StatTile
+                        label="Active In"
+                        value={verifierSummaryActiveInEvent?.verifier_count ?? 0}
+                        icon={ArrowDownToLine}
+                        tone="green"
+                        subtitle={verifierSummaryActiveInEvent ? `Primary ${verifierSummaryActiveInEvent.primary_count ?? 0}` : 'No active IN event'}
+                    />
+                    <StatTile
+                        label="Active Out"
+                        value={verifierSummaryActiveOutEvent?.verifier_count ?? 0}
+                        icon={ArrowUpFromLine}
+                        tone="red"
+                        subtitle={verifierSummaryActiveOutEvent ? `Primary ${verifierSummaryActiveOutEvent.primary_count ?? 0}` : 'No active OUT event'}
+                    />
+                    <StatTile
+                        label="Last In"
+                        value={verifierSummaryLastInEvent?.verifier_count ?? 0}
+                        icon={ArrowDownToLine}
+                        tone="green"
+                        subtitle={verifierSummaryLastInEvent ? `Primary ${verifierSummaryLastInEvent.primary_count ?? 0}` : 'No completed IN event'}
+                    />
+                    <StatTile
+                        label="Last Out"
+                        value={verifierSummaryLastOutEvent?.verifier_count ?? 0}
+                        icon={ArrowUpFromLine}
+                        tone="red"
+                        subtitle={verifierSummaryLastOutEvent ? `Primary ${verifierSummaryLastOutEvent.primary_count ?? 0}` : 'No completed OUT event'}
+                    />
+                </div>
+            </div>
         </div>
     ) : (
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-            <StatTile label="Door In" value={countingData.total_in ?? 0} icon={ArrowDownToLine} tone="green" subtitle="Disappear-confirmed inward counts" />
-            <StatTile label="Door Out" value={countingData.total_out ?? 0} icon={ArrowUpFromLine} tone="red" subtitle="Cross or zone-exit outward counts" />
+            <StatTile label="Door In" value={countingData.total_in ?? 0} icon={ArrowDownToLine} tone="green" subtitle="Cross inward counts" />
+            <StatTile label="Door Out" value={countingData.total_out ?? 0} icon={ArrowUpFromLine} tone="red" subtitle="Cross outward counts" />
             <StatTile label="Inside Now" value={occupancy} icon={Users} tone="default" subtitle="Camera-level occupancy" />
             <StatTile
                 label="Foot Traffic"
@@ -717,11 +1150,147 @@ const PeopleCounting = () => {
         </div>
     );
 
+    const renderCameraSurface = ({ camera, role, containerRef, isSelected }) => {
+        const roleLabel = role === 'primary' ? 'Primary Camera' : 'Verifier Camera';
+        const roleTone = role === 'primary'
+            ? 'bg-blue-500/15 text-blue-100 border-blue-400/30'
+            : 'bg-amber-500/15 text-amber-100 border-amber-400/30';
+
+        if (!camera) {
+            return (
+                <div className="flex h-full min-h-[360px] flex-col overflow-hidden rounded-2xl border border-white/10 bg-slate-950 md:min-h-[480px] xl:min-h-[620px]">
+                    <div className="border-b border-white/10 bg-white/5 px-4 py-3">
+                        <div className="flex flex-wrap items-center gap-2">
+                            <span className={cn('rounded-full border px-2.5 py-1 text-[11px] font-medium', roleTone)}>
+                                {roleLabel}
+                            </span>
+                            {isSelected && (
+                                <span className="rounded-full border border-white/15 bg-white/5 px-2.5 py-1 text-[11px] font-medium text-white/80">
+                                    Selected for editing
+                                </span>
+                            )}
+                        </div>
+                        <div className="mt-2 text-sm font-semibold text-white">{roleLabel} unavailable</div>
+                        <div className="mt-1 text-xs text-white/60">
+                            {role === 'primary' && resolvingPairedPrimary
+                                ? 'Resolving the paired primary camera...'
+                                : `No ${role.toLowerCase()} camera is configured for this verification pair.`}
+                        </div>
+                    </div>
+                    <div className="flex flex-1 items-center justify-center px-6 text-center text-sm text-white/60">
+                        Connect both cameras in Cross-Camera Verification to compare them side by side.
+                    </div>
+                </div>
+            );
+        }
+
+        const location = String(camera.location || '').trim();
+        const wsUrl = getWSUrl(`/ws/${camera.id}`);
+        const useStoppedPreview = shouldUseStoppedUploadPreview(camera);
+        const stoppedPreview = getStoppedPreviewState(camera.id);
+        const panelTitle = camera.name || roleLabel;
+        const panelStats = panelStatsByCamera[camera.id] || { fps: 0, people_count: 0 };
+        const panelCountingData = panelCountingDataByCamera[camera.id] || {};
+        const panelFootTrafficLeft = panelCountingData.foot_traffic_left ?? 0;
+        const panelFootTrafficRight = panelCountingData.foot_traffic_right ?? 0;
+        const panelFootTrafficTotal = panelCountingData.foot_traffic_total ?? 0;
+        const panelFootTrafficLabels = getFootTrafficSummaryLabels(Array.isArray(panelCountingData.lines) ? panelCountingData.lines : []);
+        const comparisonOverlayActive = !isSelected && comparisonCamera?.id === camera.id && comparisonCameraConfig;
+        const overlayLines = isSelected
+            ? lines
+            : (comparisonOverlayActive ? (Array.isArray(comparisonCameraConfig?.lines) ? comparisonCameraConfig.lines : []) : []);
+        const overlayFrameExcludeAreas = isSelected
+            ? validFrameExcludeAreas
+            : (comparisonOverlayActive ? filterValidFrameExcludeAreas(comparisonCameraConfig?.frame_exclude_areas) : []);
+        const overlayCountingData = isSelected ? countingData : panelCountingData;
+        const overlayDisplayArea = useStoppedPreview
+            ? null
+            : (isSelected ? livePreviewLayout : panelLivePreviewLayouts[camera.id] || null);
+
+        return (
+            <div className="flex h-full min-h-[360px] flex-col overflow-hidden rounded-2xl border border-white/10 bg-slate-950 md:min-h-[480px] xl:min-h-[620px]">
+                <div className="border-b border-white/10 bg-white/5 px-4 py-3">
+                    <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                        <div>
+                            <div className="flex flex-wrap items-center gap-2">
+                                <span className={cn('rounded-full border px-2.5 py-1 text-[11px] font-medium', roleTone)}>
+                                    {roleLabel}
+                                </span>
+                                {isSelected && (
+                                    <span className="rounded-full border border-emerald-400/20 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-200">
+                                        Selected for editing
+                                    </span>
+                                )}
+                            </div>
+                            <div className="mt-2 text-sm font-semibold text-white">{panelTitle}</div>
+                            <div className="mt-1 text-xs text-white/60">
+                                {location || 'No location configured'}
+                            </div>
+                        </div>
+
+                        <div className="flex flex-wrap gap-2 text-xs text-white/70">
+                            <span className="rounded-full border border-white/15 px-3 py-1">People {panelStats.people_count ?? 0}</span>
+                            <span className="rounded-full border border-white/15 px-3 py-1">FPS {panelStats.fps ?? 0}</span>
+                            <span className="rounded-full border border-white/15 px-3 py-1">
+                                FT {panelFootTrafficLabels.shortNegative}:{panelFootTrafficLeft} {panelFootTrafficLabels.shortPositive}:{panelFootTrafficRight} T:{panelFootTrafficTotal}
+                            </span>
+                        </div>
+                    </div>
+                </div>
+
+                <div ref={containerRef} className="relative min-h-0 flex-1 overflow-hidden bg-black">
+                    {useStoppedPreview ? (
+                        stoppedPreview.image ? (
+                            <img
+                                src={stoppedPreview.image}
+                                alt={panelTitle}
+                                className="absolute inset-0 h-full w-full object-contain"
+                            />
+                        ) : (
+                            <div className="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-muted-foreground">
+                                <p>{stoppedPreview.loading ? 'Loading preview...' : 'Preview unavailable for this uploaded video.'}</p>
+                            </div>
+                        )
+                    ) : (
+                        <StreamPlayer
+                            wsUrl={wsUrl}
+                            className="absolute inset-0 h-full w-full"
+                            alt={panelTitle}
+                            onStats={isSelected ? handleStats : (nextStats) => handlePanelStats(camera.id, nextStats)}
+                            onCountingData={isSelected ? handleCountingData : (nextData) => handlePanelCountingData(camera.id, nextData)}
+                            onMediaLayout={isSelected ? setLivePreviewLayout : (nextLayout) => handlePanelMediaLayout(camera.id, nextLayout)}
+                            showCountingAnchors={isSelected}
+                            overlayMode="counting"
+                        />
+                    )}
+
+                    {(isSelected || comparisonOverlayActive) && (
+                        <CountingCanvas
+                            lines={overlayLines}
+                            frameExcludeAreas={overlayFrameExcludeAreas}
+                            countingData={overlayCountingData}
+                            drawingMode={isSelected ? drawingMode : null}
+                            onLineDrawn={isSelected ? handleLineDrawn : undefined}
+                            onFrameExcludeAreaDrawn={isSelected ? handleFrameExcludeAreaDrawn : undefined}
+                            containerRef={containerRef}
+                            mediaSize={useStoppedPreview ? stoppedPreview.frameSize : null}
+                            displayArea={overlayDisplayArea}
+                            showLiveSummary={false}
+                        />
+                    )}
+                </div>
+            </div>
+        );
+    };
+
     const setupContent = (
         <div className="space-y-4">
             <SectionShell
                 title="Counting Geometry"
                 description="Draw lines here, tag them as occupancy or FT, and keep the active zone nearby."
+                collapsible
+                collapsed={collapsedSetupSections.geometry}
+                onToggle={() => toggleSetupSection('geometry')}
                 action={(
                     <Button variant={drawingMode === 'line' ? 'default' : 'outline'} size="sm" className="h-9" onClick={() => setDrawingMode(drawingMode === 'line' ? null : 'line')}>
                         <PenTool className="mr-2 h-3.5 w-3.5" />
@@ -732,7 +1301,7 @@ const PeopleCounting = () => {
                 <div className="grid gap-3">
                     {lines.length === 0 && (
                         <div className="rounded-2xl border border-dashed px-4 py-5 text-sm text-muted-foreground">
-                            No lines yet. Draw one on the preview, then use `FT` for outside foot traffic or the arrow button for IN/OUT door logic.
+                            No lines yet. Draw one on the preview, then use the mode button to cycle `Door IN`, `Door OUT`, and `Foot Traffic`.
                         </div>
                     )}
                     {lines.map((line, index) => {
@@ -747,28 +1316,35 @@ const PeopleCounting = () => {
                                     <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
                                         <span className="rounded-full border px-2 py-0.5">{isFootTraffic ? 'Foot Traffic' : `Door ${line.count_event === 'out' ? 'OUT' : 'IN'}`}</span>
                                         <span className="rounded-full border px-2 py-0.5">
-                                            {isFootTraffic
-                                                ? `Auto ${lineFootTrafficLabels.negative} / ${lineFootTrafficLabels.positive}`
-                                                : line.direction === 'left_to_right' ? 'Right to Left' : 'Left to Right'}
+                                            {getLineDirectionDisplay(line)}
                                         </span>
                                     </div>
                                 </div>
                                 <div className="flex items-center gap-1">
-                                        <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => toggleLineType(line.id)} title={`Line type: ${isFootTraffic ? 'Foot Traffic' : 'Occupancy'}`}>
-                                            <span className={cn('text-[10px] font-bold', isFootTraffic ? 'text-cyan-400' : 'text-muted-foreground')}>FT</span>
-                                        </Button>
-                                        {!isFootTraffic && (
-                                            <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => toggleLineEvent(line.id)} title={`Count event: ${line.count_event === 'out' ? 'OUT' : 'IN'}`}>
-                                                {line.count_event === 'out'
+                                        <Button
+                                            variant="ghost"
+                                            size="icon"
+                                            className="h-8 w-8"
+                                            onClick={() => cycleLineMode(line.id)}
+                                            title="Cycle line mode: Door IN -> Door OUT -> Foot Traffic"
+                                        >
+                                            {isFootTraffic
+                                                ? <span className="text-[10px] font-bold text-cyan-400">FT</span>
+                                                : line.count_event === 'out'
                                                     ? <ArrowUpFromLine className="h-3.5 w-3.5 text-red-500" />
                                                     : <ArrowDownToLine className="h-3.5 w-3.5 text-yellow-500" />}
-                                            </Button>
-                                        )}
-                                        {!isFootTraffic && (
-                                            <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => toggleDirection(line.id)} title={`Direction: ${line.direction === 'left_to_right' ? 'R->L' : 'L->R'}`}>
-                                                <ArrowRightLeft className="h-3.5 w-3.5" />
-                                            </Button>
-                                        )}
+                                        </Button>
+                                        <Button
+                                            variant="ghost"
+                                            size="icon"
+                                            className="h-8 w-8"
+                                            onClick={() => toggleDirection(line.id)}
+                                            title={isFootTraffic
+                                                ? `Foot traffic direction: ${getLineDirectionDisplay(line)}`
+                                                : `Direction: ${line.direction === 'left_to_right' ? 'R->L' : 'L->R'}`}
+                                        >
+                                            <ArrowRightLeft className="h-3.5 w-3.5" />
+                                        </Button>
                                         <Button variant="ghost" size="icon" className="h-8 w-8 text-destructive" onClick={() => deleteLine(line.id)}>
                                             <Trash2 className="h-3.5 w-3.5" />
                                         </Button>
@@ -778,12 +1354,15 @@ const PeopleCounting = () => {
                         );
                     })}
                 </div>
-                {drawingMode === 'line' && <p className="text-xs text-muted-foreground">Draw directly on the preview. New lines start as occupancy lines, and you can switch them to foot traffic with `FT`.</p>}
+                {drawingMode === 'line' && <p className="text-xs text-muted-foreground">Draw directly on the preview. New lines start as `Door IN`, and the mode button cycles `Door IN`, `Door OUT`, and `Foot Traffic`.</p>}
             </SectionShell>
 
             <SectionShell
                 title="Active Counting Zone"
-                description="Use this only when you need to gate door counts and foot-traffic crossings to a smaller area."
+                description="Door and occupancy counts only trigger when the counting probe point is inside this polygon. Foot-traffic lines can be placed outside the entrance path."
+                collapsible
+                collapsed={collapsedSetupSections.activeZone}
+                onToggle={() => toggleSetupSection('activeZone')}
                 action={(
                     <Button variant={drawingMode === 'frame_exclude' ? 'default' : 'outline'} size="sm" className="h-9" onClick={() => setDrawingMode(drawingMode === 'frame_exclude' ? null : 'frame_exclude')}>
                         <PenTool className="mr-2 h-3.5 w-3.5" />
@@ -791,7 +1370,6 @@ const PeopleCounting = () => {
                     </Button>
                 )}
             >
-                <p className="text-sm text-muted-foreground">Door and occupancy counts only trigger when the counting probe point is inside this polygon. Foot-traffic lines can be placed outside the entrance path.</p>
                 <div className="grid gap-3">
                     {validFrameExcludeAreas.length === 0 && (
                         <div className="rounded-2xl border border-dashed px-4 py-5 text-sm text-muted-foreground">
@@ -814,7 +1392,13 @@ const PeopleCounting = () => {
                 {drawingMode === 'frame_exclude' && <p className="text-xs text-muted-foreground">Click around the preview to place points, then double-click to close the area.</p>}
             </SectionShell>
 
-            <SectionShell title="Building Group" description="Only cameras with the same building ID are merged into one building total group.">
+            <SectionShell
+                title="Building Group"
+                description="Only cameras with the same building ID are merged into one building total group."
+                collapsible
+                collapsed={collapsedSetupSections.buildingGroup}
+                onToggle={() => toggleSetupSection('buildingGroup')}
+            >
                 <div className="flex items-center justify-between rounded-2xl border border-border/70 bg-background px-4 py-3">
                     <div>
                         <div className="text-sm font-medium">Use Building ID</div>
@@ -830,11 +1414,17 @@ const PeopleCounting = () => {
                 )}
             </SectionShell>
 
-            <SectionShell title="Cross-Camera Verification" description="Use this when one camera should correct missed IN counts from another camera covering the same entrance.">
+            <SectionShell
+                title="Cross-Camera Verification"
+                description="Pair two cameras covering the same entrance so the verification camera can correct missed IN and OUT counts from the primary camera."
+                collapsible
+                collapsed={collapsedSetupSections.crossCamera}
+                onToggle={() => toggleSetupSection('crossCamera')}
+            >
                 <div className="flex items-center justify-between rounded-2xl border border-border/70 bg-background px-4 py-3">
                     <div>
                         <div className="text-sm font-medium">Verification Enabled</div>
-                        <div className="text-xs text-muted-foreground">Primary cameras only receive upward corrections.</div>
+                        <div className="text-xs text-muted-foreground"></div>
                     </div>
                     <Toggle
                         checked={crossCameraEnabled}
@@ -871,14 +1461,43 @@ const PeopleCounting = () => {
                                 <select className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm" value={verificationCameraId} onChange={(e) => setVerificationCameraId(e.target.value)}>
                                     <option value="">Select verifier camera</option>
                                     {verificationCameraOptions.map((camera) => (
-                                        <option key={camera.id} value={camera.id}>{camera.name}</option>
+                                        <option key={camera.id} value={camera.id}>{getCameraOptionLabel(camera)}</option>
                                     ))}
                                 </select>
                             </div>
                         )}
+                        {crossCameraRole === 'primary' && (
+                            <>
+                                <div className="space-y-2">
+                                    <label className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">IN Idle Timeout (sec)</label>
+                                    <input
+                                        type="number"
+                                        min="0"
+                                        step="0.1"
+                                        className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm"
+                                        value={primaryInEventIdleTimeoutSec}
+                                        onChange={(e) => setPrimaryInEventIdleTimeoutSec(e.target.value)}
+                                        placeholder="7.0"
+                                    />
+                                </div>
+                                <div className="space-y-2">
+                                    <label className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">OUT Idle Timeout (sec)</label>
+                                    <input
+                                        type="number"
+                                        min="0"
+                                        step="0.1"
+                                        className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm"
+                                        value={primaryOutEventIdleTimeoutSec}
+                                        onChange={(e) => setPrimaryOutEventIdleTimeoutSec(e.target.value)}
+                                        placeholder="7.0"
+                                    />
+                                </div>
+                            </>
+                        )}
                     </div>
                 )}
             </SectionShell>
+
         </div>
     );
 
@@ -942,13 +1561,43 @@ const PeopleCounting = () => {
 
     const settingsPanel = (
         <div className="order-2 space-y-4 xl:order-1">
+            <div className="flex justify-end">
+                <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setSidebarCollapsed(true)}
+                    className="h-9 rounded-xl border-slate-200 bg-white text-slate-600 hover:bg-slate-50 hover:text-slate-900"
+                >
+                    <ChevronLeft className="mr-1.5 h-4 w-4" />
+                    Hide Sidebar
+                </Button>
+            </div>
             <Card className="border-slate-200/80 bg-white/95 shadow-sm">
                 <CardHeader className="pb-2">
-                    <div className="space-y-1">
-                        <CardTitle className="text-xl">Configuration</CardTitle>
-                        <p className="text-sm text-muted-foreground">A cleaner control rail with the most important inputs aligned first.</p>
+                    <div className="flex items-start justify-between gap-3">
+                        <div className="space-y-1">
+                            <div className="flex items-center gap-2">
+                                <button
+                                    type="button"
+                                    onClick={() => setCollapsedConfigurationPanel((current) => !current)}
+                                    className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 transition hover:bg-slate-50 hover:text-slate-700"
+                                    aria-label={`${collapsedConfigurationPanel ? 'Expand' : 'Collapse'} configuration`}
+                                >
+                                    {collapsedConfigurationPanel ? <ChevronRight className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                                </button>
+                                <CardTitle className="text-xl">Configuration</CardTitle>
+                            </div>
+                            {collapsedConfigurationPanel && (
+                                <p className="text-sm text-muted-foreground">
+                                    {selectedCameraLabel}{selectedCameraLocation ? ` - ${selectedCameraLocation}` : ''}
+                                </p>
+                            )}
+                            {/* <p className="text-sm text-muted-foreground">A cleaner control rail with the most important inputs aligned first.</p> */}
+                        </div>
                     </div>
                 </CardHeader>
+                {!collapsedConfigurationPanel && (
                 <CardContent className="space-y-5">
                     <div className="rounded-3xl border border-slate-200 bg-slate-50/70 p-4">
                         <div className="space-y-4">
@@ -957,7 +1606,7 @@ const PeopleCounting = () => {
                                 <select className="flex h-11 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm" value={selectedCamera} onChange={(e) => setSelectedCamera(e.target.value)}>
                                     {cameras.length === 0 && <option value="">No cameras available</option>}
                                     {cameras.map((camera) => (
-                                        <option key={camera.id} value={camera.id}>{camera.name}</option>
+                                        <option key={camera.id} value={camera.id}>{getCameraOptionLabel(camera)}</option>
                                     ))}
                                 </select>
                             </div>
@@ -1013,6 +1662,7 @@ const PeopleCounting = () => {
                         ))}
                     </div>
                 </CardContent>
+                )}
             </Card>
             <div className="space-y-4">
                 {activeTab === 'setup' && setupContent}
@@ -1025,64 +1675,100 @@ const PeopleCounting = () => {
         <div className="order-1 space-y-4 xl:order-2 xl:sticky xl:top-6">
             {topSummary}
             <Card className="overflow-hidden border-slate-200/80 bg-white/95 shadow-sm">
-                <CardHeader className="border-b border-white/10 bg-black/80 pb-3 text-white">
-                    <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-                        <div>
-                            <CardTitle className="text-lg text-white">{selectedCam?.name || 'Preview'}</CardTitle>
-                            <p className="mt-1 text-sm text-white/60">
-                                {drawingMode === 'line' && 'Drawing line on preview'}
-                                {drawingMode === 'frame_exclude' && 'Drawing active zone on preview'}
-                                {!drawingMode && 'Live preview stays visible while you configure the page'}
-                            </p>
+                {!verificationLayoutEnabled && (
+                    <CardHeader className="border-b border-white/10 bg-black/80 pb-3 text-white">
+                        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                            <div>
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <CardTitle className="text-lg text-white">
+                                        {selectedCameraLabel || 'Preview'}
+                                    </CardTitle>
+                                    {selectedCameraLocation && (
+                                        <span className="inline-flex items-center gap-1 rounded-full border border-white/15 bg-white/5 px-3 py-1 text-xs font-medium text-white/80">
+                                            <Building2 className="h-3.5 w-3.5" />
+                                            {selectedCameraLocation}
+                                        </span>
+                                    )}
+                                </div>
+                                <p className="mt-1 text-sm text-white/60">
+                                    {drawingMode === 'line' && 'Drawing line on preview'}
+                                    {drawingMode === 'frame_exclude' && 'Drawing active zone on preview'}
+                                    {!drawingMode && 'Live preview stays visible while you configure the page'}
+                                </p>
+                            </div>
+                            <div className="flex flex-wrap gap-2 text-xs text-white/70">
+                                <span className="rounded-full border border-white/15 px-3 py-1">People {stats.people_count}</span>
+                                <span className="rounded-full border border-white/15 px-3 py-1">FPS {stats.fps}</span>
+                                <span className="rounded-full border border-white/15 px-3 py-1">
+                                    FT {footTrafficLabels.shortNegative}:{footTrafficLeft} {footTrafficLabels.shortPositive}:{footTrafficRight} T:{footTrafficTotal}
+                                </span>
+                            </div>
                         </div>
-                        <div className="flex flex-wrap gap-2 text-xs text-white/70">
-                            <span className="rounded-full border border-white/15 px-3 py-1">People {stats.people_count}</span>
-                            <span className="rounded-full border border-white/15 px-3 py-1">FPS {stats.fps}</span>
-                            <span className="rounded-full border border-white/15 px-3 py-1">
-                                FT {footTrafficLabels.shortNegative}:{footTrafficLeft} {footTrafficLabels.shortPositive}:{footTrafficRight} T:{footTrafficTotal}
-                            </span>
-                        </div>
+                    </CardHeader>
+                )}
+                {verificationLayoutEnabled ? (
+                    <div className="grid min-h-[360px] auto-rows-fr gap-4 bg-black p-4 md:min-h-[480px] xl:min-h-[620px] lg:grid-cols-2">
+                        {renderCameraSurface({
+                            camera: primaryCamera,
+                            role: 'primary',
+                            containerRef: primaryVideoContainerRef,
+                            isSelected: selectedCameraRole === 'primary',
+                        })}
+                        {renderCameraSurface({
+                            camera: verifierCamera,
+                            role: 'verifier',
+                            containerRef: verifierVideoContainerRef,
+                            isSelected: selectedCameraRole === 'verifier',
+                        })}
                     </div>
-                </CardHeader>
-                <div ref={videoContainerRef} className="relative min-h-[360px] bg-black md:min-h-[480px] xl:min-h-[620px]">
-                    {wsUrl ? (
-                        <>
-                            {showStoppedUploadPreview ? (
-                                runtimePreviewImage ? (
-                                    <img src={runtimePreviewImage} alt={selectedCam?.name || 'Camera Preview'} className="h-full w-full object-contain" />
+                ) : (
+                    <div ref={singleVideoContainerRef} className="relative min-h-[360px] overflow-hidden bg-black md:min-h-[480px] xl:min-h-[620px]">
+                        {selectedCam ? (
+                            <>
+                                {shouldUseStoppedUploadPreview(selectedCam) ? (
+                                    getStoppedPreviewState(selectedCam.id).image ? (
+                                        <img
+                                            src={getStoppedPreviewState(selectedCam.id).image}
+                                            alt={selectedCam?.name || 'Camera Preview'}
+                                            className="absolute inset-0 h-full w-full object-contain"
+                                        />
+                                    ) : (
+                                        <div className="absolute inset-0 flex items-center justify-center text-muted-foreground">
+                                            <p>{getStoppedPreviewState(selectedCam.id).loading ? 'Loading preview...' : 'Preview unavailable for this uploaded video.'}</p>
+                                        </div>
+                                    )
                                 ) : (
-                                    <div className="absolute inset-0 flex items-center justify-center text-muted-foreground">
-                                        <p>{loadingRuntimePreview ? 'Loading preview...' : 'Preview unavailable for this uploaded video.'}</p>
-                                    </div>
-                                )
-                            ) : (
-                                <StreamPlayer
-                                    wsUrl={wsUrl}
-                                    className="h-full w-full"
-                                    alt={selectedCam?.name || 'Camera Feed'}
-                                    onStats={handleStats}
-                                    onCountingData={handleCountingData}
-                                    showCountingAnchors
-                                    overlayMode="counting"
+                                    <StreamPlayer
+                                        wsUrl={getWSUrl(`/ws/${selectedCamera}`)}
+                                        className="absolute inset-0 h-full w-full"
+                                        alt={selectedCam?.name || 'Camera Feed'}
+                                        onStats={handleStats}
+                                        onCountingData={handleCountingData}
+                                        onMediaLayout={setLivePreviewLayout}
+                                        showCountingAnchors
+                                        overlayMode="counting"
+                                    />
+                                )}
+                                <CountingCanvas
+                                    lines={lines}
+                                    frameExcludeAreas={validFrameExcludeAreas}
+                                    countingData={countingData}
+                                    drawingMode={drawingMode}
+                                    onLineDrawn={handleLineDrawn}
+                                    onFrameExcludeAreaDrawn={handleFrameExcludeAreaDrawn}
+                                    containerRef={singleVideoContainerRef}
+                                    mediaSize={shouldUseStoppedUploadPreview(selectedCam) ? getStoppedPreviewState(selectedCam.id).frameSize : null}
+                                    displayArea={shouldUseStoppedUploadPreview(selectedCam) ? null : livePreviewLayout}
+                                    showLiveSummary={false}
                                 />
-                            )}
-                            <CountingCanvas
-                                lines={lines}
-                                frameExcludeAreas={validFrameExcludeAreas}
-                                countingData={countingData}
-                                drawingMode={drawingMode}
-                                onLineDrawn={handleLineDrawn}
-                                onFrameExcludeAreaDrawn={handleFrameExcludeAreaDrawn}
-                                containerRef={videoContainerRef}
-                                mediaSize={showStoppedUploadPreview ? runtimePreviewFrameSize : null}
-                            />
-                        </>
-                    ) : (
-                        <div className="absolute inset-0 flex items-center justify-center text-muted-foreground">
-                            <p>Select a camera to view the feed</p>
-                        </div>
-                    )}
-                </div>
+                            </>
+                        ) : (
+                            <div className="absolute inset-0 flex items-center justify-center text-muted-foreground">
+                                <p>Select a camera to view the feed</p>
+                            </div>
+                        )}
+                    </div>
+                )}
                 {/* <div className="border-t border-white/10 bg-black/85 px-4 py-3">
                     <div className="text-sm text-white/75">
                         Draw directly on the preview. The primary save and reset actions are pinned above the workspace so they stay visible while you configure the page.
@@ -1130,6 +1816,25 @@ const PeopleCounting = () => {
             ? resettingCamera
             : false;
 
+    useEffect(() => {
+        if (!sidebarCollapsed) {
+            setShowSidebarRestoreHint(false);
+            setIsSidebarRestoreHovered(false);
+            return undefined;
+        }
+
+        setShowSidebarRestoreHint(true);
+        const timeoutId = window.setTimeout(() => {
+            setShowSidebarRestoreHint(false);
+        }, 3500);
+
+        return () => {
+            window.clearTimeout(timeoutId);
+        };
+    }, [sidebarCollapsed]);
+
+    const showSidebarRestoreLabel = showSidebarRestoreHint || isSidebarRestoreHovered;
+
     return (
         <div className="flex h-full flex-col gap-6 overflow-auto bg-[radial-gradient(circle_at_top_left,_rgba(59,130,246,0.08),_transparent_32%),linear-gradient(180deg,_rgba(248,250,252,0.95),_rgba(255,255,255,1))] p-6">
             <ConfirmationDialog
@@ -1149,7 +1854,7 @@ const PeopleCounting = () => {
                 <div className="relative flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                     <div>
                         <h1 className="text-3xl font-bold tracking-tight text-slate-950">People Counting</h1>
-                        <p className="mt-1 text-sm text-slate-600">Redesigned so the live preview stays primary and the configuration stays focused.</p>
+                        {/* <p className="mt-1 text-sm text-slate-600">Redesigned so the live preview stays primary and the configuration stays focused.</p> */}
                     </div>
                     <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end">
                         {buildingCapacityExceeded && (
@@ -1174,9 +1879,37 @@ const PeopleCounting = () => {
                     {saveMessage}
                 </div>
             )}
-            <div className="grid gap-6 xl:grid-cols-[minmax(420px,500px)_minmax(0,1fr)] xl:items-start">
+            {sidebarCollapsed && (
+                <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setSidebarCollapsed(false)}
+                    onMouseEnter={() => setIsSidebarRestoreHovered(true)}
+                    onMouseLeave={() => setIsSidebarRestoreHovered(false)}
+                    aria-label="Show configuration bar"
+                    className={cn(
+                        'fixed left-20 top-28 z-50 h-11 overflow-hidden rounded-full border-slate-200 bg-white/95 px-3 text-slate-700 shadow-lg backdrop-blur transition-all duration-300 hover:bg-white sm:left-24',
+                        showSidebarRestoreLabel ? 'w-[240px] justify-start' : 'w-11 justify-center',
+                    )}
+                >
+                    <ChevronRight className={cn('h-4 w-4 shrink-0', showSidebarRestoreLabel && 'mr-2')} />
+                    <span
+                        className={cn(
+                            'whitespace-nowrap text-sm transition-all duration-300',
+                            showSidebarRestoreLabel ? 'max-w-[190px] opacity-100' : 'max-w-0 opacity-0',
+                        )}
+                    >
+                        Show Configuration Bar
+                    </span>
+                </Button>
+            )}
+            <div className={cn(
+                'grid gap-6',
+                sidebarCollapsed ? 'grid-cols-1' : 'xl:grid-cols-[minmax(420px,500px)_minmax(0,1fr)] xl:items-start',
+            )}>
                 {videoPanel}
-                {settingsPanel}
+                {!sidebarCollapsed && settingsPanel}
             </div>
         </div>
     );

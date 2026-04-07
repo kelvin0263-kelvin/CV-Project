@@ -24,6 +24,15 @@ import { cn } from '../lib/utils';
 
 const DEFAULT_FISHEYE_VIEW = 0;
 const FISHEYE_VIEW_SUFFIX_PATTERN = /\s-\sView\s\d+\s*\([^)]*\)$/;
+const FISHEYE_VIEW_OPTIONS = Array.from({ length: 8 }, (_, index) => ({
+    index,
+    angle: index * 45,
+    label: `View ${index + 1} (${index * 45}\u00B0)`,
+}));
+
+const getFisheyeViewLabel = (viewIndex) => (
+    FISHEYE_VIEW_OPTIONS.find((option) => option.index === viewIndex)?.label || `View ${viewIndex + 1}`
+);
 
 const getUploadDisplayName = (item) => {
     const explicitName = String(item?.display_name || '').trim();
@@ -41,18 +50,53 @@ const getUploadDisplayName = (item) => {
 
 const buildUploadEditForm = (item) => {
     const primaryCamera = item?.cameras?.[0] || {};
+    const selectedView = Number.isInteger(item?.selected_views?.[0])
+        ? item.selected_views[0]
+        : (Number.isInteger(primaryCamera?.view_index) && primaryCamera.view_index >= 0
+            ? primaryCamera.view_index
+            : DEFAULT_FISHEYE_VIEW);
     return {
         name: getUploadDisplayName(item),
         location: String(primaryCamera.location || ''),
         sourcePath: String(item?.source_path || ''),
         detectionRoi: primaryCamera?.detection_roi || null,
+        isFisheye: Boolean(item?.is_fisheye),
+        selectedView,
     };
+};
+
+const formatVideoDuration = (durationSeconds) => {
+    const totalSeconds = Number(durationSeconds);
+    if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) {
+        return 'Unknown';
+    }
+
+    const roundedSeconds = Math.round(totalSeconds);
+    const hours = Math.floor(roundedSeconds / 3600);
+    const minutes = Math.floor((roundedSeconds % 3600) / 60);
+    const seconds = roundedSeconds % 60;
+
+    if (hours > 0) {
+        return `${hours}h ${String(minutes).padStart(2, '0')}m ${String(seconds).padStart(2, '0')}s`;
+    }
+    if (minutes > 0) {
+        return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
+    }
+    return `${seconds}s`;
+};
+
+const formatVideoFps = (fps) => {
+    const numericFps = Number(fps);
+    if (!Number.isFinite(numericFps) || numericFps <= 0) {
+        return 'Unknown';
+    }
+    return Number.isInteger(numericFps) ? `${numericFps}` : numericFps.toFixed(2).replace(/\.?0+$/, '');
 };
 
 const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection = null, onActiveSectionChange = null }) => {
     const apiUrl = getApiBaseUrl();
     const previewContainerRef = useRef(null);
-    const [internalActiveSection, setInternalActiveSection] = useState('create');
+    const [internalActiveSection, setInternalActiveSection] = useState('sources');
     const activeSection = controlledActiveSection ?? internalActiveSection;
     const setActiveSection = onActiveSectionChange ?? setInternalActiveSection;
 
@@ -64,6 +108,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
 
     const [selectedFile, setSelectedFile] = useState(null);
     const [cameraNamePrefix, setCameraNamePrefix] = useState('');
+    const [uploadLocation, setUploadLocation] = useState('');
     const [enableFisheye, setEnableFisheye] = useState(false);
     const [selectedViews, setSelectedViews] = useState(new Set([DEFAULT_FISHEYE_VIEW]));
     const [sourceRoi, setSourceRoi] = useState(null);
@@ -71,6 +116,11 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
     const [uploadPreviewUrl, setUploadPreviewUrl] = useState('');
     const [uploadPreviewImage, setUploadPreviewImage] = useState('');
     const [uploadPreviewSize, setUploadPreviewSize] = useState({ width: 640, height: 360 });
+    const [uploadPreviewMeta, setUploadPreviewMeta] = useState({
+        durationSeconds: null,
+        resolution: null,
+        fps: null,
+    });
     const [runtimePreviewImage, setRuntimePreviewImage] = useState('');
     const [loadingRuntimePreview, setLoadingRuntimePreview] = useState(false);
 
@@ -136,6 +186,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
             setUploadPreviewUrl('');
             setUploadPreviewImage('');
             setUploadPreviewSize({ width: 640, height: 360 });
+            setUploadPreviewMeta({ durationSeconds: null, resolution: null, fps: null });
             return undefined;
         }
 
@@ -143,6 +194,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
         setUploadPreviewUrl(objectUrl);
         setUploadPreviewImage('');
         setUploadPreviewSize({ width: 640, height: 360 });
+        setUploadPreviewMeta({ durationSeconds: null, resolution: null, fps: null });
 
         let cancelled = false;
 
@@ -167,6 +219,11 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                 setUploadPreviewSize({
                     width: parseInt(data.frame_width, 10) || 640,
                     height: parseInt(data.frame_height, 10) || 360,
+                });
+                setUploadPreviewMeta({
+                    durationSeconds: data.video_duration_seconds ?? null,
+                    resolution: data.video_resolution || null,
+                    fps: data.video_fps ?? null,
                 });
             } catch (error) {
                 if (!cancelled) {
@@ -342,6 +399,13 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
         setIsDrawingEditRoi(false);
     };
 
+    const handleEditViewSelection = (viewIndex) => {
+        setEditForm((current) => ({
+            ...current,
+            selectedView: viewIndex,
+        }));
+    };
+
     useEffect(() => {
         let cancelled = false;
 
@@ -356,7 +420,10 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                 const res = await fetch(`${apiUrl}/api/upload-videos/preview`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ runtime_key: activeItem.runtime_key }),
+                    body: JSON.stringify({
+                        runtime_key: activeItem.runtime_key,
+                        selected_view: editForm.isFisheye ? editForm.selectedView : null,
+                    }),
                 });
                 const data = await res.json().catch(() => ({}));
                 if (cancelled) {
@@ -387,7 +454,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
         return () => {
             cancelled = true;
         };
-    }, [activeItem?.runtime_key, apiUrl, isEditingSource]);
+    }, [activeItem?.runtime_key, apiUrl, editForm.isFisheye, editForm.selectedView, isEditingSource]);
 
     const handleSaveEdit = async () => {
         if (!activeItem) {
@@ -411,11 +478,13 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                     name,
                     location: editForm.location.trim(),
                     detection_roi: editForm.detectionRoi?.points?.length >= 3 ? editForm.detectionRoi : null,
+                    is_fisheye: editForm.isFisheye,
+                    view_index: editForm.isFisheye ? editForm.selectedView : -1,
                 }),
             });
             const data = await res.json().catch(() => ({}));
             if (!res.ok) {
-                throw new Error(data.detail || 'Failed to update uploaded source.');
+                throw new Error(data.detail || 'Failed to update video source.');
             }
 
             if (data.item?.runtime_key) {
@@ -426,12 +495,12 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                 refreshUploads();
             }
 
-            setMessage({ type: 'success', text: 'Uploaded source updated successfully.' });
+            setMessage({ type: 'success', text: 'Video source updated successfully.' });
             setIsEditingSource(false);
         } catch (error) {
             setMessage({
                 type: 'error',
-                text: error?.message || 'Failed to update uploaded source.',
+                text: error?.message || 'Failed to update video source.',
             });
         } finally {
             setIsSavingEdit(false);
@@ -450,6 +519,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
         const formData = new FormData();
         formData.append('file', selectedFile);
         formData.append('camera_name_prefix', cameraNamePrefix.trim() || 'Uploaded Camera');
+        formData.append('location', uploadLocation.trim());
         formData.append('enable_fisheye', String(enableFisheye));
         if (enableFisheye) {
             formData.append('selected_views', Array.from(selectedViews).join(','));
@@ -476,7 +546,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
             const createdRuntimeKey = Array.isArray(data.created_cameras) ? data.created_cameras[0]?.runtime_key : '';
             setMessage({
                 type: 'success',
-                text: 'Upload created successfully. Configure the analysis rules, then press Start Selected when ready.',
+                text: 'Video source added successfully.',
             });
             setSelectedFile(null);
             setSourceRoi(null);
@@ -486,6 +556,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
             setSelectedViews(new Set([DEFAULT_FISHEYE_VIEW]));
             setEnableFisheye(false);
             setCameraNamePrefix('');
+            setUploadLocation('');
             refreshUploads();
             if (createdRuntimeKey) {
                 setActiveRuntimeKey(createdRuntimeKey);
@@ -529,10 +600,10 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
             setMessage({
                 type: 'success',
                 text: action === 'start'
-                    ? `Started ${data.started_sources || 0} uploaded source(s).`
+                    ? `Started ${data.started_sources || 0} video source(s).`
                     : action === 'stop'
-                        ? `Stopped ${data.stopped_sources || 0} uploaded source(s).`
-                        : `Removed ${data.deleted_sources || 0} uploaded source(s).`,
+                        ? `Stopped ${data.stopped_sources || 0} video source(s).`
+                        : `Removed ${data.deleted_sources || 0} video source(s).`,
             });
             if (action === 'delete') {
                 setSelectedRuntimeKeys(new Set());
@@ -554,10 +625,10 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
         <div className="flex flex-col gap-6">
             <ConfirmationDialog
                 open={Boolean(confirmAction)}
-                title={confirmAction?.action === 'stop' ? 'Stop Selected Uploads?' : 'Remove Selected Uploads?'}
+                title={confirmAction?.action === 'stop' ? 'Stop Selected Uploads?' : 'Remove Selected Video Source?'}
                 description={confirmAction?.action === 'stop'
-                    ? `Stop ${confirmAction?.runtimeKeys?.length || 0} uploaded source(s)? You can start them again later.`
-                    : `Remove ${confirmAction?.runtimeKeys?.length || 0} uploaded source(s)? This also deletes the uploaded video file.`}
+                    ? `Stop ${confirmAction?.runtimeKeys?.length || 0} video source(s)? You can start them again later.`
+                    : `Remove ${confirmAction?.runtimeKeys?.length || 0} video source(s)? This also deletes the uploaded video file.`}
                 confirmLabel={confirmAction?.action === 'stop' ? 'Confirm Stop' : 'Confirm Remove'}
                 confirmVariant={confirmAction?.action === 'delete' ? 'destructive' : 'secondary'}
                 loading={busyAction === confirmAction?.action}
@@ -576,7 +647,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
             {!embedded && (
                 <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
                     <div>
-                        <h1 className="text-2xl font-bold tracking-tight">Uploaded Video Manager</h1>
+                        <h1 className="text-2xl font-bold tracking-tight">Video Sources</h1>
                         <p className="text-sm text-muted-foreground">
                             Upload video files here, configure counting or detection rules, then start the selected uploads when you are ready.
                         </p>
@@ -603,27 +674,27 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                     <div className="flex flex-wrap gap-2">
                         <Button
                             type="button"
-                            variant={activeSection === 'create' ? 'default' : 'outline'}
-                            onClick={() => setActiveSection('create')}
-                        >
-                            Create Upload Source
-                        </Button>
-                        <Button
-                            type="button"
                             variant={activeSection === 'sources' ? 'default' : 'outline'}
                             onClick={() => setActiveSection('sources')}
                         >
-                            Uploaded Sources
+                            Added Video Sources
+                        </Button>
+                        <Button
+                            type="button"
+                            variant={activeSection === 'create' ? 'default' : 'outline'}
+                            onClick={() => setActiveSection('create')}
+                        >
+                            Add Video Source
                         </Button>
                     </div>
                 )}
 
                 {activeSection === 'create' && (
-                <Card className="w-full border-border/60">
+                <Card className="mx-auto w-full max-w-2xl border-border/60">
                     <CardHeader>
-                        <CardTitle>Create Upload Source</CardTitle>
+                        <CardTitle>Add Video Source</CardTitle>
                         <CardDescription>
-                            Upload does not start analysis automatically. It only creates the source so you can configure it first.
+                            Adding a video source does not start analysis automatically. It only creates the source so you can configure it first.
                         </CardDescription>
                     </CardHeader>
                     <CardContent className="space-y-4">
@@ -636,6 +707,17 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                                 onChange={(event) => setCameraNamePrefix(event.target.value)}
                                 className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                                 placeholder="e.g. Warehouse Test Video"
+                            />
+                        </div>
+                        <div className="space-y-2">
+                            <Label htmlFor="upload-location">Location</Label>
+                            <input
+                                id="upload-location"
+                                type="text"
+                                value={uploadLocation}
+                                onChange={(event) => setUploadLocation(event.target.value)}
+                                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                placeholder="e.g. Building A"
                             />
                         </div>
 
@@ -655,6 +737,25 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                             </div>
                         </div>
 
+                        {selectedFile && (
+                            <div className="grid gap-3 rounded-lg border p-3 sm:grid-cols-3">
+                                <div className="rounded-md bg-muted/30 px-3 py-3">
+                                    <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Duration</div>
+                                    <div className="mt-1 text-sm font-medium">{formatVideoDuration(uploadPreviewMeta.durationSeconds)}</div>
+                                </div>
+                                <div className="rounded-md bg-muted/30 px-3 py-3">
+                                    <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Resolution</div>
+                                    <div className="mt-1 text-sm font-medium">{uploadPreviewMeta.resolution || 'Loading...'}</div>
+                                </div>
+                                <div className="rounded-md bg-muted/30 px-3 py-3">
+                                    <div className="text-[11px] uppercase tracking-wide text-muted-foreground">FPS</div>
+                                    <div className="mt-1 text-sm font-medium">
+                                        {uploadPreviewMeta.fps != null ? `${formatVideoFps(uploadPreviewMeta.fps)} FPS` : 'Loading...'}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
                         <div className="flex items-center space-x-2 rounded-lg border p-3">
                             <Checkbox
                                 id="upload-fisheye"
@@ -668,7 +769,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                             <div className="space-y-3 rounded-lg border p-3">
                                 <Label>Select One View</Label>
                                 <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-                                    {[0, 1, 2, 3, 4, 5, 6, 7].map((index) => (
+                                    {FISHEYE_VIEW_OPTIONS.map(({ index, label }) => (
                                         <label
                                             key={index}
                                             className={cn(
@@ -680,7 +781,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                                                 checked={selectedViews.has(index)}
                                                 onCheckedChange={() => handleToggleView(index)}
                                             />
-                                            <span>View {index + 1}</span>
+                                            <span>{label}</span>
                                         </label>
                                     ))}
                                 </div>
@@ -765,7 +866,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                     <Card className="border-border/60">
                         <CardHeader className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                             <div>
-                                <CardTitle>Uploaded Sources</CardTitle>
+                                <CardTitle>Added Video Sources</CardTitle>
                                 <CardDescription>
                                     Select one or more uploaded videos, then start them together or stop them manually.
                                 </CardDescription>
@@ -779,15 +880,15 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                                 </Button>
                                 <Button onClick={() => runAction('start')} disabled={!selectedCount || busyAction === 'stop' || busyAction === 'delete'}>
                                     {busyAction === 'start' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Play className="mr-2 h-4 w-4" />}
-                                    Start Selected
+                                    Start Selected ({selectedCount})
                                 </Button>
                                 <Button variant="secondary" onClick={() => requestActionConfirmation('stop')} disabled={!selectedCount || busyAction === 'start' || busyAction === 'delete'}>
                                     {busyAction === 'stop' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Square className="mr-2 h-4 w-4" />}
-                                    Stop Selected
+                                    Stop Selected ({selectedCount})
                                 </Button>
                                 <Button variant="destructive" onClick={() => requestActionConfirmation('delete')} disabled={!selectedCount || busyAction === 'start' || busyAction === 'stop'}>
                                     {busyAction === 'delete' ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Trash2 className="mr-2 h-4 w-4" />}
-                                    Remove Selected
+                                    Remove Selected ({selectedCount})
                                 </Button>
                             </div>
                         </CardHeader>
@@ -811,8 +912,18 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                                     Loading uploaded videos...
                                 </div>
                             ) : !items.length ? (
-                                <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
-                                    No uploaded videos yet.
+                                <div className="rounded-[28px] border border-dashed border-border/80 bg-muted/20 px-8 py-14 text-center">
+                                    <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-3xl bg-blue-50 text-blue-600 shadow-sm">
+                                        <FolderUp className="h-8 w-8" />
+                                    </div>
+                                    <h3 className="mt-6 text-2xl font-semibold text-slate-950">No video sources yet</h3>
+                                    <p className="mx-auto mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
+                                        This section is empty right now. Upload a video source first, then you can preview it here, edit its name and ROI, or start and stop it later.
+                                    </p>
+                                    <Button type="button" className="mt-6" onClick={() => setActiveSection('create')}>
+                                        <Clapperboard className="mr-2 h-4 w-4" />
+                                        Add Video Source
+                                    </Button>
                                 </div>
                             ) : (
                                 <div className="grid gap-4 xl:grid-cols-[minmax(0,380px)_minmax(0,1fr)]">
@@ -822,6 +933,11 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                                             const isActive = activeItem?.runtime_key === item.runtime_key;
                                             const isRunning = Boolean(item.producer_running);
                                             const displayName = getUploadDisplayName(item);
+                                            const metadataSummary = [
+                                                formatVideoDuration(item.video_duration_seconds),
+                                                item.video_resolution || 'Unknown resolution',
+                                                `${formatVideoFps(item.video_fps)} FPS`,
+                                            ].join(' • ');
                                             return (
                                                 <button
                                                     key={item.runtime_key}
@@ -855,6 +971,9 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                                                             <div className="mt-1 text-xs text-muted-foreground">
                                                                 {item.is_fisheye ? 'Fisheye upload' : 'Standard upload'} • {item.camera_count} camera source{item.camera_count > 1 ? 's' : ''}
                                                             </div>
+                                                            <div className="mt-1 text-xs text-muted-foreground">
+                                                                {metadataSummary}
+                                                            </div>
                                                             <div className="mt-2 flex flex-wrap gap-2">
                                                                 {(item.analysis_tags || ['Unassigned']).map((tag) => (
                                                                     <span key={`${item.runtime_key}-${tag}`} className="rounded-full bg-secondary px-2 py-1 text-[11px]">
@@ -876,7 +995,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                                                     <div>
                                                         <div className="text-lg font-semibold">{activeDisplayName}</div>
                                                         <div className="text-sm text-muted-foreground">
-                                                            Uploaded source preview and runtime status
+                                                            Video source preview and runtime status
                                                         </div>
                                                     </div>
                                                     <div className="flex items-center gap-2">
@@ -942,6 +1061,33 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                                                                 This path is visible for reference, but uploaded video files cannot be changed after creation.
                                                             </p>
                                                         </div>
+                                                        {editForm.isFisheye && (
+                                                            <div className="mt-4 space-y-3">
+                                                                <div className="flex items-center justify-between">
+                                                                    <Label>Select View</Label>
+                                                                    <span className="text-xs text-muted-foreground">
+                                                                        Preview updates immediately for the chosen fisheye view.
+                                                                    </span>
+                                                                </div>
+                                                                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                                                                    {FISHEYE_VIEW_OPTIONS.map(({ index, label }) => (
+                                                                        <label
+                                                                            key={`edit-view-${index}`}
+                                                                            className={cn(
+                                                                                'flex cursor-pointer items-center gap-2 rounded-md border px-3 py-2 text-xs',
+                                                                                editForm.selectedView === index && 'border-primary bg-primary/5',
+                                                                            )}
+                                                                        >
+                                                                            <Checkbox
+                                                                                checked={editForm.selectedView === index}
+                                                                                onCheckedChange={() => handleEditViewSelection(index)}
+                                                                            />
+                                                                            <span>{label}</span>
+                                                                        </label>
+                                                                    ))}
+                                                                </div>
+                                                            </div>
+                                                        )}
                                                         <div className="mt-4 space-y-3">
                                                             <div className="flex items-center justify-between">
                                                                 <Label>Detection ROI</Label>
@@ -997,7 +1143,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                                                                 )}
                                                             </div>
                                                             <p className="text-xs text-muted-foreground">
-                                                                ROI changes are allowed here and will apply to this uploaded source. Clear ROI to use the full frame again.
+                                                                ROI changes are allowed here and will apply to this video source. Clear ROI to use the full frame again.
                                                             </p>
                                                         </div>
                                                         <div className="mt-4 flex justify-end gap-2">
@@ -1027,16 +1173,33 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
 
                                                 {!isEditingSource && (
                                                     <>
-                                                    <div className="grid gap-3 md:grid-cols-3">
+                                                    <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
                                                         <div className="rounded-lg border p-3">
                                                             <div className="text-xs uppercase tracking-wide text-muted-foreground">Source Path</div>
                                                             <div className="mt-1 break-all text-sm">{activeItem.source_path}</div>
                                                         </div>
                                                         <div className="rounded-lg border p-3">
+                                                            <div className="text-xs uppercase tracking-wide text-muted-foreground">Video Details</div>
+                                                            <div className="mt-2 grid gap-2 text-sm">
+                                                                <div className="flex items-center justify-between gap-3">
+                                                                    <span className="text-muted-foreground">Duration</span>
+                                                                    <span className="font-medium">{formatVideoDuration(activeItem.video_duration_seconds)}</span>
+                                                                </div>
+                                                                <div className="flex items-center justify-between gap-3">
+                                                                    <span className="text-muted-foreground">Resolution</span>
+                                                                    <span className="font-medium">{activeItem.video_resolution || 'Unknown'}</span>
+                                                                </div>
+                                                                <div className="flex items-center justify-between gap-3">
+                                                                    <span className="text-muted-foreground">FPS</span>
+                                                                    <span className="font-medium">{formatVideoFps(activeItem.video_fps)}</span>
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                        <div className="rounded-lg border p-3">
                                                         <div className="text-xs uppercase tracking-wide text-muted-foreground">Views</div>
                                                         <div className="mt-1 text-sm">
                                                             {activeItem.selected_views?.length
-                                                                ? activeItem.selected_views.map((viewIndex) => `View ${viewIndex + 1}`).join(', ')
+                                                                ? activeItem.selected_views.map((viewIndex) => getFisheyeViewLabel(viewIndex)).join(', ')
                                                                 : 'Original'}
                                                             </div>
                                                         </div>
@@ -1089,7 +1252,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                                             </>
                                         ) : (
                                             <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
-                                                Select an uploaded source to inspect it here.
+                                                Select an video source to inspect it here.
                                             </div>
                                         )}
                                     </div>

@@ -32,7 +32,8 @@ class PeopleCountingConfigRead(BaseModel):
     cross_camera_pair_id: Optional[str] = None
     cross_camera_role: Literal["none", "primary", "verifier"] = "none"
     verification_camera_id: Optional[str] = None
-    verification_inward_threshold: float = 0.02
+    primary_in_event_idle_timeout_sec: float = 7.0
+    primary_out_event_idle_timeout_sec: float = 7.0
     lines: list[dict[str, Any]] = Field(default_factory=list)
     frame_exclude_areas: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -48,7 +49,8 @@ class PeopleCountingConfigUpdate(BaseModel):
     cross_camera_pair_id: Optional[str] = None
     cross_camera_role: Optional[Literal["none", "primary", "verifier"]] = None
     verification_camera_id: Optional[str] = None
-    verification_inward_threshold: Optional[float] = None
+    primary_in_event_idle_timeout_sec: Optional[float] = None
+    primary_out_event_idle_timeout_sec: Optional[float] = None
     lines: Optional[list[dict[str, Any]]] = None
     frame_exclude_areas: Optional[list[dict[str, Any]]] = None
 

@@ -88,6 +88,7 @@ class UploadRuntimeActionRequest(BaseModel):
 class UploadPreviewRequest(BaseModel):
     runtime_key: str
     camera_id: str | None = None
+    selected_view: int | None = None
 
 
 class UploadVideoUpdateRequest(BaseModel):
@@ -95,6 +96,8 @@ class UploadVideoUpdateRequest(BaseModel):
     name: str
     location: str = ""
     detection_roi: dict[str, Any] | None = None
+    is_fisheye: bool | None = None
+    view_index: int | None = None
 
 
 FISHEYE_VIEW_CONFIGS = [
@@ -401,6 +404,7 @@ def _build_upload_runtime_payload(
     matched_prefix = FISHEYE_UPLOAD_NAME_PATTERN.match(first_camera_name)
     if matched_prefix:
         display_name = matched_prefix.group("prefix").strip() or first_camera_name
+    upload_metadata = _probe_uploaded_video_metadata(source_path)
 
     return {
         "runtime_key": runtime_key,
@@ -420,6 +424,11 @@ def _build_upload_runtime_payload(
         "camera_count": len(rows),
         "analysis_tags": unique_tags or ["Unassigned"],
         "cameras": cameras_payload,
+        "video_duration_seconds": upload_metadata.get("duration_seconds"),
+        "video_resolution": upload_metadata.get("resolution"),
+        "video_fps": upload_metadata.get("fps"),
+        "video_frame_width": upload_metadata.get("frame_width"),
+        "video_frame_height": upload_metadata.get("frame_height"),
         "uploaded_at": time.strftime(
             "%Y-%m-%dT%H:%M:%S",
             time.localtime(os.path.getmtime(source_path)),
@@ -751,6 +760,47 @@ def _probe_uploaded_video_file(
             "preview_image": base64.b64encode(preview_buf).decode("utf-8") if ok_jpg else None,
             "frame_width": int(width),
             "frame_height": int(height),
+        }
+    finally:
+        cap.release()
+
+
+def _probe_uploaded_video_metadata(file_path: str) -> dict[str, Any]:
+    if not file_path or not os.path.exists(file_path):
+        return {
+            "duration_seconds": None,
+            "resolution": None,
+            "fps": None,
+            "frame_width": None,
+            "frame_height": None,
+        }
+
+    cap = _open_probe_capture(file_path)
+    try:
+        if not cap.isOpened():
+            return {
+                "duration_seconds": None,
+                "resolution": None,
+                "fps": None,
+                "frame_width": None,
+                "frame_height": None,
+            }
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+        duration_seconds = None
+        if fps > 0.0 and frame_count > 0:
+            duration_seconds = round(frame_count / fps, 3)
+
+        return {
+            "duration_seconds": duration_seconds,
+            "resolution": f"{width}x{height}" if width > 0 and height > 0 else None,
+            "fps": round(fps, 2) if fps > 0.0 else None,
+            "frame_width": width if width > 0 else None,
+            "frame_height": height if height > 0 else None,
         }
     finally:
         cap.release()
@@ -1191,6 +1241,17 @@ async def preview_uploaded_video(
         )
         if not result.get("ok"):
             raise HTTPException(status_code=400, detail=result.get("detail") or "Unable to preview uploaded video.")
+        metadata = await loop.run_in_executor(
+            None,
+            lambda: _probe_uploaded_video_metadata(temp_path),
+        )
+        result.update({
+            "video_duration_seconds": metadata.get("duration_seconds"),
+            "video_resolution": metadata.get("resolution"),
+            "video_fps": metadata.get("fps"),
+            "video_frame_width": metadata.get("frame_width"),
+            "video_frame_height": metadata.get("frame_height"),
+        })
         return result
     finally:
         try:
@@ -1295,8 +1356,21 @@ async def update_uploaded_video(
     normalized_location = (payload.location or "").strip()
     first_stream = rows[0][1]
     is_fisheye = bool(first_stream.is_fisheye)
+    requested_is_fisheye = is_fisheye if payload.is_fisheye is None else bool(payload.is_fisheye)
+    if requested_is_fisheye != is_fisheye:
+        raise HTTPException(status_code=400, detail="Uploaded source fisheye mode cannot be changed after creation.")
+
+    requested_view_index = -1
+    if is_fisheye:
+        requested_view_index = _normalize_fisheye_view_index(payload.view_index)
+    elif payload.view_index is not None and int(payload.view_index) != -1:
+        raise HTTPException(status_code=400, detail="Only fisheye uploaded sources support changing view_index.")
+
+    was_running = is_producer_running(runtime_key)
+    source_path = first_stream.source_path
 
     for camera, stream_config in rows:
+        stream_config.view_index = requested_view_index if is_fisheye else -1
         camera.name = _build_uploaded_camera_name(
             normalized_name,
             int(stream_config.view_index if stream_config.view_index is not None else -1),
@@ -1306,6 +1380,12 @@ async def update_uploaded_video(
         stream_config.detection_roi = _normalize_detection_roi(payload.detection_roi)
 
     await db.flush()
+
+    if was_running:
+        stop_producer_thread(runtime_key)
+        active_views = await _get_active_views_for_runtime(db, runtime_key, is_fisheye)
+        start_producer_thread(runtime_key, source_path, is_fisheye, active_views)
+
     await _sync_runtime_state(db)
 
     camera_ids = [camera.id for camera, _ in rows]
@@ -1482,7 +1562,7 @@ async def preview_uploaded_runtime(
         lambda: _probe_uploaded_video_file(
             stream_config.source_path,
             enable_fisheye=bool(stream_config.is_fisheye),
-            selected_view=stream_config.view_index,
+            selected_view=payload.selected_view if payload.selected_view is not None else stream_config.view_index,
         ),
     )
     if not result.get("ok"):
@@ -1495,6 +1575,7 @@ async def upload_video(
     file: UploadFile = File(...),
     enable_fisheye: bool = Form(False),
     camera_name_prefix: str = Form("Camera"),
+    location: str = Form(""),
     selected_views: str = Form(""),  # Comma separated indices, e.g. "0,2,4"
     detection_roi: str = Form(""),
     sync_start: bool = Form(False),
@@ -1538,6 +1619,10 @@ async def upload_video(
                 f"{input_path}#group={uuid.uuid4()}",
             )
 
+        upload_metadata = _probe_uploaded_video_metadata(input_path)
+        upload_resolution = upload_metadata.get("resolution") or "640x360"
+        upload_fps = int(round(float(upload_metadata.get("fps") or 30)))
+        normalized_location = (location or "").strip() or "Uploaded Video"
         pending_count = 0
 
         # Helper to create camera + stream_config in DB
@@ -1547,13 +1632,13 @@ async def upload_video(
             db_camera = Camera(
                 id=cam_id,
                 name=f"{camera_name_prefix} - {suffix}" if suffix else camera_name_prefix,
-                location="Uploaded Video",
+                location=normalized_location,
                 type="Fisheye" if enable_fisheye else "File",
                 status="Ready",
                 mode="Unassigned",
                 ws_url=_default_ws_url(cam_id),
-                resolution="640x360",
-                fps=30,
+                resolution=upload_resolution,
+                fps=upload_fps,
                 enabled=True,
                 image="",
             )

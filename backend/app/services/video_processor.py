@@ -8,7 +8,8 @@ import uuid
 import queue
 import hashlib
 import re
-import subprocess
+# Currently unused while NVENC output is disabled.
+# import subprocess
 import inspect
 from collections import deque
 import numpy as np
@@ -73,9 +74,6 @@ UPLOAD_ROOT = os.path.abspath(os.path.join(PROJECT_ROOT, "temp_video_uploads"))
 SNAPSHOT_DIR = os.path.join(PROJECT_ROOT, "temp_video_uploads", "snapshots")
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
-
-# Fixed runtime tuning for the current project.
-# POSE_MODEL_PT_PATH = os.path.join(BACKEND_ROOT, "yolov8l-pose.pt")
 POSE_MODEL_ENGINE_PATH = os.path.join(BACKEND_ROOT, "yolo26m-pose.engine")
 POSE_MODEL_PT_PATH = "yolov8m-pose.pt"
 # POSE_MODEL_ENGINE_PATH = ""
@@ -83,14 +81,16 @@ POSE_MODEL_PT_PATH = "yolov8m-pose.pt"
 TRACKER_CONFIG_PATH = os.path.join(BACKEND_ROOT, "botsort_custom.yaml")
 YOLO_DEVICE = None
 # POSE_TRACK_IMGSZ = (576,1024)
-POSE_TRACK_IMGSZ = (416,736)
 # POSE_TRACK_IMGSZ = 736
+POSE_TRACK_IMGSZ = (416,736)
 DETECTION_STRIDE = 1
 COUNTING_SNAPSHOT_HEARTBEAT_SEC = 300
 
-DRESSCODE_RECLASSIFY_INTERVAL_SEC = 1.0
+# At DRESSCODE_VIOLATION_WINDOW_SEC appear DRESSCODE_VIOLATION_CONFIRMATIONS times only consider violation
+DRESSCODE_RECLASSIFY_INTERVAL_SEC = 0.5
 DRESSCODE_VIOLATION_CONFIRMATIONS = 2
 DRESSCODE_VIOLATION_WINDOW_SEC = 5.0
+
 PERF_LOG_INTERVAL_FRAMES = 30
 PERF_STAGE_LOGS = True
 
@@ -109,42 +109,48 @@ RTSP_MAX_CONSECUTIVE_READ_FAILURES = 1200
 RTSP_READ_FAILURE_BACKOFF_MS = 50
 
 RTSP_CORRUPT_FRAME_DETECTION_ENABLED = False
-RTSP_CORRUPT_FRAME_RECOVERY_THRESHOLD = 999
 RTSP_KEEP_LAST_FRAME_ON_RECOVERY = True
-RTSP_CORRUPT_FRAME_STDDEV_MAX = 4.0
-RTSP_CORRUPT_FRAME_RANGE_MAX = 18.0
-RTSP_CORRUPT_FRAME_COLOR_DELTA_MAX = 2.5
-RTSP_CORRUPT_FRAME_DIFF_MIN = 18.0
-RTSP_CORRUPT_FRAME_EDGE_VAR_MAX = 0.0
+# Currently unused while RTSP_CORRUPT_FRAME_DETECTION_ENABLED is False.
+# RTSP_CORRUPT_FRAME_RECOVERY_THRESHOLD = 999
+# RTSP_CORRUPT_FRAME_STDDEV_MAX = 4.0
+# RTSP_CORRUPT_FRAME_RANGE_MAX = 18.0
+# RTSP_CORRUPT_FRAME_COLOR_DELTA_MAX = 2.5
+# RTSP_CORRUPT_FRAME_DIFF_MIN = 18.0
+# RTSP_CORRUPT_FRAME_EDGE_VAR_MAX = 0.0
 RTSP_HW_FALLBACK_FAILURE_WINDOW_SEC = 10.0
 RTSP_HW_FALLBACK_FAILURE_THRESHOLD = 3
 
 NVENC_OUTPUT_ENABLED = False
-NVENC_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "temp_video_uploads", "nvenc_outputs")
-NVENC_OUTPUT_CONTAINER = "mp4"
-NVENC_CODEC = "h264_nvenc"
-NVENC_PRESET = "p4"
-NVENC_TUNE = "ll"
-NVENC_RATE_CONTROL = "vbr"
-NVENC_BITRATE_K = 2500
-NVENC_MAXRATE_K = 3500
-NVENC_BUFSIZE_K = 7000
+# Currently unused while NVENC_OUTPUT_ENABLED is False.
+# NVENC_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "temp_video_uploads", "nvenc_outputs")
+# NVENC_OUTPUT_CONTAINER = "mp4"
+# NVENC_CODEC = "h264_nvenc"
+# NVENC_PRESET = "p4"
+# NVENC_TUNE = "ll"
+# NVENC_RATE_CONTROL = "vbr"
+# NVENC_BITRATE_K = 2500
+# NVENC_MAXRATE_K = 3500
+# NVENC_BUFSIZE_K = 7000
 FFMPEG_BIN = "ffmpeg"
 
-
+# ---------------------------------------------------------------------------
+# Model loading decide wehter .pt or .engine 
+# if exist .engine，else fallback to .pt
+# ---------------------------------------------------------------------------
 def _resolve_pose_model_path() -> str:
-    if os.path.exists(POSE_MODEL_ENGINE_PATH):
+    if os.path.exists(POSE_MODEL_ENGINE_PATH): 
         return POSE_MODEL_ENGINE_PATH
     return POSE_MODEL_PT_PATH
 
+# Currently unused. Active model loading resolves the path on demand.
+# POSE_MODEL_PATH = _resolve_pose_model_path()
 
-POSE_MODEL_PATH = _resolve_pose_model_path()
-
-
+# To determine whether the currently selected pose model is a TensorRT .engine file.
 def _pose_model_uses_engine() -> bool:
     return _resolve_pose_model_path().lower().endswith(".engine")
 
-
+# To load the pose model with automatic fallback from a TensorRT .engine file to a PyTorch .pt file 
+# if engine loading fails.
 def _load_pose_model() -> YOLO:
     model_path = _resolve_pose_model_path()
     try:
@@ -174,18 +180,17 @@ except Exception as e:
 # ---------------------------------------------------------------------------
 # In-memory violation event queue (consumed by detection_router)
 # ---------------------------------------------------------------------------
-VIOLATION_QUEUE: list = []  # Thread-safe enough for append; consumed elsewhere
+VIOLATION_QUEUE: list = []  
 VIOLATION_QUEUE_LOCK = threading.Lock()
 
-
+# To safely enqueue a violation event into an in-memory queue so it can be persisted to the database later.
 def queue_violation_event(event: dict):
-    """Append a violation event to the in-memory queue for DB persistence."""
     with VIOLATION_QUEUE_LOCK:
         VIOLATION_QUEUE.append(event)
 
-
+# External Entry (detection_router.py)
+# Pop all queued events atomically. Called from the async event loop.
 def drain_violation_queue() -> list:
-    """Pop all queued events atomically. Called from the async event loop."""
     with VIOLATION_QUEUE_LOCK:
         events = list(VIOLATION_QUEUE)
         VIOLATION_QUEUE.clear()
@@ -195,6 +200,7 @@ def drain_violation_queue() -> list:
 # ---------------------------------------------------------------------------
 # Source/runtime management helpers
 # ---------------------------------------------------------------------------
+# To classify the input video source and return metadata indicating whether it is an RTSP stream, a network stream, a local file, or an uploaded file.
 def _build_source_meta(source_path: str) -> dict:
     is_rtsp_stream = is_rtsp_source(source_path)
     if is_rtsp_stream:
@@ -218,12 +224,12 @@ def _build_source_meta(source_path: str) -> dict:
         "is_network_stream_source": False,
     }
 
+# Currently unused after the NVENC writer path was commented.
+# def _sanitize_token(value: str, fallback: str = "stream") -> str:
+#     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", (value or "").strip()).strip("._-")
+#     return cleaned or fallback
 
-def _sanitize_token(value: str, fallback: str = "stream") -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", (value or "").strip()).strip("._-")
-    return cleaned or fallback
-
-
+# To create a small grayscale version of a frame for quick health checking.
 def _build_frame_health_signature(frame: np.ndarray) -> np.ndarray | None:
     if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
         return None
@@ -239,7 +245,7 @@ def _build_frame_health_signature(frame: np.ndarray) -> np.ndarray | None:
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
     return gray
 
-
+# To safely update the runtime stream status and reason in "shared metadata" and "frame buffers".
 def _set_runtime_stream_status(
     runtime_key: str,
     *,
@@ -248,7 +254,7 @@ def _set_runtime_stream_status(
     clear_images: bool = False,
 ):
     with PRODUCER_LOCK:
-        producer_meta = dict(PRODUCER_META.get(runtime_key, {}))
+        producer_meta = dict(PRODUCER_META.get(runtime_key, {})) # Get the runtime meta info
         producer_meta["stream_status"] = status
         if reason:
             producer_meta["stream_reason"] = reason
@@ -273,11 +279,12 @@ def _set_runtime_stream_status(
         current_buffer["__meta__"] = meta
         FRAME_BUFFERS[runtime_key] = current_buffer
 
-
+# To perform basic validation on an RTSP frame and return early if the frame is invalid, contains non-finite pixels, or if corruption detection is disabled.
 def _detect_corrupted_rtsp_frame(
     frame: np.ndarray,
     previous_signature: np.ndarray | None,
 ) -> tuple[bool, str | None, np.ndarray | None]:
+    
     signature = _build_frame_health_signature(frame)
     if signature is None:
         return True, "empty_or_invalid_frame", None
@@ -288,54 +295,55 @@ def _detect_corrupted_rtsp_frame(
     if not RTSP_CORRUPT_FRAME_DETECTION_ENABLED:
         return False, None, signature
 
-    stddev = float(signature.std())
-    luma_range = float(signature.max() - signature.min())
-
-    color_delta = 0.0
-    if frame.ndim == 3 and frame.shape[2] >= 3:
-        small = cv2.resize(frame[:, :, :3], (64, 36), interpolation=cv2.INTER_AREA).astype(np.float32)
-        color_delta = float(
-            (
-                np.abs(small[:, :, 0] - small[:, :, 1])
-                + np.abs(small[:, :, 1] - small[:, :, 2])
-                + np.abs(small[:, :, 0] - small[:, :, 2])
-            ).mean() / 3.0
-        )
-
-    if previous_signature is None:
-        return False, None, signature
-
-    frame_diff = float(np.mean(np.abs(signature - previous_signature)))
-    edge_var = float(cv2.Laplacian(signature, cv2.CV_32F).var())
-    if (
-        stddev <= RTSP_CORRUPT_FRAME_STDDEV_MAX
-        and luma_range <= RTSP_CORRUPT_FRAME_RANGE_MAX
-        and color_delta <= RTSP_CORRUPT_FRAME_COLOR_DELTA_MAX
-        and frame_diff >= RTSP_CORRUPT_FRAME_DIFF_MIN
-    ):
-        reason = (
-            "suspected_decoder_corruption"
-            f"(std={stddev:.1f},range={luma_range:.1f},color={color_delta:.1f},diff={frame_diff:.1f})"
-        )
-        return True, reason, signature
-
-    if (
-        RTSP_CORRUPT_FRAME_EDGE_VAR_MAX > 0.0
-        and edge_var <= RTSP_CORRUPT_FRAME_EDGE_VAR_MAX
-        and frame_diff >= (RTSP_CORRUPT_FRAME_DIFF_MIN * 0.75)
-        and stddev <= max(RTSP_CORRUPT_FRAME_STDDEV_MAX * 2.0, RTSP_CORRUPT_FRAME_STDDEV_MAX + 4.0)
-        and color_delta <= max(RTSP_CORRUPT_FRAME_COLOR_DELTA_MAX * 2.0, 6.0)
-    ):
-        reason = (
-            "suspected_blurred_decoder_corruption"
-            f"(edge_var={edge_var:.1f},std={stddev:.1f},range={luma_range:.1f},"
-            f"color={color_delta:.1f},diff={frame_diff:.1f})"
-        )
-        return True, reason, signature
+    # Currently unused because RTSP_CORRUPT_FRAME_DETECTION_ENABLED is False.
+    # stddev = float(signature.std())
+    # luma_range = float(signature.max() - signature.min())
+    #
+    # color_delta = 0.0
+    # if frame.ndim == 3 and frame.shape[2] >= 3:
+    #     small = cv2.resize(frame[:, :, :3], (64, 36), interpolation=cv2.INTER_AREA).astype(np.float32)
+    #     color_delta = float(
+    #         (
+    #             np.abs(small[:, :, 0] - small[:, :, 1])
+    #             + np.abs(small[:, :, 1] - small[:, :, 2])
+    #             + np.abs(small[:, :, 0] - small[:, :, 2])
+    #         ).mean() / 3.0
+    #     )
+    #
+    # if previous_signature is None:
+    #     return False, None, signature
+    #
+    # frame_diff = float(np.mean(np.abs(signature - previous_signature)))
+    # edge_var = float(cv2.Laplacian(signature, cv2.CV_32F).var())
+    # if (
+    #     stddev <= RTSP_CORRUPT_FRAME_STDDEV_MAX
+    #     and luma_range <= RTSP_CORRUPT_FRAME_RANGE_MAX
+    #     and color_delta <= RTSP_CORRUPT_FRAME_COLOR_DELTA_MAX
+    #     and frame_diff >= RTSP_CORRUPT_FRAME_DIFF_MIN
+    # ):
+    #     reason = (
+    #         "suspected_decoder_corruption"
+    #         f"(std={stddev:.1f},range={luma_range:.1f},color={color_delta:.1f},diff={frame_diff:.1f})"
+    #     )
+    #     return True, reason, signature
+    #
+    # if (
+    #     RTSP_CORRUPT_FRAME_EDGE_VAR_MAX > 0.0
+    #     and edge_var <= RTSP_CORRUPT_FRAME_EDGE_VAR_MAX
+    #     and frame_diff >= (RTSP_CORRUPT_FRAME_DIFF_MIN * 0.75)
+    #     and stddev <= max(RTSP_CORRUPT_FRAME_STDDEV_MAX * 2.0, RTSP_CORRUPT_FRAME_STDDEV_MAX + 4.0)
+    #     and color_delta <= max(RTSP_CORRUPT_FRAME_COLOR_DELTA_MAX * 2.0, 6.0)
+    # ):
+    #     reason = (
+    #         "suspected_blurred_decoder_corruption"
+    #         f"(edge_var={edge_var:.1f},std={stddev:.1f},range={luma_range:.1f},"
+    #         f"color={color_delta:.1f},diff={frame_diff:.1f})"
+    #     )
+    #     return True, reason, signature
 
     return False, None, signature
 
-
+# To package inference, detection, and classification performance metrics into a standardized dictionary. (Receive Input only)
 def _build_perf_dict(
     *,
     detect_ms: float = 0.0,
@@ -366,7 +374,7 @@ def _build_perf_dict(
         "infer_post_ms": infer_post_ms,
     }
 
-
+# To return a "standardized" empty detection result with the original tracking state and performance metadata.
 def _empty_detection_result(
     track_state: dict,
     *,
@@ -388,6 +396,7 @@ def _empty_detection_result(
 # ---------------------------------------------------------------------------
 # Frame preprocessing and output helpers
 # ---------------------------------------------------------------------------
+# To initialize a stage-level performance metrics dictionary for the video processing pipeline.
 def _build_stage_metrics(decode_ms: float) -> dict:
     return {
         "capture_decode": decode_ms,
@@ -404,7 +413,7 @@ def _build_stage_metrics(decode_ms: float) -> dict:
         "nvenc": 0.0,
     }
 
-
+# To initialize a runtime buffer with basic stream metadata such as FPS, people count, detections, and stream status.
 def _build_runtime_buffer(current_real_fps: float, cached_people_count: int) -> dict:
     return {
         "__meta__": {
@@ -416,7 +425,7 @@ def _build_runtime_buffer(current_real_fps: float, cached_people_count: int) -> 
         }
     }
 
-
+# To generate the 8 fisheye view configurations and enable only the selected active views.
 def _build_fisheye_view_configs(active_views: list | None) -> list:
     all_configs = [
         {"angle_z": 0, "angle_up": 35, "zoom": 80},
@@ -436,7 +445,7 @@ def _build_fisheye_view_configs(active_views: list | None) -> list:
             final_configs.append(None)
     return final_configs
 
-
+# To create a FisheyeMultiView processor for generating multiple views from a fisheye frame.
 def _create_fisheye_processor(
     frame_size: tuple[int, int],
     active_views: list | None,
@@ -451,7 +460,7 @@ def _create_fisheye_processor(
         downscale_size=None,
     )
 
-
+# To resize an image to a web-friendly resolution, using CUDA acceleration when available.
 def _resize_for_web(img: np.ndarray, *, use_cuda: bool) -> np.ndarray:
     if use_cuda and hasattr(cv2, "cuda"):
         try:
@@ -463,7 +472,7 @@ def _resize_for_web(img: np.ndarray, *, use_cuda: bool) -> np.ndarray:
             pass
     return cv2.resize(img, (640, 360))
 
-
+# To resize an image, encode it as JPEG, and convert it into a base64 string for web transmission and display.
 def _encode_frame(img: np.ndarray, *, use_cuda: bool) -> str:
     img_small = _resize_for_web(img, use_cuda=use_cuda)
     if jpeg:
@@ -472,7 +481,7 @@ def _encode_frame(img: np.ndarray, *, use_cuda: bool) -> str:
         _, buf = cv2.imencode(".jpg", img_small, [cv2.IMWRITE_JPEG_QUALITY, 40])
     return base64.b64encode(buf).decode("utf-8")
 
-
+# To scale detection coordinates from the original frame size to the target display size for correct frontend rendering.
 def _scale_detections(
     detections,
     orig_h,
@@ -509,6 +518,8 @@ def _scale_detections(
 # ---------------------------------------------------------------------------
 # Detection/tracking and ROI helpers
 # ---------------------------------------------------------------------------
+
+# To crop the detection ROI from the original image and return both the cropped image and its offset metadata for coordinate mapping.
 def _prepare_detection_roi_image(
     img: np.ndarray,
     roi_areas: list[dict] | None,
@@ -579,7 +590,7 @@ def _prepare_detection_roi_image(
         "crop_h": float(crop.shape[0]),
     }
 
-
+# To remap bounding boxes from ROI-local coordinates back to the original image coordinates.
 def _remap_boxes_from_roi(boxes_xyxy: np.ndarray, roi_meta: dict | None) -> np.ndarray:
     if roi_meta is None or boxes_xyxy.size == 0:
         return boxes_xyxy
@@ -588,7 +599,7 @@ def _remap_boxes_from_roi(boxes_xyxy: np.ndarray, roi_meta: dict | None) -> np.n
     remapped[:, [1, 3]] += float(roi_meta.get("offset_y", 0.0))
     return remapped
 
-
+# To remap ROI-based detection boxes, including associated score/class data, back to the original image coordinates.
 def _remap_boxes_with_scores_from_roi(boxes, roi_meta: dict | None) -> np.ndarray:
     if boxes is None:
         return boxes
@@ -620,7 +631,7 @@ def _remap_boxes_with_scores_from_roi(boxes, roi_meta: dict | None) -> np.ndarra
     remapped[:, [1, 3]] += float(roi_meta.get("offset_y", 0.0))
     return remapped
 
-
+# To remap keypoint coordinates from ROI-local space back to the original image coordinates.
 def _remap_keypoints_from_roi(keypoints: np.ndarray | None, roi_meta: dict | None) -> np.ndarray | None:
     if keypoints is None or roi_meta is None or keypoints.size == 0:
         return keypoints
@@ -629,7 +640,7 @@ def _remap_keypoints_from_roi(keypoints: np.ndarray | None, roi_meta: dict | Non
     remapped[..., 1] += float(roi_meta.get("offset_y", 0.0))
     return remapped
 
-
+# To handle RTSP capture failures by deciding whether to tolerate the failure, fall back to software decoding, or reopen the stream.
 def _handle_rtsp_capture_failure_common(
     *,
     reason: str,
@@ -653,46 +664,48 @@ def _handle_rtsp_capture_failure_common(
     ):
         recent_rtsp_failure_times.popleft()
 
-    if is_decoder_corruption and rtsp_read_failures < RTSP_CORRUPT_FRAME_RECOVERY_THRESHOLD:
-        if rtsp_read_failures == 1:
-            print(
-                f"[Producer] Decoder corruption suspected; tolerating up to "
-                f"{RTSP_CORRUPT_FRAME_RECOVERY_THRESHOLD} consecutive corrupted frame(s) "
-                f"before reconnect: runtime_key={runtime_key}, last_reason={reason}"
-            )
-        time.sleep(RTSP_READ_FAILURE_BACKOFF_MS / 1000.0)
-        return rtsp_read_failures, capture_allow_hwaccel, False
-
-    if is_decoder_corruption and capture_allow_hwaccel:
-        capture_allow_hwaccel = False
-        _set_runtime_stream_status(
-            runtime_key,
-            status="recovering",
-            reason=reason,
-            clear_images=clear_images_on_recovery,
-        )
-        print(
-            f"[Producer] Decoder corruption detected with hardware decode; switching immediately "
-            f"to software decode: runtime_key={runtime_key}, last_reason={reason}"
-        )
-        reopen_capture(0.2, capture_allow_hwaccel)
-        recent_rtsp_failure_times.clear()
-        return 0, capture_allow_hwaccel, True
-
-    if is_decoder_corruption:
-        _set_runtime_stream_status(
-            runtime_key,
-            status="recovering",
-            reason=reason,
-            clear_images=clear_images_on_recovery,
-        )
-        print(
-            f"[Producer] Decoder corruption detected; reconnecting immediately: "
-            f"runtime_key={runtime_key}, last_reason={reason}"
-        )
-        reopen_capture(0.2, capture_allow_hwaccel)
-        recent_rtsp_failure_times.clear()
-        return 0, capture_allow_hwaccel, True
+    # Currently unused because corruption-specific reasons are not produced while
+    # RTSP_CORRUPT_FRAME_DETECTION_ENABLED is False.
+    # if is_decoder_corruption and rtsp_read_failures < RTSP_CORRUPT_FRAME_RECOVERY_THRESHOLD:
+    #     if rtsp_read_failures == 1:
+    #         print(
+    #             f"[Producer] Decoder corruption suspected; tolerating up to "
+    #             f"{RTSP_CORRUPT_FRAME_RECOVERY_THRESHOLD} consecutive corrupted frame(s) "
+    #             f"before reconnect: runtime_key={runtime_key}, last_reason={reason}"
+    #         )
+    #     time.sleep(RTSP_READ_FAILURE_BACKOFF_MS / 1000.0)
+    #     return rtsp_read_failures, capture_allow_hwaccel, False
+    #
+    # if is_decoder_corruption and capture_allow_hwaccel:
+    #     capture_allow_hwaccel = False
+    #     _set_runtime_stream_status(
+    #         runtime_key,
+    #         status="recovering",
+    #         reason=reason,
+    #         clear_images=clear_images_on_recovery,
+    #     )
+    #     print(
+    #         f"[Producer] Decoder corruption detected with hardware decode; switching immediately "
+    #         f"to software decode: runtime_key={runtime_key}, last_reason={reason}"
+    #     )
+    #     reopen_capture(0.2, capture_allow_hwaccel)
+    #     recent_rtsp_failure_times.clear()
+    #     return 0, capture_allow_hwaccel, True
+    #
+    # if is_decoder_corruption:
+    #     _set_runtime_stream_status(
+    #         runtime_key,
+    #         status="recovering",
+    #         reason=reason,
+    #         clear_images=clear_images_on_recovery,
+    #     )
+    #     print(
+    #         f"[Producer] Decoder corruption detected; reconnecting immediately: "
+    #         f"runtime_key={runtime_key}, last_reason={reason}"
+    #     )
+    #     reopen_capture(0.2, capture_allow_hwaccel)
+    #     recent_rtsp_failure_times.clear()
+    #     return 0, capture_allow_hwaccel, True
 
     if capture_allow_hwaccel and len(recent_rtsp_failure_times) >= RTSP_HW_FALLBACK_FAILURE_THRESHOLD:
         capture_allow_hwaccel = False
@@ -1131,7 +1144,7 @@ class _BatchInferenceEngine:
 _BATCH_INFER_ENGINE: _BatchInferenceEngine | None = None
 _BATCH_INFER_LOCK = threading.Lock()
 
-
+# To safely return the shared batch inference engine(only 1 shared by all thread), creating it on first use if needed.
 def _get_batch_infer_engine() -> _BatchInferenceEngine:
     global _BATCH_INFER_ENGINE
     with _BATCH_INFER_LOCK:
@@ -1139,7 +1152,7 @@ def _get_batch_infer_engine() -> _BatchInferenceEngine:
             _BATCH_INFER_ENGINE = _BatchInferenceEngine()
         return _BATCH_INFER_ENGINE
 
-
+# To clear the batch inference tracker state associated with a specific runtime key.
 def _clear_batch_infer_trackers_for_runtime(runtime_key: str) -> None:
     with _BATCH_INFER_LOCK:
         engine = _BATCH_INFER_ENGINE
@@ -1351,162 +1364,165 @@ class _AsyncFrameReader:
 # ---------------------------------------------------------------------------
 # Output/publish: optional FFmpeg NVENC sink
 # ---------------------------------------------------------------------------
-class _NvencOutputWriter:
-    """Optional FFmpeg NVENC sink for processed frames."""
-
-    def __init__(self, runtime_key: str, view_key: str, fps: float):
-        self.runtime_key = runtime_key
-        self.view_key = view_key
-        self.fps = max(1.0, float(fps) if fps else 30.0)
-        self.process: subprocess.Popen | None = None
-        self.width: int | None = None
-        self.height: int | None = None
-        self.output_path: str | None = None
-        self.disabled = False
-
-    def _output_ext(self) -> str:
-        return "mkv" if NVENC_OUTPUT_CONTAINER == "mkv" else "mp4"
-
-    def _build_output_path(self) -> str:
-        os.makedirs(NVENC_OUTPUT_DIR, exist_ok=True)
-        runtime_hash = hashlib.sha1(self.runtime_key.encode("utf-8", errors="ignore")).hexdigest()[:10]
-        view_label = _sanitize_token(self.view_key, fallback="view")[:32]
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        suffix = uuid.uuid4().hex[:6]
-        return os.path.join(NVENC_OUTPUT_DIR, f"{runtime_hash}_{view_label}_{ts}_{suffix}.{self._output_ext()}")
-
-    def _build_cmd(self, width: int, height: int) -> list[str]:
-        cmd = [
-            FFMPEG_BIN,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "bgr24",
-            "-s:v",
-            f"{width}x{height}",
-            "-r",
-            f"{self.fps:.3f}",
-            "-i",
-            "-",
-            "-an",
-            "-c:v",
-            NVENC_CODEC,
-            "-preset",
-            NVENC_PRESET,
-        ]
-        if NVENC_TUNE:
-            cmd.extend(["-tune", NVENC_TUNE])
-        if NVENC_RATE_CONTROL:
-            cmd.extend(["-rc", NVENC_RATE_CONTROL])
-        cmd.extend(
-            [
-                "-b:v",
-                f"{NVENC_BITRATE_K}k",
-                "-maxrate",
-                f"{NVENC_MAXRATE_K}k",
-                "-bufsize",
-                f"{NVENC_BUFSIZE_K}k",
-                "-pix_fmt",
-                "yuv420p",
-            ]
-        )
-        if self._output_ext() == "mp4":
-            cmd.extend(["-movflags", "+faststart"])
-        cmd.append(self.output_path or self._build_output_path())
-        return cmd
-
-    def _start(self, frame: np.ndarray) -> bool:
-        if self.disabled:
-            return False
-        if frame is None or frame.size == 0:
-            return False
-
-        height, width = frame.shape[:2]
-        if height <= 0 or width <= 0:
-            return False
-
-        self.width = int(width)
-        self.height = int(height)
-        self.output_path = self._build_output_path()
-        cmd = self._build_cmd(self.width, self.height)
-
-        try:
-            self.process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            print(
-                f"[NVENC] Started writer for runtime_key={self.runtime_key}, "
-                f"view={self.view_key}, output={self.output_path}"
-            )
-            return True
-        except FileNotFoundError:
-            print(f"[NVENC] FFmpeg executable not found: {FFMPEG_BIN}")
-        except Exception as e:
-            print(f"[NVENC] Failed to start writer for {self.runtime_key} ({self.view_key}): {e}")
-
-        self.disabled = True
-        self.process = None
-        return False
-
-    def write(self, frame: np.ndarray) -> bool:
-        if self.disabled:
-            return False
-        if frame is None or frame.size == 0:
-            return False
-        if self.process is None and not self._start(frame):
-            return False
-        if self.process is None or self.process.stdin is None:
-            return False
-        if self.process.poll() is not None:
-            self.disabled = True
-            print(
-                f"[NVENC] Writer exited early for runtime_key={self.runtime_key}, "
-                f"view={self.view_key}"
-            )
-            return False
-
-        out = frame
-        if self.width and self.height and (frame.shape[1] != self.width or frame.shape[0] != self.height):
-            out = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
-
-        try:
-            self.process.stdin.write(out.tobytes())
-            return True
-        except Exception as e:
-            print(f"[NVENC] Failed to write frame for {self.runtime_key} ({self.view_key}): {e}")
-            self.close()
-            self.disabled = True
-            return False
-
-    def close(self):
-        proc = self.process
-        self.process = None
-        if proc is None:
-            return
-        try:
-            if proc.stdin is not None:
-                proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=2.0)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+# Currently unused while NVENC_OUTPUT_ENABLED is False.
+# class _NvencOutputWriter:
+#     """Optional FFmpeg NVENC sink for processed frames."""
+#
+#     def __init__(self, runtime_key: str, view_key: str, fps: float):
+#         self.runtime_key = runtime_key
+#         self.view_key = view_key
+#         self.fps = max(1.0, float(fps) if fps else 30.0)
+#         self.process: subprocess.Popen | None = None
+#         self.width: int | None = None
+#         self.height: int | None = None
+#         self.output_path: str | None = None
+#         self.disabled = False
+#
+#     def _output_ext(self) -> str:
+#         return "mkv" if NVENC_OUTPUT_CONTAINER == "mkv" else "mp4"
+#
+#     def _build_output_path(self) -> str:
+#         os.makedirs(NVENC_OUTPUT_DIR, exist_ok=True)
+#         runtime_hash = hashlib.sha1(self.runtime_key.encode("utf-8", errors="ignore")).hexdigest()[:10]
+#         view_label = _sanitize_token(self.view_key, fallback="view")[:32]
+#         ts = time.strftime("%Y%m%d_%H%M%S")
+#         suffix = uuid.uuid4().hex[:6]
+#         return os.path.join(NVENC_OUTPUT_DIR, f"{runtime_hash}_{view_label}_{ts}_{suffix}.{self._output_ext()}")
+#
+#     def _build_cmd(self, width: int, height: int) -> list[str]:
+#         cmd = [
+#             FFMPEG_BIN,
+#             "-hide_banner",
+#             "-loglevel",
+#             "error",
+#             "-y",
+#             "-f",
+#             "rawvideo",
+#             "-pix_fmt",
+#             "bgr24",
+#             "-s:v",
+#             f"{width}x{height}",
+#             "-r",
+#             f"{self.fps:.3f}",
+#             "-i",
+#             "-",
+#             "-an",
+#             "-c:v",
+#             NVENC_CODEC,
+#             "-preset",
+#             NVENC_PRESET,
+#         ]
+#         if NVENC_TUNE:
+#             cmd.extend(["-tune", NVENC_TUNE])
+#         if NVENC_RATE_CONTROL:
+#             cmd.extend(["-rc", NVENC_RATE_CONTROL])
+#         cmd.extend(
+#             [
+#                 "-b:v",
+#                 f"{NVENC_BITRATE_K}k",
+#                 "-maxrate",
+#                 f"{NVENC_MAXRATE_K}k",
+#                 "-bufsize",
+#                 f"{NVENC_BUFSIZE_K}k",
+#                 "-pix_fmt",
+#                 "yuv420p",
+#             ]
+#         )
+#         if self._output_ext() == "mp4":
+#             cmd.extend(["-movflags", "+faststart"])
+#         cmd.append(self.output_path or self._build_output_path())
+#         return cmd
+#
+#     def _start(self, frame: np.ndarray) -> bool:
+#         if self.disabled:
+#             return False
+#         if frame is None or frame.size == 0:
+#             return False
+#
+#         height, width = frame.shape[:2]
+#         if height <= 0 or width <= 0:
+#             return False
+#
+#         self.width = int(width)
+#         self.height = int(height)
+#         self.output_path = self._build_output_path()
+#         cmd = self._build_cmd(self.width, self.height)
+#
+#         try:
+#             self.process = subprocess.Popen(
+#                 cmd,
+#                 stdin=subprocess.PIPE,
+#                 stdout=subprocess.DEVNULL,
+#                 stderr=subprocess.DEVNULL,
+#             )
+#             print(
+#                 f"[NVENC] Started writer for runtime_key={self.runtime_key}, "
+#                 f"view={self.view_key}, output={self.output_path}"
+#             )
+#             return True
+#         except FileNotFoundError:
+#             print(f"[NVENC] FFmpeg executable not found: {FFMPEG_BIN}")
+#         except Exception as e:
+#             print(f"[NVENC] Failed to start writer for {self.runtime_key} ({self.view_key}): {e}")
+#
+#         self.disabled = True
+#         self.process = None
+#         return False
+#
+#     def write(self, frame: np.ndarray) -> bool:
+#         if self.disabled:
+#             return False
+#         if frame is None or frame.size == 0:
+#             return False
+#         if self.process is None and not self._start(frame):
+#             return False
+#         if self.process is None or self.process.stdin is None:
+#             return False
+#         if self.process.poll() is not None:
+#             self.disabled = True
+#             print(
+#                 f"[NVENC] Writer exited early for runtime_key={self.runtime_key}, "
+#                 f"view={self.view_key}"
+#             )
+#             return False
+#
+#         out = frame
+#         if self.width and self.height and (frame.shape[1] != self.width or frame.shape[0] != self.height):
+#             out = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
+#
+#         try:
+#             self.process.stdin.write(out.tobytes())
+#             return True
+#         except Exception as e:
+#             print(f"[NVENC] Failed to write frame for {self.runtime_key} ({self.view_key}): {e}")
+#             self.close()
+#             self.disabled = True
+#             return False
+#
+#     def close(self):
+#         proc = self.process
+#         self.process = None
+#         if proc is None:
+#             return
+#         try:
+#             if proc.stdin is not None:
+#                 proc.stdin.close()
+#         except Exception:
+#             pass
+#         try:
+#             proc.wait(timeout=2.0)
+#         except Exception:
+#             try:
+#                 proc.kill()
+#             except Exception:
+#                 pass
 
 
 # ---------------------------------------------------------------------------
 # Source/runtime management: producer thread lifecycle
 # ---------------------------------------------------------------------------
+# External Entry 1
+# To start a background producer thread for a specific runtime source and initialize its control state and metadata.
 def start_producer_thread(
     runtime_key: str,
     source_path: str,
@@ -1515,17 +1531,18 @@ def start_producer_thread(
     sync_barrier: threading.Barrier | None = None,
     sync_state: dict | None = None,
 ):
-    with PRODUCER_LOCK:
+    with PRODUCER_LOCK: # because PRODUCER_THREADS、PRODUCER_META is shared data
         existing = PRODUCER_THREADS.get(runtime_key)
-        if existing is not None and existing.is_alive():
+        if existing is not None and existing.is_alive(): # check this run time key have old thread running?
             return  # Already running for this source
 
-        _clear_batch_infer_trackers_for_runtime(runtime_key)
+        _clear_batch_infer_trackers_for_runtime(runtime_key) # before run clear runtime old batch infer tracker state
 
-        stop_event = threading.Event()
-        source_meta = _build_source_meta(source_path)
+        stop_event = threading.Event() # if want to stop this thread use this
+        source_meta = _build_source_meta(source_path) #check whehter is RTSP or Video and then create metadata
 
-        thread = threading.Thread(
+        #Create Thread
+        thread = threading.Thread( 
             target=video_producer,
             args=(
                 runtime_key,
@@ -1539,6 +1556,8 @@ def start_producer_thread(
             ),
             daemon=True,
         )
+
+        #Store all the thread info
         PRODUCER_THREADS[runtime_key] = thread
         PRODUCER_STOP_EVENTS[runtime_key] = stop_event
         PRODUCER_META[runtime_key] = {
@@ -1548,7 +1567,7 @@ def start_producer_thread(
         }
         thread.start()
 
-
+# External Entry 2
 def stop_producer_thread(runtime_key: str, join_timeout: float = 2.0) -> bool:
     """Request producer shutdown for a source. Returns True if fully stopped."""
     with PRODUCER_LOCK:
@@ -1569,7 +1588,7 @@ def stop_producer_thread(runtime_key: str, join_timeout: float = 2.0) -> bool:
     _cleanup_producer_state(runtime_key, clear_frame_buffer=True)
     return True
 
-
+# External Entry 3
 def stop_all_producer_threads(join_timeout: float = 2.0) -> list[str]:
     """
     Request shutdown for all producers and return any sources that
@@ -1595,13 +1614,13 @@ def stop_all_producer_threads(join_timeout: float = 2.0) -> list[str]:
 
     return still_running
 
-
+# External Entry 4
 def is_producer_running(runtime_key: str) -> bool:
     with PRODUCER_LOCK:
         thread = PRODUCER_THREADS.get(runtime_key)
         return thread.is_alive() if thread is not None else False
 
-
+# To clean up the producer’s runtime state, tracker state, and optionally its frame buffer
 def _cleanup_producer_state(runtime_key: str, clear_frame_buffer: bool):
     with PRODUCER_LOCK:
         PRODUCER_THREADS.pop(runtime_key, None)
@@ -1610,7 +1629,7 @@ def _cleanup_producer_state(runtime_key: str, clear_frame_buffer: bool):
     if clear_frame_buffer:
         FRAME_BUFFERS.pop(runtime_key, None)
 
-
+# To reset the live counting data for all related views when an uploaded video source reaches the end of playback.
 def _clear_uploaded_eof_live_counts(runtime_key: str) -> None:
     for view_key in get_counting_views(runtime_key):
         camera_id = get_counting_camera_id(runtime_key, view_key)
@@ -1746,11 +1765,12 @@ def video_producer(
         print("[System] CUDA detected: enabling GPU remap/resize")
     else:
         print("[System] CUDA not available, using CPU pipeline")
-    if NVENC_OUTPUT_ENABLED:
-        print(
-            f"[NVENC] Enabled: codec={NVENC_CODEC}, preset={NVENC_PRESET}, "
-            f"container={NVENC_OUTPUT_CONTAINER}, output_dir={NVENC_OUTPUT_DIR}"
-        )
+    # Currently unused while NVENC_OUTPUT_ENABLED is False.
+    # if NVENC_OUTPUT_ENABLED:
+    #     print(
+    #         f"[NVENC] Enabled: codec={NVENC_CODEC}, preset={NVENC_PRESET}, "
+    #         f"container={NVENC_OUTPUT_CONTAINER}, output_dir={NVENC_OUTPUT_DIR}"
+    #     )
 
     # -----------------------------------------------------------------------
     # Frame preprocessing setup
@@ -1982,9 +2002,11 @@ def video_producer(
         detection_stride = max(DETECTION_STRIDE, 1)
     frame_count = 0
     decoded_frame_index = -1
-    rtsp_read_failures = 0
-    recent_rtsp_failure_times: deque[float] = deque()
-    last_good_frame_signature: np.ndarray | None = None
+    # Currently unused for RTSP because the active RTSP path reads through
+    # _AsyncFrameReader when ASYNC_CAPTURE_ENABLED is True.
+    # rtsp_read_failures = 0
+    # recent_rtsp_failure_times: deque[float] = deque()
+    # last_good_frame_signature: np.ndarray | None = None
     track_state = {}       # Per-track dress-code and fall-detection state.
     cached_detections = [] # Reused between detection frames
     cached_people_count = 0
@@ -1993,7 +2015,8 @@ def video_producer(
     people_counters: dict[str, PeopleCounter] = {}
     cached_counting_data: dict[str, dict] = {}  # view_key -> last counting result
     counting_event_state: dict[str, dict[str, int]] = {}  # view_key -> previous total counts
-    nvenc_writers: dict[str, _NvencOutputWriter] = {}
+    # Currently unused while NVENC_OUTPUT_ENABLED is False.
+    # nvenc_writers: dict[str, _NvencOutputWriter] = {}
     sync_started_at = None
     async_reader: _AsyncFrameReader | None = None
 
@@ -2035,16 +2058,17 @@ def video_producer(
     # -----------------------------------------------------------------------
     # Output/publish helper
     # -----------------------------------------------------------------------
-    def _write_nvenc_frame(view_key: str, img: np.ndarray) -> float:
-        if not NVENC_OUTPUT_ENABLED:
-            return 0.0
-        writer = nvenc_writers.get(view_key)
-        if writer is None:
-            writer = _NvencOutputWriter(runtime_key, view_key, fps)
-            nvenc_writers[view_key] = writer
-        started_at = time.perf_counter()
-        writer.write(img)
-        return (time.perf_counter() - started_at) * 1000.0
+    # Currently unused while NVENC_OUTPUT_ENABLED is False.
+    # def _write_nvenc_frame(view_key: str, img: np.ndarray) -> float:
+    #     if not NVENC_OUTPUT_ENABLED:
+    #         return 0.0
+    #     writer = nvenc_writers.get(view_key)
+    #     if writer is None:
+    #         writer = _NvencOutputWriter(runtime_key, view_key, fps)
+    #         nvenc_writers[view_key] = writer
+    #     started_at = time.perf_counter()
+    #     writer.write(img)
+    #     return (time.perf_counter() - started_at) * 1000.0
 
     def _skip_file_frame() -> bool:
         nonlocal decoded_frame_index
@@ -2055,31 +2079,33 @@ def video_producer(
             decoded_frame_index += 1
         return skipped
 
-    def _handle_rtsp_capture_failure(reason: str):
-        nonlocal cap, rtsp_read_failures, capture_allow_hwaccel, last_good_frame_signature
-        def _reopen_capture(sleep_seconds: float, allow_hwaccel: bool):
-            nonlocal cap, capture_allow_hwaccel
-            capture_allow_hwaccel = allow_hwaccel
-            cap.release()
-            time.sleep(sleep_seconds)
-            cap = open_video_capture(
-                source_path,
-                is_rtsp=bool(source_meta.get("is_rtsp_source")),
-                allow_hwaccel=capture_allow_hwaccel,
-            )
-
-        rtsp_read_failures, capture_allow_hwaccel, reset_signature = (
-            _handle_rtsp_capture_failure_common(
-                reason=reason,
-                runtime_key=runtime_key,
-                rtsp_read_failures=rtsp_read_failures,
-                recent_rtsp_failure_times=recent_rtsp_failure_times,
-                capture_allow_hwaccel=capture_allow_hwaccel,
-                reopen_capture=_reopen_capture,
-            )
-        )
-        if reset_signature:
-            last_good_frame_signature = None
+    # Currently unused for RTSP because the active RTSP path reads through
+    # _AsyncFrameReader when ASYNC_CAPTURE_ENABLED is True.
+    # def _handle_rtsp_capture_failure(reason: str):
+    #     nonlocal cap, rtsp_read_failures, capture_allow_hwaccel, last_good_frame_signature
+    #     def _reopen_capture(sleep_seconds: float, allow_hwaccel: bool):
+    #         nonlocal cap, capture_allow_hwaccel
+    #         capture_allow_hwaccel = allow_hwaccel
+    #         cap.release()
+    #         time.sleep(sleep_seconds)
+    #         cap = open_video_capture(
+    #             source_path,
+    #             is_rtsp=bool(source_meta.get("is_rtsp_source")),
+    #             allow_hwaccel=capture_allow_hwaccel,
+    #         )
+    #
+    #     rtsp_read_failures, capture_allow_hwaccel, reset_signature = (
+    #         _handle_rtsp_capture_failure_common(
+    #             reason=reason,
+    #             runtime_key=runtime_key,
+    #             rtsp_read_failures=rtsp_read_failures,
+    #             recent_rtsp_failure_times=recent_rtsp_failure_times,
+    #             capture_allow_hwaccel=capture_allow_hwaccel,
+    #             reopen_capture=_reopen_capture,
+    #         )
+    #     )
+    #     if reset_signature:
+    #         last_good_frame_signature = None
 
     # -----------------------------------------------------------------------
     # Detection/tracking view selection helpers
@@ -2250,9 +2276,7 @@ def video_producer(
                     "timestamp": event_time + ((delta_in + idx) * 0.001),
                     "count_after": total_out - delta_out + idx + 1,
                 })
-            building_alert = ingest_sensor_events(camera_id, sensor_events)
-            if building_alert:
-                queue_violation_event(building_alert)
+            ingest_sensor_events(camera_id, sensor_events)
 
         # Snapshot on change + periodic heartbeat to preserve timeline continuity.
         if counter.should_snapshot(heartbeat_interval=COUNTING_SNAPSHOT_HEARTBEAT_SEC):
@@ -2316,6 +2340,7 @@ def video_producer(
             det["fall_detected"] = False
 
             if track_id is None:
+                det["fall_detected"] = bool(fall_pose)
                 continue
 
             if track_id not in track_state:
@@ -2494,12 +2519,14 @@ def video_producer(
             decode_ms = (time.perf_counter() - read_started_at) * 1000.0
             if ret:
                 decoded_frame_index += 1
-                if rtsp_read_failures > 0 and source_meta.get("is_network_stream_source"):
-                    print(
-                        f"[Producer] Recovered live stream after {rtsp_read_failures} failed frame(s): "
-                        f"runtime_key={runtime_key}"
-                    )
-                    rtsp_read_failures = 0
+                # Currently unused for RTSP because the active RTSP path reads
+                # through _AsyncFrameReader when ASYNC_CAPTURE_ENABLED is True.
+                # if rtsp_read_failures > 0 and source_meta.get("is_network_stream_source"):
+                #     print(
+                #         f"[Producer] Recovered live stream after {rtsp_read_failures} failed frame(s): "
+                #         f"runtime_key={runtime_key}"
+                #     )
+                #     rtsp_read_failures = 0
 
             if not ret:
                 # Uploaded file source reached EOF: stop producer automatically.
@@ -2508,23 +2535,30 @@ def video_producer(
                     reached_eof = True
                     break
 
+                # Currently unused for RTSP because the active RTSP path reads
+                # through _AsyncFrameReader when ASYNC_CAPTURE_ENABLED is True.
+                # if source_meta.get("is_network_stream_source"):
+                #     _handle_rtsp_capture_failure("read_failed")
+                #     continue
                 if source_meta.get("is_network_stream_source"):
-                    _handle_rtsp_capture_failure("read_failed")
+                    time.sleep(0.1)
                     continue
 
                 # Non-upload/live source: transient read failure, keep retrying.
                 time.sleep(0.1)
                 continue
 
-            if source_meta.get("is_rtsp_source"):
-                is_bad_frame, bad_frame_reason, frame_signature = _detect_corrupted_rtsp_frame(
-                    frame,
-                    last_good_frame_signature,
-                )
-                if is_bad_frame:
-                    _handle_rtsp_capture_failure(bad_frame_reason or "corrupted_frame")
-                    continue
-                last_good_frame_signature = frame_signature
+            # Currently unused for RTSP because the active RTSP path reads
+            # through _AsyncFrameReader when ASYNC_CAPTURE_ENABLED is True.
+            # if source_meta.get("is_rtsp_source"):
+            #     is_bad_frame, bad_frame_reason, frame_signature = _detect_corrupted_rtsp_frame(
+            #         frame,
+            #         last_good_frame_signature,
+            #     )
+            #     if is_bad_frame:
+            #         _handle_rtsp_capture_failure(bad_frame_reason or "corrupted_frame")
+            #         continue
+            #     last_good_frame_signature = frame_signature
 
         # Shared per-frame bookkeeping
         # Step 6B: Once a frame is available, update frame counters and perf state.
@@ -2581,7 +2615,8 @@ def video_producer(
                         encode_started_at = time.perf_counter()
                         current_buffer[key] = _encode_frame(img, use_cuda=cuda_available)
                         stage_ms["encode"] += (time.perf_counter() - encode_started_at) * 1000.0
-                        stage_ms["nvenc"] += _write_nvenc_frame(key, img)
+                        # Currently unused while NVENC_OUTPUT_ENABLED is False.
+                        # stage_ms["nvenc"] += _write_nvenc_frame(key, img)
 
                     except Exception as e:
                         print(f"Encoding error for {key}: {e}")
@@ -2609,7 +2644,8 @@ def video_producer(
                 encode_started_at = time.perf_counter()
                 current_buffer['original'] = _encode_frame(frame, use_cuda=cuda_available)
                 stage_ms["encode"] += (time.perf_counter() - encode_started_at) * 1000.0
-                stage_ms["nvenc"] += _write_nvenc_frame("original", frame)
+                # Currently unused while NVENC_OUTPUT_ENABLED is False.
+                # stage_ms["nvenc"] += _write_nvenc_frame("original", frame)
                 current_buffer['__meta__']['detections'] = {'original': scaled}
                 current_buffer['__meta__']['people_count'] = cached_people_count
                 current_buffer['__meta__']['counting_data'] = {
@@ -2669,8 +2705,9 @@ def video_producer(
             if wait > 0:
                 time.sleep(wait)
 
-    for writer in nvenc_writers.values():
-        writer.close()
+    # Currently unused while NVENC_OUTPUT_ENABLED is False.
+    # for writer in nvenc_writers.values():
+    #     writer.close()
     if async_reader is not None:
         async_reader.close()
     else:
@@ -2701,9 +2738,10 @@ _current_policy = {
 }
 _policy_lock = threading.Lock()
 
-
+# External Entry Point (Called by policy_router when policy changes.)
+# To safely update the current global policy configuration used by the system
 def update_policy(policy: dict):
-    """Called by policy_router when policy changes."""
+
     global _current_policy
     with _policy_lock:
         _current_policy = policy
@@ -2719,14 +2757,14 @@ def get_policy() -> dict:
     with _policy_lock:
         return dict(_current_policy)
 
-
+# To safely convert a policy threshold value to a float, using a fallback value if conversion fails.
 def _coerce_policy_threshold(value, fallback: float) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
         return float(fallback)
 
-
+# To retrieve the pants and slipper classifier confidence thresholds from the policy, falling back to a shared threshold when needed
 def _get_policy_classifier_thresholds(policy: dict) -> tuple[float, float]:
     shared_threshold = _coerce_policy_threshold(policy.get("confidence_threshold"), 0.8)
     pants_threshold = _coerce_policy_threshold(
@@ -2739,21 +2777,19 @@ def _get_policy_classifier_thresholds(policy: dict) -> tuple[float, float]:
     )
     return pants_threshold, slipper_threshold
 
-
+# To return the "set" of view keys that should run detection for the given runtime key based on the current policy
 def _get_detection_views(runtime_key: str) -> set:
-    """Get set of view keys that should run detection for a specific runtime key."""
     p = get_policy()
     detection_map = p.get("detection_map", {})
     return detection_map.get(runtime_key, set())
 
-
+# To find the camera ID associated with a specific runtime key and view key from the current policy.
 def _get_camera_id(runtime_key: str, view_key: str) -> str | None:
-    """Resolve the camera_id for a specific runtime key + view."""
     p = get_policy()
     camera_id_map = p.get("camera_id_map", {})
     return camera_id_map.get(f"{runtime_key}||{view_key}")
 
-
+# To return whether pants detection and slipper detection are enabled in the current policy.
 def _get_classifier_flags() -> tuple[bool, bool]:
     policy = get_policy()
     return (
@@ -2761,16 +2797,16 @@ def _get_classifier_flags() -> tuple[bool, bool]:
         bool(policy.get("enable_slipper_detection", False)),
     )
 
-
+# To determine whether a cached classification result is still recent and valid enough to be reused.
 def _should_reuse_cached_classification(cached: dict, *, now_monotonic: float) -> bool:
-    last_classified_at = cached.get("last_classified_at_monotonic")
+    last_classified_at = cached.get("last_classified_at_monotonic") # check if have last classification time
     if last_classified_at is None:
         return False
-    if (now_monotonic - float(last_classified_at)) >= DRESSCODE_RECLASSIFY_INTERVAL_SEC:
+    if (now_monotonic - float(last_classified_at)) >= DRESSCODE_RECLASSIFY_INTERVAL_SEC: # check if more than setting time interval
         return False
-    return bool(cached.get("label") is not None or cached.get("classifications"))
+    return bool(cached.get("label") is not None or cached.get("classifications")) # check if old cache have classification result
 
-
+# To extract and format cached classification results that correspond only to the currently enabled models.
 def _get_cached_classification_for_enabled_models(cached: dict, *, enable_pants: bool, enable_slipper: bool) -> dict | None:
     classifications = []
     for item in list(cached.get("classifications") or []):
@@ -2806,7 +2842,7 @@ def _get_cached_classification_for_enabled_models(cached: dict, *, enable_pants:
         "classifications": classifications,
     }
 
-
+# To choose the correct "violation threshold" based on the classification region.
 def _get_violation_threshold_for_classification(
     classification: dict,
     *,
@@ -2817,7 +2853,7 @@ def _get_violation_threshold_for_classification(
         return slipper_threshold
     return pants_threshold
 
-
+# To (Filter) collect the classification results "that qualify as violations" based on restricted labels and confidence thresholds.
 def _collect_violation_classifications(
     det: dict,
     restricted: set[str],
@@ -2852,7 +2888,7 @@ def _collect_violation_classifications(
 
     return candidates
 
-
+# To select the highest-confidence violation result for display.
 def _select_display_violation(matched_violations: list[dict]) -> dict | None:
     if not matched_violations:
         return None
@@ -2861,7 +2897,7 @@ def _select_display_violation(matched_violations: list[dict]) -> dict | None:
         key=lambda item: float(item.get("confidence", 0.0)),
     )
 
-
+# To clear all violation-tracking state stored for a specific track entry.
 def _clear_violation_tracking(track_entry: dict) -> None:
     track_entry.pop("violation_candidate_label", None)
     track_entry.pop("violation_candidate_count", None)
@@ -2870,13 +2906,26 @@ def _clear_violation_tracking(track_entry: dict) -> None:
     track_entry.pop("confirmed_matched_violations", None)
     track_entry.pop("last_matched_violations", None)
 
-
+# To clear the pending violation-candidate state for a specific track entry.
 def _clear_pending_violation_candidate(track_entry: dict) -> None:
     track_entry.pop("violation_candidate_label", None)
     track_entry.pop("violation_candidate_count", None)
     track_entry.pop("violation_candidate_started_at_monotonic", None)
 
 
+def _get_violation_region_state(track_entry: dict, region: str) -> dict:
+    region_states = track_entry.setdefault("violation_region_states", {})
+    if not isinstance(region_states, dict):
+        region_states = {}
+        track_entry["violation_region_states"] = region_states
+    state = region_states.get(region)
+    if not isinstance(state, dict):
+        state = {}
+        region_states[region] = state
+    return state
+
+# To manage the transition from "violation candidate to confirmed violation" 
+# and "clear the confirmation when it is no longer valid"
 def _update_violation_confirmation_state(
     track_entry: dict,
     matched_violations: list[dict],
@@ -2948,9 +2997,35 @@ def _update_violation_confirmation_state(
     return dict(latest_display), [dict(item) for item in matched_violations]
 
 
+def _update_parallel_violation_confirmation_state(
+    track_entry: dict,
+    matched_violations: list[dict],
+    *,
+    classification_fresh: bool,
+) -> tuple[dict | None, list[dict]]:
+    confirmed_matches: list[dict] = []
+
+    for region in ("lower_body", "footwear"):
+        region_matches = [
+            dict(item) for item in matched_violations if item.get("region") == region
+        ]
+        _, region_confirmed_matches = _update_violation_confirmation_state(
+            _get_violation_region_state(track_entry, region),
+            region_matches,
+            classification_fresh=classification_fresh,
+        )
+        confirmed_matches.extend(region_confirmed_matches)
+
+    display_violation = _select_display_violation(confirmed_matches)
+    if display_violation is None:
+        return None, []
+    return dict(display_violation), confirmed_matches
+
+
 # ---------------------------------------------------------------------------
 # Dress code policy application and violation snapshot queueing
 # ---------------------------------------------------------------------------
+# To apply the current policy to detections, confirm dress code violations, and save one snapshot evidence event per violating track
 def _apply_policy_and_save(detections, track_state, frame, runtime_key, source_path, view_key=None):
     """
     Apply the current policy to mark violations and save snapshot evidence.
@@ -2981,7 +3056,7 @@ def _apply_policy_and_save(detections, track_state, frame, runtime_key, source_p
 
         classification_fresh = bool(det.get("_classification_fresh", False))
         if track_entry is not None:
-            violation_cls, confirmed_matches = _update_violation_confirmation_state(
+            violation_cls, confirmed_matches = _update_parallel_violation_confirmation_state(
                 track_entry,
                 matched_violations,
                 classification_fresh=classification_fresh,
@@ -2998,10 +3073,15 @@ def _apply_policy_and_save(detections, track_state, frame, runtime_key, source_p
             det["matched_violations"] = confirmed_matches
             det["violation"] = True
 
-            # Dedup: only save once per track
+            # Dedup: only save once per label for a track
             if track_id is not None and camera_id is not None:
                 ts = track_state.get(track_id, {})
-                if not ts.get("violation_saved", False):
+                saved_labels = ts.get("saved_violation_labels")
+                if not isinstance(saved_labels, list):
+                    saved_labels = []
+                    ts["saved_violation_labels"] = saved_labels
+
+                if label not in saved_labels:
                     # Save snapshot evidence
                     snapshot_id = str(uuid.uuid4())
                     person_crop = crop_full_person(frame, det["person_bbox"])
@@ -3027,9 +3107,11 @@ def _apply_policy_and_save(detections, track_state, frame, runtime_key, source_p
                         "snapshot_path": snapshot_path,
                     })
 
-                    # Mark as saved
+                    # Mark this label as saved for the track
                     if track_id in track_state:
-                        track_state[track_id]["violation_saved"] = True
+                        track_state[track_id].setdefault("saved_violation_labels", [])
+                        if label not in track_state[track_id]["saved_violation_labels"]:
+                            track_state[track_id]["saved_violation_labels"].append(label)
         else:
             det["violation"] = False
 
@@ -3039,6 +3121,7 @@ def _apply_policy_and_save(detections, track_state, frame, runtime_key, source_p
 # ---------------------------------------------------------------------------
 # Fall detection compatibility helper
 # ---------------------------------------------------------------------------
+# To detect whether is_person_in_fall_pose() supports the detection_sensitivity argument before calling it.
 try:
     _FALL_POSE_ACCEPTS_SENSITIVITY = "detection_sensitivity" in inspect.signature(
         is_person_in_fall_pose
@@ -3046,7 +3129,7 @@ try:
 except (TypeError, ValueError):
     _FALL_POSE_ACCEPTS_SENSITIVITY = False
 
-
+# To call is_person_in_fall_pose() in a backward-compatible way across different function signatures.
 def _is_person_in_fall_pose_compat(
     person_bbox,
     keypoints_data,

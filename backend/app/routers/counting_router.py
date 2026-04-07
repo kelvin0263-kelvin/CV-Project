@@ -37,6 +37,7 @@ from app.schemas.people_counting import (
 )
 from app.services.building_counter import (
     get_building_summary,
+    poll_building_capacity_alert,
     reset_camera_rollup,
     reset_building_runtime,
     restore_building_runtime,
@@ -93,7 +94,8 @@ def _serialize_counting_config_row(row: PeopleCountingConfig) -> dict:
         "cross_camera_pair_id": row.cross_camera_pair_id,
         "cross_camera_role": row.cross_camera_role,
         "verification_camera_id": row.verification_camera_id,
-        "verification_inward_threshold": row.verification_inward_threshold,
+        "primary_in_event_idle_timeout_sec": row.primary_in_event_idle_timeout_sec,
+        "primary_out_event_idle_timeout_sec": row.primary_out_event_idle_timeout_sec,
         "lines": row.lines or [],
         "frame_exclude_areas": frame_exclude_areas,
     }
@@ -130,7 +132,8 @@ def _cache_config(camera_id: str, row: PeopleCountingConfig):
         "cross_camera_pair_id": row.cross_camera_pair_id,
         "cross_camera_role": row.cross_camera_role,
         "verification_camera_id": row.verification_camera_id,
-        "verification_inward_threshold": row.verification_inward_threshold,
+        "primary_in_event_idle_timeout_sec": row.primary_in_event_idle_timeout_sec,
+        "primary_out_event_idle_timeout_sec": row.primary_out_event_idle_timeout_sec,
         "lines": row.lines or [],
         "frame_exclude_areas": frame_exclude_areas,
     }
@@ -621,6 +624,11 @@ async def counting_snapshot_persistence_loop():
     while True:
         await asyncio.sleep(5)
         _queue_building_snapshot_if_needed()
+        building_alert = poll_building_capacity_alert()
+        if building_alert:
+            from app.services.video_processor import queue_violation_event
+
+            queue_violation_event(building_alert)
 
         items = _drain_snapshot_queue()
         building_items = _drain_building_snapshot_queue()
@@ -847,7 +855,8 @@ async def sync_counting_runtime_from_db(session: AsyncSession):
             "cross_camera_pair_id": row.cross_camera_pair_id,
             "cross_camera_role": row.cross_camera_role,
             "verification_camera_id": row.verification_camera_id,
-            "verification_inward_threshold": row.verification_inward_threshold,
+            "primary_in_event_idle_timeout_sec": row.primary_in_event_idle_timeout_sec,
+            "primary_out_event_idle_timeout_sec": row.primary_out_event_idle_timeout_sec,
             "lines": row.lines or [],
             "frame_exclude_areas": frame_exclude_areas,
         }
@@ -990,10 +999,15 @@ async def upsert_config(
         existing_role=row.cross_camera_role if row is not None else "none",
         verification_camera_id=verification_camera_id,
     )
-    verification_inward_threshold = (
-        float(update.verification_inward_threshold)
-        if update.verification_inward_threshold is not None
-        else float(row.verification_inward_threshold if row is not None else 0.02)
+    primary_in_event_idle_timeout_sec = (
+        max(0.0, float(update.primary_in_event_idle_timeout_sec))
+        if update.primary_in_event_idle_timeout_sec is not None
+        else float(row.primary_in_event_idle_timeout_sec if row is not None else 7.0)
+    )
+    primary_out_event_idle_timeout_sec = (
+        max(0.0, float(update.primary_out_event_idle_timeout_sec))
+        if update.primary_out_event_idle_timeout_sec is not None
+        else float(row.primary_out_event_idle_timeout_sec if row is not None else 7.0)
     )
     _validate_cross_camera_fields(
         camera_id=camera_id,
@@ -1019,7 +1033,8 @@ async def upsert_config(
             cross_camera_pair_id=cross_camera_pair_id,
             cross_camera_role=cross_camera_role,
             verification_camera_id=verification_camera_id,
-            verification_inward_threshold=max(0.0, verification_inward_threshold),
+            primary_in_event_idle_timeout_sec=primary_in_event_idle_timeout_sec,
+            primary_out_event_idle_timeout_sec=primary_out_event_idle_timeout_sec,
             lines=update.lines or [],
             frame_exclude_areas=frame_exclude_areas or [],
         )
@@ -1040,8 +1055,10 @@ async def upsert_config(
             row.cross_camera_role = cross_camera_role
         if update.verification_camera_id is not None:
             row.verification_camera_id = verification_camera_id
-        if update.verification_inward_threshold is not None:
-            row.verification_inward_threshold = max(0.0, verification_inward_threshold)
+        if update.primary_in_event_idle_timeout_sec is not None:
+            row.primary_in_event_idle_timeout_sec = primary_in_event_idle_timeout_sec
+        if update.primary_out_event_idle_timeout_sec is not None:
+            row.primary_out_event_idle_timeout_sec = primary_out_event_idle_timeout_sec
         if update.lines is not None:
             row.lines = update.lines
         if frame_exclude_areas is not None:

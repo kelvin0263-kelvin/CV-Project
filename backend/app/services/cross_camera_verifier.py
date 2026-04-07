@@ -3,8 +3,8 @@ import time
 import uuid
 
 
-DEFAULT_INWARD_THRESHOLD = 0.02
-DEFAULT_PRIMARY_EVENT_IDLE_TIMEOUT_SEC =  7.0
+DEFAULT_PRIMARY_IN_EVENT_IDLE_TIMEOUT_SEC = 7.0
+DEFAULT_PRIMARY_OUT_EVENT_IDLE_TIMEOUT_SEC = 7.0
 TRACK_STALE_TIMEOUT_SEC = 5.0
 LINE_SIDE_EPS = 0.002
 
@@ -60,11 +60,14 @@ def sync_cross_camera_runtime(counting_configs: dict[str, dict]) -> None:
         new_primary_pairs[camera_id] = {
             "pair_id": pair_id,
             "verifier_camera_id": verifier_camera_id,
-            "verification_inward_threshold": max(
-                0.0,
-                float(cfg.get("verification_inward_threshold", DEFAULT_INWARD_THRESHOLD) or DEFAULT_INWARD_THRESHOLD),
+            "primary_in_event_idle_timeout_sec": float(
+                cfg.get("primary_in_event_idle_timeout_sec", DEFAULT_PRIMARY_IN_EVENT_IDLE_TIMEOUT_SEC)
+                or DEFAULT_PRIMARY_IN_EVENT_IDLE_TIMEOUT_SEC
             ),
-            "primary_event_idle_timeout_sec": DEFAULT_PRIMARY_EVENT_IDLE_TIMEOUT_SEC,
+            "primary_out_event_idle_timeout_sec": float(
+                cfg.get("primary_out_event_idle_timeout_sec", DEFAULT_PRIMARY_OUT_EVENT_IDLE_TIMEOUT_SEC)
+                or DEFAULT_PRIMARY_OUT_EVENT_IDLE_TIMEOUT_SEC
+            ),
         }
         new_verifier_to_primary.setdefault(verifier_camera_id, set()).add(camera_id)
 
@@ -507,10 +510,7 @@ def _close_expired_primary_event(
     if active_event is None:
         return 0
 
-    idle_timeout = float(
-        pair_cfg.get("primary_event_idle_timeout_sec", DEFAULT_PRIMARY_EVENT_IDLE_TIMEOUT_SEC)
-        or DEFAULT_PRIMARY_EVENT_IDLE_TIMEOUT_SEC
-    )
+    idle_timeout = _primary_event_idle_timeout(pair_cfg, direction)
     last_activity_time = float(
         active_event.get("last_activity_time")
         or active_event.get("last_primary_time")
@@ -542,6 +542,18 @@ def _close_expired_primary_event(
     pair_state[last_key] = completed_event
     pair_state[active_key] = None
     return correction_delta
+
+
+def _primary_event_idle_timeout(pair_cfg: dict, direction: str) -> float:
+    if str(direction).lower() == "out":
+        return float(
+            pair_cfg.get("primary_out_event_idle_timeout_sec", DEFAULT_PRIMARY_OUT_EVENT_IDLE_TIMEOUT_SEC)
+            or DEFAULT_PRIMARY_OUT_EVENT_IDLE_TIMEOUT_SEC
+        )
+    return float(
+        pair_cfg.get("primary_in_event_idle_timeout_sec", DEFAULT_PRIMARY_IN_EVENT_IDLE_TIMEOUT_SEC)
+        or DEFAULT_PRIMARY_IN_EVENT_IDLE_TIMEOUT_SEC
+    )
 
 
 def _accept_verifier_track_for_event(

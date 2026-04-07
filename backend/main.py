@@ -117,7 +117,19 @@ async def lifespan(app: FastAPI):
             await conn.execute(
                 sa.text(
                     "ALTER TABLE people_counting_configs "
-                    "ADD COLUMN IF NOT EXISTS verification_inward_threshold DOUBLE PRECISION NOT NULL DEFAULT 0.02"
+                    "ADD COLUMN IF NOT EXISTS primary_in_event_idle_timeout_sec DOUBLE PRECISION NOT NULL DEFAULT 7.0"
+                )
+            )
+            await conn.execute(
+                sa.text(
+                    "ALTER TABLE people_counting_configs "
+                    "ADD COLUMN IF NOT EXISTS primary_out_event_idle_timeout_sec DOUBLE PRECISION NOT NULL DEFAULT 7.0"
+                )
+            )
+            await conn.execute(
+                sa.text(
+                    "ALTER TABLE people_counting_configs "
+                    "DROP COLUMN IF EXISTS verification_inward_threshold"
                 )
             )
             await conn.execute(

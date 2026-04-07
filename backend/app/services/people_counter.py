@@ -137,10 +137,15 @@ class _FootTrafficTrackState:
 # =============================================================================
 
 # Helper function: returns the signed cross product used for line-side calculations.
+# To determine which side of the directed line a → b a point lies on using the cross-product sign
+# Positive ： p  at line a -> b (upper side)
+# Negative ： p  at line a -> b (below side)
+# 0：p online
 def _cross_product_sign(a, b, p):
     return (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
 
 # Helper function: uses ray casting to test whether a normalized point lies inside a polygon.
+# To determine whether a point lies inside a polygon.
 def _point_in_polygon(point, polygon):
     x, y = point
     n = len(polygon)
@@ -161,6 +166,8 @@ def _point_in_polygon(point, polygon):
 # Config Helpers
 # =============================================================================
 
+# To extract and normalize valid active-zone polygons from the configuration before counting starts.
+# At least 3 point
 def _extract_active_zones(config: dict) -> list[dict]:
     """Helper function: normalizes active-zone polygons from config before counting starts."""
     normalized: list[dict] = []
@@ -341,6 +348,7 @@ class PeopleCounter:
         }
 
     # Core helper: tells the caller when current totals should be persisted or emitted again.
+    # To decide whether a new snapshot should be saved when counts change or the heartbeat interval is reached.
     def should_snapshot(self, heartbeat_interval: float = 300.0) -> bool:
         now = time.time()
         occupancy = max(0, self.total_in - self.total_out)
@@ -370,6 +378,7 @@ class PeopleCounter:
         return False
 
     # Core helper: builds a snapshot payload for storing the current totals of one camera.
+    # To build a snapshot record containing the current counting and occupancy data for a camera.
     def get_snapshot_data(self, camera_id: str) -> dict:
         occupancy = max(0, self.total_in - self.total_out)
         return {
@@ -385,6 +394,7 @@ class PeopleCounter:
         }
 
     # Core helper: restores persisted totals after an RTSP runtime restart so counting can resume from the latest snapshot.
+    # To restore previously saved counting values and update the snapshot baseline accordingly
     def restore_counts(
         self,
         *,
@@ -409,6 +419,7 @@ class PeopleCounter:
         self._last_snapshot_time = time.time()
 
     # Core function: hot-reloads line and zone settings while preserving accumulated counts.
+    # o hot-reload the counter configuration while preserving accumulated counts and resetting tracking state only when line settings change
     def update_config(self, config: dict):
         self.lines = config.get("lines", [])
         self.active_zones = _extract_active_zones(config)
@@ -425,6 +436,7 @@ class PeopleCounter:
         self._sync_line_track_states()
 
     # Core function: clears runtime state and totals, typically when restarting or looping video.
+    # To fully reset the counter’s tracking and counting state back to a fresh initial state.
     def reset(self):
         self._line_track_states = {}
         self._foot_traffic_track_states = {}
@@ -448,6 +460,7 @@ class PeopleCounter:
 
 
     # Helper function: creates a stable signature so config changes can reset per-line runtime state.
+    # To build a comparable signature for the current line configuration so changes can be detected reliably.
     def _build_line_signature(self, lines: list[dict]) -> tuple:
         signature: list[tuple] = []
         for idx, line_cfg in enumerate(lines):
@@ -468,6 +481,7 @@ class PeopleCounter:
         return tuple(signature)
 
     # Helper function: keeps internal state dictionaries aligned with the currently configured lines.
+    # To synchronize internal track-state dictionaries so they match only the currently active occupancy and foot-traffic lines.
     def _sync_line_track_states(self):
         active_line_keys = {
             self._line_state_key(line_cfg, idx)
@@ -493,10 +507,12 @@ class PeopleCounter:
         }
 
     # Helper function: returns the internal dictionary key used to store state for one line.
+    # To generate a stable state key for identifying a line’s tracking and counting state.
     def _line_state_key(self, line_cfg: dict, index: int) -> str:
         return str(line_cfg.get("id") or line_cfg.get("name") or f"line_{index}")
 
     # Helper function: decides whether a track should keep aging for minimum-frame occupancy checks.
+    # To determine whether track frames should continue accumulating based on the point’s position relative to active zones.
     def _should_accumulate_track_frames(self, point: tuple[float, float] | None) -> bool:
         if point is None:
             return False
@@ -524,46 +540,63 @@ class PeopleCounter:
     # ========================================================================
 
     # Core helper: updates one occupancy track against one line and returns any new IN or OUT count.
+    # Handle：
+
+    ### A line
+    ### A track_id
+    ### A Track id anchor point right_point
+
+    # Deicde below：
+
+    # update the person on Line state (Single Line)
+    # decide count
+    # if     count，return 1
+    # if not count，return 0
     def _update_line_track_state(
         self,
-        line_key: str,
+        line_key: str,# line key to find track state table
         line_name: str,
-        line_cfg: dict,
+        line_cfg: dict, # line config like point,direction,line type
         track_id: int,
         right_point: tuple[float, float] | None,
         now: float,
     ) -> int:
-        if right_point is None:
+        if right_point is None: # if no point direct return
             return 0
 
-        states = self._line_track_states.setdefault(line_key, {})
-        ts = states.get(track_id)
-        curr_side = self._line_target_side_value(line_cfg, right_point)
-        count_event = self._line_count_event(line_cfg)
-        required_frames = self._line_min_track_frames(line_cfg)
-        in_active_zone = self._is_inside_active_zone(right_point)
-        active_zone_arm_frames = self._out_zone_arm_min_frames(line_cfg)
+        states = self._line_track_states.setdefault(line_key, {}) # get the track state dict
+        ts = states.get(track_id) # the ""state of the track id" on this line
+        curr_side = self._line_target_side_value(line_cfg, right_point) # calculate which side the point at
+        count_event = self._line_count_event(line_cfg) # determine in or out event
+        required_frames = self._line_min_track_frames(line_cfg) # min frames
+        in_active_zone = self._is_inside_active_zone(right_point) # cuurent point in active zone?
+        active_zone_arm_frames = self._out_zone_arm_min_frames(line_cfg) # out line need at least how many frames
 
-        if ts is None:
+        if ts is None: # mean first time see the track
             ts = _LineTrackState()
             ts.last_seen_time = now
-            ts.frame_count = self._line_track_frame_totals.get(int(track_id), 0)
-            persistent_birth_point = self._persistent_birth_points.get(int(track_id))
-            persistent_birth_in_active_zone = self._persistent_birth_in_active_zone.get(int(track_id))
+            ts.frame_count = self._line_track_frame_totals.get(int(track_id), 0) # bring the frames that the track already acuumulated 
+            persistent_birth_point = self._persistent_birth_points.get(int(track_id)) # get the birth point
+            persistent_birth_in_active_zone = self._persistent_birth_in_active_zone.get(int(track_id)) # store as birth point in the active zone
             if persistent_birth_point is None:
                 persistent_birth_point = right_point
                 self._persistent_birth_points[int(track_id)] = persistent_birth_point
                 persistent_birth_in_active_zone = bool(in_active_zone)
                 self._persistent_birth_in_active_zone[int(track_id)] = persistent_birth_in_active_zone
+
+            # write all value in to state    
             ts.birth_point = persistent_birth_point
             ts.born_in_active_zone = bool(persistent_birth_in_active_zone)
             ts.last_right_point = right_point
             ts.last_in_side_value = curr_side
             ts.last_in_active_zone = in_active_zone
-            if count_event == LINE_EVENT_OUT and in_active_zone:
+
+
+            if count_event == LINE_EVENT_OUT and in_active_zone: # if outline and birth at active zone
                 ts.active_zone_streak = 1
                 ts.out_zone_armed = active_zone_arm_frames <= 1
-            states[track_id] = ts
+            # store the ts state     
+            states[track_id] = ts 
             self._log_live_track_frame(
                 track_id,
                 line_name,
@@ -576,23 +609,29 @@ class PeopleCounter:
                 out_zone_armed=ts.out_zone_armed,
                 active_zone_streak=ts.active_zone_streak,
             )
-            return 0
+            return 0 # due to first time so never count
 
+        # here mean the ts see before
+        
+        # previous frame info
         prev_point = ts.last_right_point
         prev_side = ts.last_in_side_value
         prev_in_active_zone = ts.last_in_active_zone
         prev_active_zone_streak = ts.active_zone_streak
-        cross_point = self._line_crossing_point(prev_point, right_point, prev_side, curr_side)
-        crossing_point_in_active_zone = self._is_inside_active_zone(cross_point or right_point)
 
+        cross_point = self._line_crossing_point(prev_point, right_point, prev_side, curr_side) # count crossing point prev_point -> right_point
+        crossing_point_in_active_zone = self._is_inside_active_zone(cross_point or right_point) # and then determine whether this crossing point on active zone?
+
+        # update the latest ts state
         ts.last_seen_time = now
         ts.frame_count = self._line_track_frame_totals.get(int(track_id), ts.frame_count)
         ts.last_right_point = right_point
         ts.last_in_side_value = curr_side
         ts.last_in_active_zone = in_active_zone
+
         if count_event == LINE_EVENT_OUT and in_active_zone:
             ts.active_zone_streak += 1
-            if ts.active_zone_streak >= active_zone_arm_frames:
+            if ts.active_zone_streak >= active_zone_arm_frames: # if reacd threahold set = True
                 ts.out_zone_armed = True
         elif count_event == LINE_EVENT_OUT and not in_active_zone:
             ts.active_zone_streak = 0
@@ -630,16 +669,20 @@ class PeopleCounter:
             )
 
         max_frames = self._line_max_track_frames(line_cfg)
+
+        # Start Check IN logic
+        ### if line is IN AND last point is source side now reach "target side"
+        ### So mean cross the IN line
         if count_event == LINE_EVENT_IN and prev_side <= DEFAULT_LINE_SIDE_EPS and curr_side > DEFAULT_LINE_SIDE_EPS:
             direction = "IN"
-            if (
-                crossing_point_in_active_zone
-                and ts.frame_count >= required_frames
-                and (max_frames is None or ts.frame_count <= max_frames)
-                and self._can_count_in(track_id, now)
+            if ( ## Another If
+                crossing_point_in_active_zone # cross point must at active zone
+                and ts.frame_count >= required_frames # must reach min frames
+                and (max_frames is None or ts.frame_count <= max_frames) # can not reach max frames
+                and self._can_count_in(track_id, now) # must exceed in coldnow time 
             ):
-                if self._register_count(track_id, direction, "line_cross", now):
-                    self._last_in_count_points[int(track_id)] = cross_point or right_point
+                if self._register_count(track_id, direction, "line_cross", now): ## if all pass Register IN Event first
+                    self._last_in_count_points[int(track_id)] = cross_point or right_point ## save last in point (use for OUT event)
                     self._log_count_event(
                         track_id,
                         direction,
@@ -679,7 +722,7 @@ class PeopleCounter:
                         out_zone_armed=ts.out_zone_armed,
                         active_zone_streak=ts.active_zone_streak,
                     )
-                    return 1
+                    return 1 ## return count 1
             if DEBUG_COUNTING:
                 reasons: list[str] = []
                 if not crossing_point_in_active_zone:
@@ -708,21 +751,26 @@ class PeopleCounter:
                     )
                 )
 
+
+        # Start Check OUT logic
         if count_event == LINE_EVENT_OUT:
-            counted_in_record = self._counted_in_tracks.get(int(track_id))
-            has_active_in_reference = counted_in_record is not None and not counted_in_record.uncounted
+            counted_in_record = self._counted_in_tracks.get(int(track_id))  ## Find track id previous count IN point
+            has_active_in_reference = counted_in_record is not None and not counted_in_record.uncounted ## Whther being uncounted before
             reference_point = None
             reference_source = "none"
-            if has_active_in_reference and ts.born_in_active_zone:
+
+            #Decide OUT reference point use which one 
+            if has_active_in_reference and ts.born_in_active_zone: # if have count in record AND born in active zone
                 reference_point = ts.birth_point
                 reference_source = "birth_point"
-            elif has_active_in_reference:
+            elif has_active_in_reference: # if have count in record but not born in active zone
                 reference_point = self._last_in_count_points.get(int(track_id))
                 reference_source = "last_in_count"
-            elif ts.born_in_active_zone:
+            elif ts.born_in_active_zone: # if have not count in record but born in active zone (Most comon)
                 reference_point = ts.birth_point
                 reference_source = "birth_point"
 
+            # calculate travel distrance using current point with reference point
             travel_distance = (
                 math.dist(reference_point, right_point)
                 if reference_point is not None
@@ -730,14 +778,16 @@ class PeopleCounter:
             )
             min_travel_distance = self._out_travel_min_distance(line_cfg)
 
+
+            ### Out event Logic Start here
             if (
-                reference_point is not None
-                and curr_side > DEFAULT_LINE_SIDE_EPS
+                reference_point is not None 
+                and curr_side > DEFAULT_LINE_SIDE_EPS ## at out side
                 and ts.frame_count >= required_frames
-                and travel_distance >= min_travel_distance
+                and travel_distance >= min_travel_distance ## enough distance
             ):
-                if self._register_count(track_id, "OUT", "travel_exit", now):
-                    self._last_in_count_points.pop(int(track_id), None)
+                if self._register_count(track_id, "OUT", "travel_exit", now): # Register OUT event
+                    self._last_in_count_points.pop(int(track_id), None) # clear _last_in_count_points
                     self._log_count_event(
                         track_id,
                         "OUT",
@@ -779,7 +829,7 @@ class PeopleCounter:
                         out_zone_armed=ts.out_zone_armed,
                         active_zone_streak=ts.active_zone_streak,
                     )
-                    return 1
+                    return 1  ## sucessful out event return 1
             elif DEBUG_COUNTING and curr_side > DEFAULT_LINE_SIDE_EPS:
                 reasons: list[str] = []
                 if reference_point is None:
@@ -915,13 +965,17 @@ class PeopleCounter:
         return (total_in, total_out)
 
     # Core helper: records a finalized count and blocks duplicate events for the same track ID.
+    # To register a confirmed IN or OUT count while preventing duplicate same-direction counts and replacing any opposite-direction record when needed.
+    # Never update global counter
     def _register_count(self, track_id: int, direction: str, source: str, now: float) -> bool:
-        direction = str(direction).upper()
+        direction = str(direction).upper() ## standalized all line direction become uppercase
         tid = int(track_id)
-        target_tracks = self._get_counted_track_store(direction)
+
+        # find target direction for counted store (in order to know which direction to store)
+        target_tracks = self._get_counted_track_store(direction) 
         opposite_tracks = self._get_counted_track_store("OUT" if direction == "IN" else "IN")
 
-        if tid in target_tracks:
+        if tid in target_tracks: # if track id is in target side dont update (prevent duplicate)
             if DEBUG_COUNTING:
                 record = target_tracks[tid]
                 print(
@@ -938,16 +992,20 @@ class PeopleCounter:
                 )
             return False
 
-        if opposite_tracks.pop(tid, None) is not None:
-            self._reset_track_frame_history(tid)
-        target_tracks[tid] = _CountedTrackRecord(
+        if opposite_tracks.pop(tid, None) is not None: # if opposite direction have this track id remove it like In delete Out or Out delete In
+            self._reset_track_frame_history(tid) # if remve the track id in the opposite direction also remove its accumulated frame
+        
+        # write the track id (into track record)
+        target_tracks[tid] = _CountedTrackRecord( 
             direction=direction,
             source=source,
             count_time=now,
         )
+
+
         if direction == "IN":
-            self._last_in_count_time[tid] = now
-            self._reset_track_frame_history(tid)
+            self._last_in_count_time[tid] = now ## record the last count in (for reversion and colddown)
+            self._reset_track_frame_history(tid) ## reset the frame history
         return True
 
     # Helper function: checks whether an IN event can pass duplicate and cooldown guards.
@@ -1034,8 +1092,20 @@ class PeopleCounter:
     # ========================================================================
     # Foot Traffic Logic
     # ========================================================================
+    # Handle：
 
+    ### A line
+    ### A track_id
+    ### A Track id target point
+
+    # Deicde below：
+
+    # update the person on Line state (Single Line)
+    # decide count
+    # if     count，return 1
+    # if not count，return 0
     # Core helper: updates one foot-traffic track and records a directional crossing when eligible.
+    ##### why dont need return???? 
     def _update_foot_traffic_track_state(
         self,
         line_key: str,
@@ -1048,12 +1118,12 @@ class PeopleCounter:
         if target_point is None:
             return
 
-        states = self._foot_traffic_track_states.setdefault(line_key, {})
-        ts = states.get(track_id)
-        curr_side = self._line_target_side_value(line_cfg, target_point)
-        in_active_zone = self._is_inside_active_zone(target_point)
+        states = self._foot_traffic_track_states.setdefault(line_key, {}) # get the track state dict
+        ts = states.get(track_id) # the state of track id on this line
+        curr_side = self._line_target_side_value(line_cfg, target_point) # # calculate which side the point at
+        in_active_zone = self._is_inside_active_zone(target_point) ## only for log info (traffic not use active zone)
 
-        if ts is None:
+        if ts is None: # mean first time see the track
             ts = _FootTrafficTrackState()
             ts.last_seen_time = now
             ts.last_point = target_point
@@ -1071,11 +1141,15 @@ class PeopleCounter:
             )
             return
 
+        # here mean the ts see before
+
+        # previous frame info
         prev_point = ts.last_point
         prev_side = ts.last_side_value
-        cross_point = self._line_crossing_point(prev_point, target_point, prev_side, curr_side)
-        crosses_segment = self._foot_traffic_crosses_segment(line_cfg, cross_point)
-        traffic_direction = self._foot_traffic_direction(
+
+        cross_point = self._line_crossing_point(prev_point, target_point, prev_side, curr_side) # count crossing point prev_point -> right_point
+        crosses_segment = self._foot_traffic_crosses_segment(line_cfg, cross_point) ### check wehter on the line only
+        traffic_direction = self._foot_traffic_direction( ## check the direction LEFT or RIGHT or NONE
             prev_point=prev_point,
             curr_point=target_point,
             line_cfg=line_cfg,
@@ -1083,6 +1157,7 @@ class PeopleCounter:
             curr_side=curr_side,
         )
 
+        #Update current track id state
         ts.last_seen_time = now
         ts.last_point = target_point
         ts.last_side_value = curr_side
@@ -1101,30 +1176,38 @@ class PeopleCounter:
             in_active_zone=in_active_zone,
         )
 
-        direction_already_counted = (
+        direction_already_counted = (                                             # check if left/right side count before or not
             ts.counted_right if traffic_direction == "right" else ts.counted_left
         ) if traffic_direction else False
-        track_already_counted = int(track_id) in self._counted_foot_traffic_tracks
-        allowed_direction = self._foot_traffic_allowed_direction(line_cfg)
 
+        track_already_counted = int(track_id) in self._counted_foot_traffic_tracks # checkk this track id record in foot traffic set before?
+        allowed_direction = self._foot_traffic_allowed_direction(line_cfg) # get the foot traffic line direction
+
+        #### foot traffic counting Logic
         if (
-            traffic_direction
-            and crosses_segment
-            and (allowed_direction is None or traffic_direction == allowed_direction)
-            and not track_already_counted
-            and not direction_already_counted
-            and traffic_direction != ts.last_count_direction
-            and ts.rearmed
-            and self._foot_traffic_cooldown_elapsed(ts, now, line_cfg)
+            traffic_direction # must have direction left or right
+            and crosses_segment # muust cross the line
+            and (allowed_direction is None or traffic_direction == allowed_direction) # must fulfill the line direction
+            and not track_already_counted ## must not count before 
+            and not direction_already_counted ## must not count before in same direction
+            and traffic_direction != ts.last_count_direction ## must not same direction with last time
+            and ts.rearmed ## must be rearmed
+            and self._foot_traffic_cooldown_elapsed(ts, now, line_cfg) ## must more than coldown time
         ):
-            self._register_foot_traffic_count(line_key, traffic_direction, line_cfg, track_id)
+            
+            self._register_foot_traffic_count(line_key, traffic_direction, line_cfg, track_id) # if all fulfill register count event
+
+            # upldate track id latest state
             ts.last_count_direction = traffic_direction
             ts.last_count_time = now
             ts.rearmed = False
+
             if traffic_direction == "right":
                 ts.counted_right = True
             else:
                 ts.counted_left = True
+
+            ## Log only
             self._log_count_event(
                 track_id,
                 traffic_direction.upper(),
@@ -1183,11 +1266,17 @@ class PeopleCounter:
         return summaries
 
     # Core helper: increments foot-traffic totals once a valid directional crossing is confirmed.
+    ## To record a confirmed foot-traffic count by updating 
+    # the line-level direction totals, (1)
+    # the overall foot-traffic totals, (2)
+    # and the counted-track set (3)
     def _register_foot_traffic_count(self, line_key: str, direction: str, line_cfg: dict, track_id: int) -> None:
-        counts = self._foot_traffic_line_counts.setdefault(line_key, {"left": 0, "right": 0})
-        normalized_direction = self._foot_traffic_bucket_direction(direction, line_cfg)
-        counts[normalized_direction] = int(counts.get(normalized_direction, 0) or 0) + 1
-        self._counted_foot_traffic_tracks.add(int(track_id))
+        counts = self._foot_traffic_line_counts.setdefault(line_key, {"left": 0, "right": 0})  ## locate this line count record IF dont have create a new one
+        normalized_direction = self._foot_traffic_bucket_direction(direction, line_cfg) ## normalized the count direction (based on line config)
+        counts[normalized_direction] = int(counts.get(normalized_direction, 0) or 0) + 1 ## update left/right count for this "line" + 1
+        self._counted_foot_traffic_tracks.add(int(track_id)) ## mark this track id is counted 
+        
+        ## here is update global foot traffic count
         if normalized_direction == "right":
             self.foot_traffic_right += 1
         else:

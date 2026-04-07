@@ -15,6 +15,7 @@ import React, { useRef, useEffect, useState, useCallback } from 'react';
  *   onLineDrawn      - callback({points, direction})
  *   onFrameExcludeAreaDrawn - callback({points})
  *   containerRef     - ref to the video container for sizing
+ *   displayArea      - exact rendered media area from the preview component
  */
 
 const FRAME_EXCLUDE_COLORS = {
@@ -36,10 +37,16 @@ const getFootTrafficLabelsForLine = (line) => {
         const dx = Number(end?.[0] ?? 0) - Number(start?.[0] ?? 0);
         const dy = Number(end?.[1] ?? 0) - Number(start?.[1] ?? 0);
         if (Math.abs(dy) >= Math.abs(dx)) {
-            return { negative: 'Left', positive: 'Right', shortNegative: 'L', shortPositive: 'R', mode: 'left_right' };
+            return dy >= 0
+                ? { negative: 'Right', positive: 'Left', shortNegative: 'R', shortPositive: 'L', mode: 'left_right' }
+                : { negative: 'Left', positive: 'Right', shortNegative: 'L', shortPositive: 'R', mode: 'left_right' };
         }
     }
-    return { negative: 'Down', positive: 'Up', shortNegative: 'D', shortPositive: 'U', mode: 'up_down' };
+    const [start, end] = points;
+    const dx = Number(end?.[0] ?? 0) - Number(start?.[0] ?? 0);
+    return dx >= 0
+        ? { negative: 'Up', positive: 'Down', shortNegative: 'U', shortPositive: 'D', mode: 'up_down' }
+        : { negative: 'Down', positive: 'Up', shortNegative: 'D', shortPositive: 'U', mode: 'up_down' };
 };
 
 const getFootTrafficSummaryLabels = (lines) => {
@@ -65,6 +72,8 @@ const CountingCanvas = ({
     onFrameExcludeAreaDrawn,
     containerRef,
     mediaSize = null,
+    displayArea = null,
+    showLiveSummary = true,
 }) => {
     const svgRef = useRef(null);
     const [svgSize, setSvgSize] = useState({ width: 640, height: 360 });
@@ -78,41 +87,72 @@ const CountingCanvas = ({
 
     // Sync SVG size and video area with container
     useEffect(() => {
+        if (displayArea) {
+            setSvgSize({
+                width: Number(displayArea.containerWidth) || 640,
+                height: Number(displayArea.containerHeight) || 360,
+            });
+            setVideoArea({
+                displayW: Number(displayArea.displayW) || 640,
+                displayH: Number(displayArea.displayH) || 360,
+                offsetX: Number(displayArea.offsetX) || 0,
+                offsetY: Number(displayArea.offsetY) || 0,
+            });
+            return undefined;
+        }
+
         const updateSize = () => {
-            if (containerRef?.current) {
-                const rect = containerRef.current.getBoundingClientRect();
-                const containerW = rect.width;
-                const containerH = rect.height;
-                setSvgSize({ width: containerW, height: containerH });
-
-                const mediaWidth = Number(mediaSize?.width) > 0 ? Number(mediaSize.width) : 640;
-                const mediaHeight = Number(mediaSize?.height) > 0 ? Number(mediaSize.height) : 360;
-                const imgAspect = mediaWidth / mediaHeight;
-                const containerAspect = containerW / containerH;
-
-                let displayW, displayH, offsetX, offsetY;
-                if (containerAspect > imgAspect) {
-                    displayH = containerH;
-                    displayW = containerH * imgAspect;
-                    offsetX = (containerW - displayW) / 2;
-                    offsetY = 0;
-                } else {
-                    displayW = containerW;
-                    displayH = containerW / imgAspect;
-                    offsetX = 0;
-                    offsetY = (containerH - displayH) / 2;
-                }
-                setVideoArea({ displayW, displayH, offsetX, offsetY });
+            if (!containerRef?.current) {
+                return;
             }
+
+            const rect = containerRef.current.getBoundingClientRect();
+            const containerW = rect.width || 640;
+            const containerH = rect.height || 360;
+            setSvgSize({ width: containerW, height: containerH });
+
+            const mediaWidth = Number(mediaSize?.width) > 0 ? Number(mediaSize.width) : 640;
+            const mediaHeight = Number(mediaSize?.height) > 0 ? Number(mediaSize.height) : 360;
+            const imgAspect = mediaWidth / mediaHeight;
+            const containerAspect = containerW / containerH;
+
+            let displayW;
+            let displayH;
+            let offsetX;
+            let offsetY;
+            if (containerAspect > imgAspect) {
+                displayH = containerH;
+                displayW = containerH * imgAspect;
+                offsetX = (containerW - displayW) / 2;
+                offsetY = 0;
+            } else {
+                displayW = containerW;
+                displayH = containerW / imgAspect;
+                offsetX = 0;
+                offsetY = (containerH - displayH) / 2;
+            }
+            setVideoArea({ displayW, displayH, offsetX, offsetY });
         };
+
         updateSize();
         window.addEventListener('resize', updateSize);
-        const interval = setInterval(updateSize, 500);
+
+        if (!containerRef?.current || typeof ResizeObserver === 'undefined') {
+            return () => {
+                window.removeEventListener('resize', updateSize);
+            };
+        }
+
+        const observer = new ResizeObserver(() => {
+            updateSize();
+        });
+        observer.observe(containerRef.current);
+
         return () => {
             window.removeEventListener('resize', updateSize);
-            clearInterval(interval);
+            observer.disconnect();
         };
-    }, [containerRef, mediaSize]);
+    }, [containerRef, displayArea, mediaSize]);
 
     const toNorm = useCallback((px, py) => {
         const { displayW, displayH, offsetX, offsetY } = videoArea;
@@ -377,7 +417,7 @@ const CountingCanvas = ({
             {renderDrawing()}
 
             {/* Live counting summary badge */}
-            {isCountingActive && (
+            {showLiveSummary && isCountingActive && (
                 <g>
                     <rect x={videoArea.offsetX + videoArea.displayW - 140}
                           y={videoArea.offsetY + videoArea.displayH - (showFootTraffic ? 66 : 50)}

@@ -15,7 +15,8 @@ class PeopleCountingConfig(Base):
     cross_camera_pair_id = Column(String(100), nullable=True)
     cross_camera_role = Column(String(20), nullable=False, default="none")
     verification_camera_id = Column(String, nullable=True)
-    verification_inward_threshold = Column(Float, nullable=False, default=0.02)
+    primary_in_event_idle_timeout_sec = Column(Float, nullable=False, default=7.0)
+    primary_out_event_idle_timeout_sec = Column(Float, nullable=False, default=7.0)
     # JSON: [{id, name, points: [[x1,y1],[x2,y2]], direction: "left_to_right"|"right_to_left"}]
     lines = Column(JSON, nullable=False, default=list)
     # JSON: [{id, name, points: [[x1,y1],[x2,y2],[x3,y3],...]}]

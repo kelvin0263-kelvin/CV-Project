@@ -84,34 +84,36 @@ def _build_rtsp_ffmpeg_capture_options(*, enable_hwaccel: bool | None = None) ->
     return _serialize_ffmpeg_capture_options(merged)
 
 
-def _build_capture_open_params(
-    *,
-    is_rtsp: bool,
-    enable_hwaccel: bool | None = None,
-) -> list[int]:
-    if not is_rtsp:
-        return []
-
-    params: list[int] = []
-    enable_nvdec = RTSP_ENABLE_NVDEC if enable_hwaccel is None else enable_hwaccel
-    buffer_size = RTSP_BUFFER_SIZE
-    open_timeout_ms = RTSP_OPEN_TIMEOUT_MS
-    read_timeout_ms = RTSP_READ_TIMEOUT_MS
-    hw_device = RTSP_HW_DEVICE
-
-    if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
-        params.extend([cv2.CAP_PROP_BUFFERSIZE, buffer_size])
-    if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
-        params.extend([cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, open_timeout_ms])
-    if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
-        params.extend([cv2.CAP_PROP_READ_TIMEOUT_MSEC, read_timeout_ms])
-    if enable_nvdec and hasattr(cv2, "CAP_PROP_HW_ACCELERATION"):
-        accel_any = getattr(cv2, "VIDEO_ACCELERATION_ANY", 1)
-        params.extend([cv2.CAP_PROP_HW_ACCELERATION, int(accel_any)])
-    if enable_nvdec and hw_device >= 0 and hasattr(cv2, "CAP_PROP_HW_DEVICE"):
-        params.extend([cv2.CAP_PROP_HW_DEVICE, hw_device])
-
-    return params
+# Currently unused. RTSP capture setup uses FFmpeg env options plus
+# _apply_rtsp_capture_fallback_props() instead of constructor open params.
+# def _build_capture_open_params(
+#     *,
+#     is_rtsp: bool,
+#     enable_hwaccel: bool | None = None,
+# ) -> list[int]:
+#     if not is_rtsp:
+#         return []
+#
+#     params: list[int] = []
+#     enable_nvdec = RTSP_ENABLE_NVDEC if enable_hwaccel is None else enable_hwaccel
+#     buffer_size = RTSP_BUFFER_SIZE
+#     open_timeout_ms = RTSP_OPEN_TIMEOUT_MS
+#     read_timeout_ms = RTSP_READ_TIMEOUT_MS
+#     hw_device = RTSP_HW_DEVICE
+#
+#     if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+#         params.extend([cv2.CAP_PROP_BUFFERSIZE, buffer_size])
+#     if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
+#         params.extend([cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, open_timeout_ms])
+#     if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+#         params.extend([cv2.CAP_PROP_READ_TIMEOUT_MSEC, read_timeout_ms])
+#     if enable_nvdec and hasattr(cv2, "CAP_PROP_HW_ACCELERATION"):
+#         accel_any = getattr(cv2, "VIDEO_ACCELERATION_ANY", 1)
+#         params.extend([cv2.CAP_PROP_HW_ACCELERATION, int(accel_any)])
+#     if enable_nvdec and hw_device >= 0 and hasattr(cv2, "CAP_PROP_HW_DEVICE"):
+#         params.extend([cv2.CAP_PROP_HW_DEVICE, hw_device])
+#
+#     return params
 
 
 def _build_cudacodec_source_params() -> list[int]:

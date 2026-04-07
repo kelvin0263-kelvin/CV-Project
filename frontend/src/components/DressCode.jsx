@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
+    AlertTriangle,
     Camera,
     Check,
     Eye,
@@ -42,6 +43,24 @@ const LABEL_OPTIONS = [
 ];
 
 const labelOptionMap = Object.fromEntries(LABEL_OPTIONS.map((item) => [item.id, item]));
+const CATEGORY_GROUPS = [
+    {
+        id: 'pants',
+        title: 'Lower Body',
+        description: '',
+        items: ['shorts', 'long_pants'],
+        accent: 'red',
+        badge: 'Pants',
+    },
+    {
+        id: 'slipper',
+        title: 'Footwear',
+        description: '',
+        items: ['slipper', 'non_slipper'],
+        accent: 'amber',
+        badge: 'Footwear',
+    },
+];
 
 const isRealtimeStreamSource = (camera) =>
     camera?.source_kind === 'rtsp'
@@ -121,26 +140,39 @@ const buildDetectionItems = (detections) => {
     return items.sort((a, b) => (Number(b.confidence) || 0) - (Number(a.confidence) || 0));
 };
 
-const ToggleRow = ({ title, description, enabled, onToggle, accent = 'blue' }) => {
+const ToggleRow = ({ title, description, enabled, onToggle, accent = 'blue', disabled = false, badge = null }) => {
     const accentClasses = {
         blue: enabled ? 'border-blue-400/60 bg-blue-50' : 'border-slate-200 bg-white',
         emerald: enabled ? 'border-emerald-400/60 bg-emerald-50' : 'border-slate-200 bg-white',
+        slate: enabled ? 'border-slate-400/60 bg-slate-100' : 'border-slate-200 bg-white',
+    };
+    const trackClasses = {
+        blue: enabled ? 'bg-blue-600' : 'bg-slate-200',
+        emerald: enabled ? 'bg-emerald-600' : 'bg-slate-200',
+        slate: enabled ? 'bg-slate-700' : 'bg-slate-200',
     };
 
     return (
         <button
             type="button"
             onClick={onToggle}
+            disabled={disabled}
             className={cn(
                 'flex w-full items-center justify-between rounded-2xl border p-4 text-left transition-all hover:border-blue-300 hover:shadow-sm',
                 accentClasses[accent] || accentClasses.blue,
+                disabled && 'cursor-not-allowed opacity-50 hover:border-slate-200 hover:shadow-none',
             )}
         >
             <div className="space-y-1 pr-4">
+                {badge && (
+                    <div className="inline-flex rounded-full bg-white/80 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                        {badge}
+                    </div>
+                )}
                 <p className="text-sm font-semibold text-slate-900">{title}</p>
                 <p className="text-xs leading-relaxed text-slate-500">{description}</p>
             </div>
-            <div className={cn('relative h-7 w-14 rounded-full transition-colors', enabled ? 'bg-blue-600' : 'bg-slate-200')}>
+            <div className={cn('relative h-7 w-14 rounded-full transition-colors', trackClasses[accent] || trackClasses.blue)}>
                 <div
                     className={cn(
                         'absolute top-1 h-5 w-5 rounded-full bg-white shadow-sm transition-all',
@@ -152,7 +184,7 @@ const ToggleRow = ({ title, description, enabled, onToggle, accent = 'blue' }) =
     );
 };
 
-const ThresholdSlider = ({ title, description, value, onChange, accent = 'blue' }) => {
+const ThresholdSlider = ({ title, description, value, onChange, accent = 'blue', disabled = false }) => {
     const accentStyles = {
         blue: {
             badge: 'bg-blue-100 text-blue-700',
@@ -167,7 +199,7 @@ const ThresholdSlider = ({ title, description, value, onChange, accent = 'blue' 
     const styles = accentStyles[accent] || accentStyles.blue;
 
     return (
-        <div className="rounded-3xl border border-slate-200 bg-slate-50/70 p-4">
+        <div className={cn('rounded-3xl border border-slate-200 bg-slate-50/70 p-4', disabled && 'opacity-50')}>
             <div className="flex items-center justify-between gap-4">
                 <div className="pr-3">
                     <div className="flex items-center gap-2">
@@ -189,11 +221,107 @@ const ThresholdSlider = ({ title, description, value, onChange, accent = 'blue' 
                 step="1"
                 value={value}
                 onChange={(event) => onChange(Number(event.target.value))}
+                disabled={disabled}
                 className={cn(
                     'mt-4 h-2 w-full cursor-pointer appearance-none rounded-full bg-slate-200',
                     styles.slider,
+                    disabled && 'cursor-not-allowed',
                 )}
             />
+        </div>
+    );
+};
+
+const RestrictedCategoryCard = ({
+    title,
+    description,
+    badge,
+    accent = 'red',
+    disabled = false,
+    items,
+    restrictedLabels,
+    onToggle,
+}) => {
+    const accentStyles = {
+        red: {
+            badge: 'bg-red-100 text-red-700',
+            activeCard: 'border-red-300 bg-red-50',
+            activeIcon: 'bg-red-500 text-white',
+            activeState: 'text-red-600',
+        },
+        amber: {
+            badge: 'bg-amber-100 text-amber-700',
+            activeCard: 'border-amber-300 bg-amber-50',
+            activeIcon: 'bg-amber-500 text-white',
+            activeState: 'text-amber-700',
+        },
+    };
+    const styles = accentStyles[accent] || accentStyles.red;
+
+    return (
+        <div className={cn('rounded-[28px] border border-slate-200 bg-white p-4 shadow-sm', disabled && 'opacity-50')}>
+            <div className="flex items-start justify-between gap-3">
+                <div>
+                    <div className={cn('inline-flex rounded-full px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em]', styles.badge)}>
+                        {badge}
+                    </div>
+                    <h3 className="mt-3 text-lg font-semibold text-slate-950">{title}</h3>
+                    <p className="mt-1 text-sm leading-relaxed text-slate-500">{description}</p>
+                </div>
+                <div className={cn(
+                    'rounded-full px-3 py-1 text-xs font-medium',
+                    disabled ? 'bg-slate-100 text-slate-500' : 'bg-emerald-50 text-emerald-700',
+                )}>
+                    {disabled ? 'Classifier off' : 'Ready'}
+                </div>
+            </div>
+
+            <div className="mt-4 grid gap-3">
+                {items.map((item) => {
+                    const option = labelOptionMap[item];
+                    const isRestricted = restrictedLabels.includes(item);
+                    return (
+                        <button
+                            key={item}
+                            type="button"
+                            disabled={disabled}
+                            onClick={() => onToggle(item)}
+                            className={cn(
+                                'grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-4 rounded-2xl border p-4 text-left transition-all',
+                                isRestricted ? styles.activeCard : 'border-slate-200 bg-slate-50 hover:border-slate-300',
+                                disabled && 'cursor-not-allowed',
+                            )}
+                        >
+                            <div className={cn(
+                                'flex h-11 w-11 items-center justify-center rounded-2xl',
+                                isRestricted ? styles.activeIcon : 'bg-white text-slate-500',
+                            )}>
+                                <ShieldCheck className="h-4 w-4" />
+                            </div>
+                            <div className="min-w-0">
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <span className="text-base font-semibold text-slate-900">{option?.name}</span>
+                                    <span className={cn(
+                                        'rounded-full px-2.5 py-1 text-[11px] font-semibold',
+                                        isRestricted ? 'bg-white/80 text-slate-700' : 'bg-white text-slate-500',
+                                    )}>
+                                        {isRestricted ? 'Restricted' : 'Allowed'}
+                                    </span>
+                                </div>
+                                <p className="mt-1 text-sm text-slate-500">{option?.description}</p>
+                            </div>
+                            <div className={cn('relative h-7 w-14 rounded-full transition-colors', isRestricted ? 'bg-red-500' : 'bg-slate-200')}>
+                                <div
+                                    className={cn(
+                                        'absolute top-1 h-5 w-5 rounded-full bg-white shadow-sm transition-all',
+                                        isRestricted ? 'left-8' : 'left-1',
+                                    )}
+                                />
+                            </div>
+                        </button>
+                    );
+                })}
+            </div>
         </div>
     );
 };
@@ -292,6 +420,20 @@ const DressCode = () => {
         () => cameras.find((camera) => camera.id === selectedCameraId) || null,
         [cameras, selectedCameraId],
     );
+    const quickSelectorCameras = useMemo(
+        () => [...cameras].sort((left, right) => {
+            const leftMonitored = enabledCameraIds.includes(left.id) ? 0 : 1;
+            const rightMonitored = enabledCameraIds.includes(right.id) ? 0 : 1;
+            if (leftMonitored !== rightMonitored) {
+                return leftMonitored - rightMonitored;
+            }
+            return String(left?.name || '').localeCompare(String(right?.name || ''), undefined, {
+                numeric: true,
+                sensitivity: 'base',
+            });
+        }),
+        [cameras, enabledCameraIds],
+    );
 
     const previewStreamUrl = selectedCameraId ? getWSUrl(`/ws/${selectedCameraId}`) : null;
     const showStoppedUploadPreview = Boolean(
@@ -347,6 +489,10 @@ const DressCode = () => {
         () => (Array.isArray(previewDetections) ? previewDetections.filter((item) => item?.violation).length : 0),
         [previewDetections],
     );
+    const monitoredCount = enabledCameraIds.length;
+    const policyControlsDisabled = !policyEnabled;
+    const pantsControlsDisabled = !policyEnabled || !enablePantsDetection;
+    const slipperControlsDisabled = !policyEnabled || !enableSlipperDetection;
 
     const toggleCameraMonitoring = (cameraId) => {
         setEnabledCameraIds((prev) => (
@@ -426,10 +572,7 @@ const DressCode = () => {
                     <div className="space-y-4">
                         <div className="space-y-2">
                             <h1 className="text-3xl font-bold tracking-tight text-slate-950">Dress Code Policy</h1>
-                            <p className="max-w-3xl text-sm leading-relaxed text-slate-600">
-                                Review one camera at a time, watch the live stream or uploaded preview, and tune the rules
-                                that decide which clothing and footwear labels should trigger a violation.
-                            </p>
+                           
                         </div>
                     </div>
 
@@ -506,6 +649,58 @@ const DressCode = () => {
                     </CardHeader>
 
                     <CardContent className="space-y-5 p-5">
+                        {quickSelectorCameras.length > 0 && (
+                            <div className="space-y-3 rounded-3xl border border-slate-200 bg-slate-50/70 p-4">
+                                <div className="flex items-center justify-between gap-3">
+                                    <div>
+                                        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Quick Preview Selector</p>
+                                        <p className="mt-1 text-sm text-slate-500">
+                                            Switch preview cameras here without scrolling to the coverage section.
+                                        </p>
+                                    </div>
+                                    <span className="rounded-full bg-white px-3 py-1 text-xs font-medium text-slate-600 shadow-sm">
+                                        {quickSelectorCameras.length} camera{quickSelectorCameras.length === 1 ? '' : 's'}
+                                    </span>
+                                </div>
+
+                                <div className="flex gap-2 overflow-x-auto pb-1">
+                                    {quickSelectorCameras.map((camera) => {
+                                        const isActive = camera.id === selectedCameraId;
+                                        const isMonitored = enabledCameraIds.includes(camera.id);
+                                        return (
+                                            <button
+                                                key={camera.id}
+                                                type="button"
+                                                onClick={() => setSelectedCameraId(camera.id)}
+                                                className={cn(
+                                                    'shrink-0 rounded-2xl border px-4 py-3 text-left transition-all',
+                                                    isActive
+                                                        ? 'border-blue-400 bg-blue-50 shadow-sm'
+                                                        : 'border-slate-200 bg-white hover:border-blue-200 hover:bg-slate-50',
+                                                )}
+                                            >
+                                                <div className="flex items-center gap-2">
+                                                    <span className={cn(
+                                                        'h-2.5 w-2.5 rounded-full',
+                                                        isMonitored ? 'bg-emerald-500' : 'bg-slate-300',
+                                                    )}
+                                                    />
+                                                    <span className="max-w-[160px] truncate text-sm font-semibold text-slate-900">
+                                                        {camera.name}
+                                                    </span>
+                                                </div>
+                                                <div className="mt-1 flex items-center gap-2 text-xs text-slate-500">
+                                                    <span>{isMonitored ? 'Monitored' : 'Preview only'}</span>
+                                                    <span>•</span>
+                                                    <span>{camera.is_uploaded && !camera.producer_running ? 'Still preview' : 'Live preview'}</span>
+                                                </div>
+                                            </button>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+                        )}
+
                         {selectedCamera ? (
                             <>
                                 <div className="relative overflow-hidden rounded-[24px] border border-slate-200 bg-slate-950 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)]">
@@ -665,134 +860,135 @@ const DressCode = () => {
 
                 <div className="order-1 grid gap-6 xl:order-1">
                     <Card className="border-slate-200/80 bg-white/95 shadow-sm">
-                        <CardHeader>
-                            <CardTitle className="text-2xl">Detection Settings</CardTitle>
-                            <CardDescription>
-                                Control whether dress code analysis runs at all, and decide which classifiers should be active.
-                            </CardDescription>
-                        </CardHeader>
-                        <CardContent className="space-y-4">
+                        <CardHeader className="space-y-4">
+                            <div className="flex items-start justify-between gap-4">
+                                <div>
+                                    <CardTitle className="text-2xl">Dress Code Control</CardTitle>
+                                    {/* <CardDescription className="mt-1 max-w-xl">
+                                        Keep this master switch obvious. When it is off, the detection settings and restricted categories below become read-only and visually muted.
+                                    </CardDescription> */}
+                                </div>
+                                <div className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600">
+                                    {monitoredCount} monitored camera{monitoredCount === 1 ? '' : 's'}
+                                </div>
+                            </div>
+
                             <ToggleRow
                                 title="Enable Dress Code Detection"
-                                description="Turns the whole dress code pipeline on or off for the selected monitored cameras."
+                                description="The main policy switch. Turn this off to pause all dress code classification and rule enforcement."
                                 enabled={policyEnabled}
                                 onToggle={() => {
                                     setPolicyEnabled((current) => !current);
                                     setSaved(false);
                                 }}
-                            />
-                            <ToggleRow
-                                title="Enable Pants Detection"
-                                description="Runs the short and long pants classifier only when this switch is enabled."
-                                enabled={enablePantsDetection}
-                                onToggle={() => {
-                                    setEnablePantsDetection((current) => !current);
-                                    setSaved(false);
-                                }}
-                                accent="emerald"
-                            />
-                            <ToggleRow
-                                title="Enable Slipper Detection"
-                                description="Runs the slipper classifier only when this switch is enabled."
-                                enabled={enableSlipperDetection}
-                                onToggle={() => {
-                                    setEnableSlipperDetection((current) => !current);
-                                    setSaved(false);
-                                }}
-                                accent="emerald"
+                                accent="blue"
+                                badge="Master Switch"
                             />
 
-                            <ThresholdSlider
-                                title="Pants Threshold"
-                                description="Minimum confidence required before a shorts or long pants label is treated as a violation."
-                                value={pantsConfidence}
-                                onChange={(value) => {
-                                    setPantsConfidence(value);
-                                    setSaved(false);
-                                }}
-                                accent="blue"
-                            />
-                            <ThresholdSlider
-                                title="Slipper Threshold"
-                                description="Minimum confidence required before a slipper or non-slipper label is treated as a violation."
-                                value={slipperConfidence}
-                                onChange={(value) => {
-                                    setSlipperConfidence(value);
-                                    setSaved(false);
-                                }}
-                                accent="emerald"
-                            />
+                            {!policyEnabled && (
+                                <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                                    <div className="flex items-start gap-3">
+                                        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                                        <div>
+                                            <p className="font-semibold">Dress code detection is currently off</p>
+                                            <p className="mt-1 text-amber-700">
+                                                All classifier settings and restricted-category controls are temporarily disabled until the master switch is turned back on.
+                                            </p>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+                        </CardHeader>
+                    </Card>
+
+                    <Card className="border-slate-200/80 bg-white/95 shadow-sm">
+                        <CardHeader>
+                            <CardTitle className="text-2xl">Detection Settings</CardTitle>
+                            {/* <CardDescription>
+                                Only show threshold controls when their matching classifier is enabled, so each setting feels directly connected to its effect.
+                            </CardDescription> */}
+                        </CardHeader>
+                        <CardContent className="space-y-4">
+                            <div className={cn('space-y-4', policyControlsDisabled && 'pointer-events-none')}>
+                                <ToggleRow
+                                    title="Enable Pants Detection"
+                                    description="Runs the shorts and long-pants classifier. Lower Body rules depend on this switch."
+                                    enabled={enablePantsDetection}
+                                    onToggle={() => {
+                                        setEnablePantsDetection((current) => !current);
+                                        setSaved(false);
+                                    }}
+                                    accent="emerald"
+                                    disabled={policyControlsDisabled}
+                                    badge="Lower Body"
+                                />
+                                {enablePantsDetection && (
+                                    <ThresholdSlider
+                                        title="Pants Threshold"
+                                        description="Minimum confidence required before shorts or long pants results are used for restriction checks."
+                                        value={pantsConfidence}
+                                        onChange={(value) => {
+                                            setPantsConfidence(value);
+                                            setSaved(false);
+                                        }}
+                                        accent="blue"
+                                        disabled={pantsControlsDisabled}
+                                    />
+                                )}
+
+                                <ToggleRow
+                                    title="Enable Slipper Detection"
+                                    description="Runs the slipper classifier. Footwear rules depend on this switch."
+                                    enabled={enableSlipperDetection}
+                                    onToggle={() => {
+                                        setEnableSlipperDetection((current) => !current);
+                                        setSaved(false);
+                                    }}
+                                    accent="emerald"
+                                    disabled={policyControlsDisabled}
+                                    badge="Footwear"
+                                />
+                                {enableSlipperDetection && (
+                                    <ThresholdSlider
+                                        title="Slipper Threshold"
+                                        description="Minimum confidence required before slipper or non-slipper results are used for restriction checks."
+                                        value={slipperConfidence}
+                                        onChange={(value) => {
+                                            setSlipperConfidence(value);
+                                            setSaved(false);
+                                        }}
+                                        accent="emerald"
+                                        disabled={slipperControlsDisabled}
+                                    />
+                                )}
+                            </div>
                         </CardContent>
                     </Card>
 
                     <Card className="border-slate-200/80 bg-white/95 shadow-sm">
                         <CardHeader>
                             <CardTitle className="text-2xl">Restricted Categories</CardTitle>
-                            <CardDescription>
-                                Choose which predictions are not allowed. Matching labels above their classifier threshold will trigger a violation.
-                            </CardDescription>
+                            {/* <CardDescription>
+                                Keep policy rules grouped by classifier so Lower Body and Footwear are easier to scan and reason about.
+                            </CardDescription> */}
                         </CardHeader>
-                        <CardContent className="grid auto-rows-fr gap-3 sm:grid-cols-2">
-                            {LABEL_OPTIONS.map((item) => {
-                                const isRestricted = restrictedLabels.includes(item.id);
-                                const classifierEnabled = item.classifier === 'pants' ? enablePantsDetection : enableSlipperDetection;
-
+                        <CardContent className="grid gap-4">
+                            {CATEGORY_GROUPS.map((group) => {
+                                const groupDisabled = group.id === 'pants' ? pantsControlsDisabled : slipperControlsDisabled;
                                 return (
-                                    <button
-                                        key={item.id}
-                                        type="button"
-                                        onClick={() => toggleRestrictedLabel(item.id)}
-                                        className={cn(
-                                            'grid h-full grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-4 rounded-3xl border p-4 text-left transition-all hover:shadow-sm',
-                                            isRestricted
-                                                ? 'border-red-300 bg-red-50'
-                                                : 'border-slate-200 bg-white hover:border-blue-200',
-                                        )}
-                                    >
-                                        <div className={cn(
-                                            'mt-0.5 flex h-12 w-12 items-center justify-center rounded-2xl',
-                                            isRestricted ? 'bg-red-500 text-white' : 'bg-slate-100 text-slate-500',
-                                        )}>
-                                            <ShieldCheck className="h-5 w-5" />
-                                        </div>
-
-                                        <div className="flex min-h-[152px] flex-col">
-                                            <div className="flex min-h-[32px] items-start">
-                                                <p className="pr-2 text-lg font-semibold leading-8 text-slate-900">{item.name}</p>
-                                            </div>
-
-                                            <div className="mt-1">
-                                                <span className={cn(
-                                                    'inline-flex min-h-6 items-center rounded-full px-2.5 py-1 text-[11px] font-medium',
-                                                    classifierEnabled
-                                                        ? 'bg-emerald-50 text-emerald-700'
-                                                        : 'bg-amber-50 text-amber-700',
-                                                )}>
-                                                    {classifierEnabled ? 'Classifier ready' : 'Classifier off'}
-                                                </span>
-                                            </div>
-
-                                            <p className="mt-3 min-h-[72px] text-sm leading-6 text-slate-500">
-                                                {item.description}
-                                            </p>
-
-                                            <p className={cn(
-                                                'mt-auto text-sm font-semibold',
-                                                isRestricted ? 'text-red-600' : 'text-slate-500',
-                                            )}>
-                                                {isRestricted ? 'Restricted' : 'Allowed'}
-                                            </p>
-                                        </div>
-
-                                        <div className={cn('mt-1 relative h-7 w-14 shrink-0 rounded-full transition-colors', isRestricted ? 'bg-red-500' : 'bg-slate-200')}>
-                                            <div
-                                                className={cn(
-                                                    'absolute top-1 h-5 w-5 rounded-full bg-white shadow-sm transition-all',
-                                                    isRestricted ? 'left-8' : 'left-1',
-                                                )}
-                                            />
-                                        </div>
-                                    </button>
+                                    <RestrictedCategoryCard
+                                        key={group.id}
+                                        title={group.title}
+                                        description={group.description}
+                                        badge={group.badge}
+                                        accent={group.accent}
+                                        disabled={groupDisabled}
+                                        items={group.items}
+                                        restrictedLabels={restrictedLabels}
+                                        onToggle={(labelId) => {
+                                            toggleRestrictedLabel(labelId);
+                                        }}
+                                    />
                                 );
                             })}
                         </CardContent>

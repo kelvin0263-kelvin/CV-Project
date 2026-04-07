@@ -9,6 +9,7 @@ import { Label } from './ui/label';
 import StreamPlayer from './StreamPlayer';
 import RoiEditorCanvas from './RoiEditorCanvas';
 import VideoUpload from './VideoUpload';
+import ConfirmationDialog from './ConfirmationDialog';
 import { getApiBaseUrl, getWSUrl } from '../apiConfig';
 
 const CAMERA_ANALYSIS_TAGS_UPDATED_EVENT = 'camera-analysis-tags-updated';
@@ -71,7 +72,7 @@ const SystemConfiguration = () => {
         searchParams.get('tab') === 'uploads' ? 'uploads' : 'streams'
     );
     const [activeStreamTab, setActiveStreamTab] = useState('added');
-    const [activeUploadTab, setActiveUploadTab] = useState('create');
+    const [activeUploadTab, setActiveUploadTab] = useState('sources');
     const [isAddMode, setIsAddMode] = useState(false);
     const [isEditMode, setIsEditMode] = useState(false);
     const [selectedCamera, setSelectedCamera] = useState(null);
@@ -80,6 +81,9 @@ const SystemConfiguration = () => {
     const [isTestingConnection, setIsTestingConnection] = useState(false);
     const [isSaving, setIsSaving] = useState(false);
     const [testResult, setTestResult] = useState(null);
+    const [statusMessage, setStatusMessage] = useState(null);
+    const [deleteConfirmation, setDeleteConfirmation] = useState(null);
+    const [deletingCameraId, setDeletingCameraId] = useState('');
 
     // File Upload State
     const [selectedFile, setSelectedFile] = useState(null);
@@ -180,6 +184,7 @@ const SystemConfiguration = () => {
 
     const handleAddClick = () => {
         resetForm();
+        setStatusMessage(null);
         setActiveManagementTab('streams');
         setActiveStreamTab('form');
         setSearchParams({}, { replace: true });
@@ -187,6 +192,7 @@ const SystemConfiguration = () => {
     };
 
     const handleEditClick = (cam) => {
+        setStatusMessage(null);
         setFormData({
             name: cam.name,
             location: cam.location,
@@ -213,6 +219,7 @@ const SystemConfiguration = () => {
 
     const handleShowStreams = () => {
         resetForm();
+        setStatusMessage(null);
         setActiveManagementTab('streams');
         setActiveStreamTab('added');
         setSearchParams({}, { replace: true });
@@ -220,12 +227,15 @@ const SystemConfiguration = () => {
 
     const handleShowUploads = () => {
         resetForm();
+        setStatusMessage(null);
         setActiveManagementTab('uploads');
+        setActiveUploadTab('sources');
         setSearchParams({ tab: 'uploads' }, { replace: true });
     };
 
     const handleShowAddedStreams = () => {
         resetForm();
+        setStatusMessage(null);
         setActiveManagementTab('streams');
         setActiveStreamTab('added');
         setSearchParams({}, { replace: true });
@@ -424,6 +434,9 @@ const SystemConfiguration = () => {
 
                 await fetchCameras();
                 resetForm();
+                setStatusMessage({ type: 'success', text: 'Stream camera added successfully.' });
+                setActiveManagementTab('streams');
+                setActiveStreamTab('added');
                 return;
             }
 
@@ -437,6 +450,7 @@ const SystemConfiguration = () => {
                     const err = await res.json().catch(() => ({}));
                     throw new Error(err.detail || 'Failed to save camera');
                 }
+                setStatusMessage({ type: 'success', text: 'Stream camera updated successfully.' });
             } else {
                 const res = await fetch(`${apiUrl}/api/cameras`, {
                     method: 'POST',
@@ -447,9 +461,12 @@ const SystemConfiguration = () => {
                     const err = await res.json().catch(() => ({}));
                     throw new Error(err.detail || 'Failed to save camera');
                 }
+                setStatusMessage({ type: 'success', text: 'Stream camera added successfully.' });
             }
             await fetchCameras();
             resetForm();
+            setActiveManagementTab('streams');
+            setActiveStreamTab('added');
         } catch (error) {
             console.error("Save error:", error);
             alert("Failed to save camera");
@@ -459,14 +476,40 @@ const SystemConfiguration = () => {
         }
     };
 
-    const handleDelete = async (id) => {
-        if (window.confirm("Are you sure you want to remove this camera Source? This will remove it from the dashboard.")) {
-            try {
-                await fetch(`${apiUrl}/api/cameras/${id}`, { method: 'DELETE' });
-                await fetchCameras();
-            } catch (e) {
-                alert("Failed to delete");
+    const handleDelete = (camera) => {
+        setDeleteConfirmation({
+            id: camera.id,
+            name: camera.name || 'this stream camera',
+        });
+    };
+
+    const handleConfirmDelete = async () => {
+        if (!deleteConfirmation?.id) {
+            return;
+        }
+
+        const { id, name } = deleteConfirmation;
+        setDeleteConfirmation(null);
+        setDeletingCameraId(id);
+        setStatusMessage({ type: 'info', text: `Removing ${name}...` });
+
+        try {
+            const res = await fetch(`${apiUrl}/api/cameras/${id}`, { method: 'DELETE' });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.detail || 'Failed to remove stream camera.');
             }
+            await fetchCameras();
+            setStatusMessage({ type: 'success', text: 'Stream camera removed successfully.' });
+            setActiveManagementTab('streams');
+            setActiveStreamTab('added');
+        } catch (error) {
+            setStatusMessage({
+                type: 'error',
+                text: error?.message || 'Failed to remove stream camera.',
+            });
+        } finally {
+            setDeletingCameraId('');
         }
     };
 
@@ -531,6 +574,19 @@ const SystemConfiguration = () => {
 
     return (
         <div className="flex h-full flex-col gap-6 overflow-auto bg-[radial-gradient(circle_at_top_left,_rgba(59,130,246,0.08),_transparent_32%),linear-gradient(180deg,_rgba(248,250,252,0.95),_rgba(255,255,255,1))] p-6 text-foreground">
+            <ConfirmationDialog
+                open={Boolean(deleteConfirmation)}
+                title="Remove Stream Camera?"
+                description={deleteConfirmation
+                    ? `Remove ${deleteConfirmation.name}? This will remove the stream camera from the dashboard and saved source list.`
+                    : ''}
+                confirmLabel="Confirm Remove"
+                confirmVariant="destructive"
+                loading={Boolean(deletingCameraId)}
+                loadingIcon={<Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                onCancel={() => setDeleteConfirmation(null)}
+                onConfirm={handleConfirmDelete}
+            />
             <section className="relative overflow-hidden rounded-[28px] border border-slate-200/80 bg-white/90 p-6 shadow-sm backdrop-blur">
                 <div className="pointer-events-none absolute right-[-100px] top-[-120px] h-64 w-64 rounded-full bg-blue-100/60 blur-3xl" />
                 <div className="relative flex items-center justify-between">
@@ -557,13 +613,13 @@ const SystemConfiguration = () => {
                                 variant={activeManagementTab === 'uploads' ? 'default' : 'outline'}
                                 className={cn(activeManagementTab !== 'uploads' && "border-slate-200 bg-white")}
                             >
-                                Upload Video
+                                Video Sources
                             </Button>
                         </div>
                         <div className="text-sm text-muted-foreground">
                             {activeManagementTab === 'streams'
                                 ? `${cameras.length} Live Sources Configured`
-                                : 'Manage uploaded video sources'}
+                                : 'Manage video sources'}
                         </div>
                     </div>
 
@@ -584,28 +640,30 @@ const SystemConfiguration = () => {
                                 variant={activeStreamTab === 'form' ? 'default' : 'outline'}
                             >
                                 <Plus className="w-4 h-4" />
-                                {isEditMode ? 'Modify Stream Camera' : 'Add Stream Camera'}
+                                {isEditMode ? 'Edit Stream Camera' : 'Add Stream Camera'}
                             </Button>
                         </div>
                     )}
 
                     {activeManagementTab === 'uploads' && (
                         <div className="mt-4 flex gap-2">
-                            <Button
-                                type="button"
-                                onClick={() => setActiveUploadTab('create')}
-                                variant={activeUploadTab === 'create' ? 'default' : 'outline'}
-                                className={cn(activeUploadTab !== 'create' && "border-slate-200 bg-white")}
-                            >
-                                Create Upload Source
-                            </Button>
+                            
                             <Button
                                 type="button"
                                 onClick={() => setActiveUploadTab('sources')}
                                 variant={activeUploadTab === 'sources' ? 'default' : 'outline'}
                                 className={cn(activeUploadTab !== 'sources' && "border-slate-200 bg-white")}
                             >
-                                Uploaded Sources
+                                Added Video Sources
+                            </Button>
+                            <Button
+                                type="button"
+                                onClick={() => setActiveUploadTab('create')}
+                                variant={activeUploadTab === 'create' ? 'default' : 'outline'}
+                                className={cn(activeUploadTab !== 'create' && "border-slate-200 bg-white")}
+                            >
+                                <Plus className="mr-2 h-4 w-4" />
+                                Add Video Source
                             </Button>
                         </div>
                     )}
@@ -613,6 +671,18 @@ const SystemConfiguration = () => {
 
                 {/* Content */}
                 <div className="flex-1 overflow-auto pr-2">
+                    {statusMessage && (
+                        <div className={cn(
+                            "mb-4 rounded-md border px-3 py-2 text-sm",
+                            statusMessage.type === 'success'
+                                ? "border-green-500/30 bg-green-500/10 text-green-600"
+                                : statusMessage.type === 'info'
+                                    ? "border-blue-500/30 bg-blue-500/10 text-blue-600"
+                                    : "border-red-500/30 bg-red-500/10 text-red-600"
+                        )}>
+                            {statusMessage.text}
+                        </div>
+                    )}
                     {activeManagementTab === 'uploads' ? (
                         <VideoUpload
                             embedded
@@ -621,62 +691,96 @@ const SystemConfiguration = () => {
                         />
                     ) : (
                         activeStreamTab === 'added' && !isAddMode && !isEditMode && !showUpload ? (
-                            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-                                {cameras.map((cam) => {
-                                    const overlayMode = inferOverlayMode(cam.analysis_tags);
-                                    return (
-                                    <Card key={cam.id} className={cn(SYSTEM_SURFACE_CARD_CLASS, "relative group overflow-hidden transition-all cursor-pointer hover:border-primary/50", !cam.enabled && "opacity-60")}>
-                                        <div className="aspect-video bg-muted relative flex items-center justify-center bg-black">
-                                            {isStreamSource(cam) ? (
-                                                <StreamPlayer
-                                                    wsUrl={getWSUrl(`/ws/${cam.id}`)}
-                                                    className="w-full h-full"
-                                                    alt="Live Stream"
-                                                    overlayMode={overlayMode}
-                                                    showCountingAnchors={overlayMode === 'counting'}
-                                                />
-                                            ) : (
-                                                <div className="flex flex-col items-center">
-                                                    <Camera className="w-8 h-8 text-muted-foreground mb-2" />
-                                                    <span className="text-xs text-muted-foreground">Live Stream</span>
-                                                </div>
-                                            )}
-
-                                            <div className="absolute top-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                                                <Button size="icon" variant="secondary" className="h-8 w-8" onClick={() => handleEditClick(cam)}>
-                                                    <Edit2 className="w-4 h-4" />
-                                                </Button>
-                                                <Button size="icon" variant="destructive" className="h-8 w-8" onClick={() => handleDelete(cam.id)}>
-                                                    <Trash2 className="w-4 h-4" />
-                                                </Button>
-                                            </div>
-                                            <div className={cn("absolute top-2 left-2 px-2 py-0.5 rounded text-xs font-medium", cam.enabled ? "bg-green-500/20 text-green-500" : "bg-red-500/20 text-red-500")}>
-                                                {cam.type}
-                                            </div>
+                            cameras.length === 0 ? (
+                                <Card className={cn(SYSTEM_SURFACE_CARD_CLASS, "mx-auto max-w-3xl rounded-[28px] border-dashed")}>
+                                    <CardContent className="flex min-h-[320px] flex-col items-center justify-center px-8 py-12 text-center">
+                                        <div className="flex h-16 w-16 items-center justify-center rounded-3xl bg-blue-50 text-blue-600 shadow-sm">
+                                            <Camera className="h-8 w-8" />
                                         </div>
-                                        <CardContent className="p-4">
-                                            <h3 className="font-semibold text-lg truncate" title={cam.name}>{cam.name}</h3>
-                                            <p className="text-sm text-muted-foreground truncate">
-                                                {cam.location || cam.source_path || 'No location configured'}
-                                            </p>
-                                            <div className="mt-3 flex flex-wrap gap-2">
-                                                {(Array.isArray(cam.analysis_tags) && cam.analysis_tags.length > 0
-                                                    ? cam.analysis_tags
-                                                    : ['Unassigned']
-                                                ).map((tag) => (
-                                                    <span
-                                                        key={`${cam.id}-${tag}`}
-                                                        className="text-xs px-2 py-1 bg-secondary rounded-full"
+                                        <h3 className="mt-6 text-2xl font-semibold text-slate-950">No live stream cameras yet</h3>
+                                        <p className="mt-2 max-w-xl text-sm leading-6 text-slate-500">
+                                            This section is currently empty. Add a stream camera to start monitoring RTSP, network, or fisheye sources from the settings page.
+                                        </p>
+                                        <Button type="button" onClick={handleAddClick} className="mt-6">
+                                            <Plus className="mr-2 h-4 w-4" />
+                                            Add Stream Camera
+                                        </Button>
+                                    </CardContent>
+                                </Card>
+                            ) : (
+                                <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                                    {cameras.map((cam) => {
+                                        const overlayMode = inferOverlayMode(cam.analysis_tags);
+                                        return (
+                                        <Card key={cam.id} className={cn(SYSTEM_SURFACE_CARD_CLASS, "relative group overflow-hidden transition-all cursor-pointer hover:border-primary/50", !cam.enabled && "opacity-60")}>
+                                            <div className="aspect-video bg-muted relative flex items-center justify-center bg-black">
+                                                {isStreamSource(cam) ? (
+                                                    <StreamPlayer
+                                                        wsUrl={getWSUrl(`/ws/${cam.id}`)}
+                                                        className="w-full h-full"
+                                                        alt="Live Stream"
+                                                        overlayMode={overlayMode}
+                                                        showCountingAnchors={overlayMode === 'counting'}
+                                                    />
+                                                ) : (
+                                                    <div className="flex flex-col items-center">
+                                                        <Camera className="w-8 h-8 text-muted-foreground mb-2" />
+                                                        <span className="text-xs text-muted-foreground">Live Stream</span>
+                                                    </div>
+                                                )}
+
+                                                <div className="absolute top-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                                    <Button size="icon" variant="secondary" className="h-8 w-8" onClick={() => handleEditClick(cam)}>
+                                                        <Edit2 className="w-4 h-4" />
+                                                    </Button>
+                                                    <Button
+                                                        size="icon"
+                                                        variant="destructive"
+                                                        className="h-8 w-8"
+                                                        onClick={() => handleDelete(cam)}
+                                                        disabled={deletingCameraId === cam.id}
                                                     >
-                                                        {tag}
-                                                    </span>
-                                                ))}
+                                                        {deletingCameraId === cam.id
+                                                            ? <Loader2 className="w-4 h-4 animate-spin" />
+                                                            : <Trash2 className="w-4 h-4" />}
+                                                    </Button>
+                                                </div>
+                                                <div className={cn("absolute top-2 left-2 px-2 py-0.5 rounded text-xs font-medium", cam.enabled ? "bg-green-500/20 text-green-500" : "bg-red-500/20 text-red-500")}>
+                                                    {cam.type}
+                                                </div>
+                                                {deletingCameraId === cam.id && (
+                                                    <div className="absolute inset-0 flex items-center justify-center bg-black/65 text-white">
+                                                        <div className="flex items-center gap-2 rounded-full border border-white/20 bg-black/50 px-4 py-2 text-sm">
+                                                            <Loader2 className="h-4 w-4 animate-spin" />
+                                                            Removing...
+                                                        </div>
+                                                    </div>
+                                                )}
                                             </div>
-                                        </CardContent>
-                                    </Card>
-                                    );
-                                })}
-                            </div>
+                                            <CardContent className="p-4">
+                                                <h3 className="font-semibold text-lg truncate" title={cam.name}>{cam.name}</h3>
+                                                <p className="text-sm text-muted-foreground truncate">
+                                                    {cam.location || cam.source_path || 'No location configured'}
+                                                </p>
+                                                <div className="mt-3 flex flex-wrap gap-2">
+                                                    {(Array.isArray(cam.analysis_tags) && cam.analysis_tags.length > 0
+                                                        ? cam.analysis_tags
+                                                        : ['Unassigned']
+                                                    ).map((tag) => (
+                                                        <span
+                                                            key={`${cam.id}-${tag}`}
+                                                            className="text-xs px-2 py-1 bg-secondary rounded-full"
+                                                        >
+                                                            {tag}
+                                                        </span>
+                                                    ))}
+                                                </div>
+                                            </CardContent>
+                                        </Card>
+                                        );
+                                    })}
+                                </div>
+                            )
                         ) : null
                     )}
 
@@ -685,7 +789,7 @@ const SystemConfiguration = () => {
                         <Card className={cn(SYSTEM_SURFACE_CARD_CLASS, "mx-auto max-w-2xl")}>
                             <CardHeader className="flex flex-row items-center justify-between">
                                 <CardTitle>
-                                    {showUpload ? "Upload Video Source" : (isEditMode ? "Modify Camera Source" : "Add Stream Camera")}
+                                    {showUpload ? "Add Video Source" : (isEditMode ? "Edit Stream Camera" : "Add Stream Camera")}
                                 </CardTitle>
                                 <Button variant="ghost" size="icon" onClick={resetForm}>
                                     <X className="w-4 h-4" />
