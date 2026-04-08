@@ -12,6 +12,7 @@ import re
 # import subprocess
 import inspect
 from collections import deque
+from datetime import datetime, timedelta, timezone
 import numpy as np
 
 # Ensure backend root is in path to import DefishVideoCV
@@ -56,6 +57,7 @@ from app.routers.counting_router import (
     get_counting_camera_id,
     get_counting_config,
     get_live_counts,
+    request_building_snapshot_if_needed,
     update_live_counts,
     queue_counting_snapshot,
 )
@@ -73,6 +75,9 @@ PROJECT_ROOT = os.path.dirname(BACKEND_ROOT)
 UPLOAD_ROOT = os.path.abspath(os.path.join(PROJECT_ROOT, "temp_video_uploads"))
 SNAPSHOT_DIR = os.path.join(PROJECT_ROOT, "temp_video_uploads", "snapshots")
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+LOCAL_TIMEZONE = datetime.now().astimezone().tzinfo or timezone.utc
+UPLOAD_FILENAME_PREFIX_PATTERN = re.compile(r"^(?P<prefix>[0-9a-fA-F]{8})_(?P<rest>.+)$")
+UPLOAD_START_TIME_PATTERN = re.compile(r"^(?P<timestamp>\d{14})(?:_|$)")
 
 POSE_MODEL_ENGINE_PATH = os.path.join(BACKEND_ROOT, "yolo26m-pose.engine")
 POSE_MODEL_PT_PATH = "yolov8m-pose.pt"
@@ -200,8 +205,85 @@ def drain_violation_queue() -> list:
 # ---------------------------------------------------------------------------
 # Source/runtime management helpers
 # ---------------------------------------------------------------------------
+def _get_upload_display_filename(source_path: str) -> str:
+    basename = os.path.basename(source_path or "")
+    matched = UPLOAD_FILENAME_PREFIX_PATTERN.match(basename)
+    if matched:
+        return matched.group("rest")
+    return basename
+
+
+def _parse_uploaded_video_start_time(source_path: str) -> datetime | None:
+    original_filename = _get_upload_display_filename(source_path)
+    stem, _ = os.path.splitext(original_filename)
+    first_segment = stem.split("_", 1)[0].strip()
+    if not UPLOAD_START_TIME_PATTERN.fullmatch(first_segment):
+        return None
+
+    try:
+        parsed = datetime.strptime(first_segment, "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=LOCAL_TIMEZONE)
+
+
+def _resolve_uploaded_video_offset_seconds(
+    *,
+    pos_msec,
+    frame_index: int,
+    fps: float,
+) -> float | None:
+    try:
+        pos_msec_value = float(pos_msec)
+    except (TypeError, ValueError):
+        pos_msec_value = 0.0
+
+    if np.isfinite(pos_msec_value) and pos_msec_value > 0.0:
+        return pos_msec_value / 1000.0
+
+    try:
+        fps_value = float(fps)
+    except (TypeError, ValueError):
+        fps_value = 0.0
+
+    if np.isfinite(fps_value) and fps_value > 0.0:
+        return max(0.0, float(frame_index) / fps_value)
+    return None
+
+
+def _build_frame_timestamps(
+    *,
+    source_meta: dict,
+    cap,
+    decoded_frame_index: int,
+    fps: float,
+) -> tuple[datetime | None, datetime | None]:
+    now_local = datetime.now().astimezone()
+    if source_meta.get("is_uploaded_source") and source_meta.get("is_file_source"):
+        processed_at = now_local
+        video_start_time = source_meta.get("uploaded_video_start_time")
+        if not isinstance(video_start_time, datetime):
+            return None, processed_at
+
+        pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC) if cap is not None else None
+        offset_seconds = _resolve_uploaded_video_offset_seconds(
+            pos_msec=pos_msec,
+            frame_index=max(0, int(decoded_frame_index)),
+            fps=fps,
+        )
+        if offset_seconds is None:
+            return None, processed_at
+        return video_start_time + timedelta(seconds=offset_seconds), processed_at
+
+    return now_local, None
+
+
 # To classify the input video source and return metadata indicating whether it is an RTSP stream, a network stream, a local file, or an uploaded file.
-def _build_source_meta(source_path: str) -> dict:
+def _build_source_meta(
+    source_path: str,
+    *,
+    uploaded_video_start_time_override: datetime | None = None,
+) -> dict:
     is_rtsp_stream = is_rtsp_source(source_path)
     if is_rtsp_stream:
         return {
@@ -222,6 +304,11 @@ def _build_source_meta(source_path: str) -> dict:
         "is_uploaded_source": is_uploaded_source,
         "is_rtsp_source": False,
         "is_network_stream_source": False,
+        "uploaded_video_start_time": uploaded_video_start_time_override,
+        "uploaded_video_start_time_override": uploaded_video_start_time_override,
+        "upload_display_filename": (
+            _get_upload_display_filename(source_abs) if is_uploaded_source else os.path.basename(source_abs)
+        ),
     }
 
 # Currently unused after the NVENC writer path was commented.
@@ -419,7 +506,7 @@ def _build_runtime_buffer(current_real_fps: float, cached_people_count: int) -> 
         "__meta__": {
             "fps": round(current_real_fps, 1),
             "people_count": cached_people_count,
-            "detections": [],
+            "detections": {},
             "counting_data": {},
             "stream_status": "live",
         }
@@ -1530,6 +1617,7 @@ def start_producer_thread(
     active_views: list = None,
     sync_barrier: threading.Barrier | None = None,
     sync_state: dict | None = None,
+    uploaded_video_start_time_override: datetime | None = None,
 ):
     with PRODUCER_LOCK: # because PRODUCER_THREADS、PRODUCER_META is shared data
         existing = PRODUCER_THREADS.get(runtime_key)
@@ -1539,7 +1627,10 @@ def start_producer_thread(
         _clear_batch_infer_trackers_for_runtime(runtime_key) # before run clear runtime old batch infer tracker state
 
         stop_event = threading.Event() # if want to stop this thread use this
-        source_meta = _build_source_meta(source_path) #check whehter is RTSP or Video and then create metadata
+        source_meta = _build_source_meta(
+            source_path,
+            uploaded_video_start_time_override=uploaded_video_start_time_override,
+        ) #check whehter is RTSP or Video and then create metadata
 
         #Create Thread
         thread = threading.Thread( 
@@ -2002,6 +2093,8 @@ def video_producer(
         detection_stride = max(DETECTION_STRIDE, 1)
     frame_count = 0
     decoded_frame_index = -1
+    current_frame_event_timestamp: datetime | None = None
+    current_frame_processed_at: datetime | None = None
     # Currently unused for RTSP because the active RTSP path reads through
     # _AsyncFrameReader when ASYNC_CAPTURE_ENABLED is True.
     # rtsp_read_failures = 0
@@ -2225,6 +2318,10 @@ def video_producer(
             }
             counting_data = counter._empty_result()
             update_live_counts(camera_id, counting_data)
+            request_building_snapshot_if_needed(
+                timestamp=current_frame_event_timestamp,
+                processed_at=current_frame_processed_at,
+            )
             return counting_data
 
         now_ts = time.time()
@@ -2245,7 +2342,7 @@ def video_producer(
         register_primary_in_reversions(camera_id, reverted_in, now_ts)
         register_primary_out_events(camera_id, raw_delta_out, now_ts)
         observe_verifier_tracks(camera_id, detections_unscaled, config, frame_shape, now_ts)
-        counting_data, _ = apply_primary_camera_correction(camera_id, raw_counting_data, now_ts)
+        counting_data, correction_delta = apply_primary_camera_correction(camera_id, raw_counting_data, now_ts)
 
         total_in = int(counting_data.get("total_in", 0) or 0)
         total_out = int(counting_data.get("total_out", 0) or 0)
@@ -2277,10 +2374,20 @@ def video_producer(
                     "count_after": total_out - delta_out + idx + 1,
                 })
             ingest_sensor_events(camera_id, sensor_events)
+        if reverted_in > 0 or delta_in or delta_out:
+            request_building_snapshot_if_needed(
+                timestamp=current_frame_event_timestamp,
+                processed_at=current_frame_processed_at,
+            )
 
-        # Snapshot on change + periodic heartbeat to preserve timeline continuity.
-        if counter.should_snapshot(heartbeat_interval=COUNTING_SNAPSHOT_HEARTBEAT_SEC):
+        # Snapshot on raw counter change, verifier correction, or periodic heartbeat.
+        should_queue_snapshot = bool(correction_delta) or counter.should_snapshot(
+            heartbeat_interval=COUNTING_SNAPSHOT_HEARTBEAT_SEC
+        )
+        if should_queue_snapshot:
             snap = counter.get_snapshot_data(camera_id)
+            snap["timestamp"] = current_frame_event_timestamp
+            snap["processed_at"] = current_frame_processed_at
             snap["total_in"] = int(counting_data.get("total_in", snap.get("total_in", 0)) or 0)
             snap["total_out"] = int(counting_data.get("total_out", snap.get("total_out", 0)) or 0)
             snap["current_occupancy"] = int(
@@ -2374,6 +2481,8 @@ def video_producer(
                 queue_violation_event({
                     "id": snapshot_id,
                     "camera_id": camera_id,
+                    "timestamp": current_frame_event_timestamp,
+                    "processed_at": current_frame_processed_at,
                     "source_path": source_path,
                     "track_id": track_id,
                     "event_type": "Fall Detected",
@@ -2448,6 +2557,8 @@ def video_producer(
                 runtime_key,
                 source_path,
                 view_key=view_key,
+                event_timestamp=current_frame_event_timestamp,
+                processed_at=current_frame_processed_at,
             )
             stage_ms["policy_queue"] += (time.perf_counter() - policy_started_at) * 1000.0
 
@@ -2562,6 +2673,12 @@ def video_producer(
 
         # Shared per-frame bookkeeping
         # Step 6B: Once a frame is available, update frame counters and perf state.
+        current_frame_event_timestamp, current_frame_processed_at = _build_frame_timestamps(
+            source_meta=source_meta,
+            cap=cap if not use_async_capture else None,
+            decoded_frame_index=decoded_frame_index,
+            fps=fps,
+        )
         frame_count += 1
 
         # FPS counter
@@ -3026,7 +3143,17 @@ def _update_parallel_violation_confirmation_state(
 # Dress code policy application and violation snapshot queueing
 # ---------------------------------------------------------------------------
 # To apply the current policy to detections, confirm dress code violations, and save one snapshot evidence event per violating track
-def _apply_policy_and_save(detections, track_state, frame, runtime_key, source_path, view_key=None):
+def _apply_policy_and_save(
+    detections,
+    track_state,
+    frame,
+    runtime_key,
+    source_path,
+    view_key=None,
+    *,
+    event_timestamp: datetime | None = None,
+    processed_at: datetime | None = None,
+):
     """
     Apply the current policy to mark violations and save snapshot evidence.
     Deduplicates by track_id (one snapshot per track).
@@ -3094,6 +3221,8 @@ def _apply_policy_and_save(detections, track_state, frame, runtime_key, source_p
                     queue_violation_event({
                         "id": snapshot_id,
                         "camera_id": camera_id,
+                        "timestamp": event_timestamp,
+                        "processed_at": processed_at,
                         "source_path": source_path,
                         "track_id": track_id,
                         "event_type": "Dress Code Violation",

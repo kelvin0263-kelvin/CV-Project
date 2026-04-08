@@ -4,7 +4,9 @@ from dotenv import load_dotenv
 
 # Load .env from backend root
 env_path = Path(__file__).resolve().parent.parent.parent / ".env"
-load_dotenv(dotenv_path=env_path)
+# Prefer the current backend/.env values even if an older DATABASE_URL is still
+# present in the shell environment from a previous run.
+load_dotenv(dotenv_path=env_path, override=True)
 
 
 class Settings:

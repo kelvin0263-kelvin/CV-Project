@@ -1,7 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
-    CheckCircle2,
     Clapperboard,
     Edit2,
     FolderUp,
@@ -48,6 +47,41 @@ const getUploadDisplayName = (item) => {
     return item?.file_name || '';
 };
 
+const parseFilenameStartTimeForInput = (filename) => {
+    const normalized = String(filename || '').trim();
+    if (!normalized) {
+        return '';
+    }
+
+    const match = normalized.match(/^(\d{14})(?:_|$)/);
+    if (!match) {
+        return '';
+    }
+
+    const raw = match[1];
+    const year = Number(raw.slice(0, 4));
+    const month = Number(raw.slice(4, 6));
+    const day = Number(raw.slice(6, 8));
+    const hour = Number(raw.slice(8, 10));
+    const minute = Number(raw.slice(10, 12));
+    const second = Number(raw.slice(12, 14));
+    const parsed = new Date(year, month - 1, day, hour, minute, second);
+
+    if (
+        Number.isNaN(parsed.getTime())
+        || parsed.getFullYear() !== year
+        || parsed.getMonth() !== month - 1
+        || parsed.getDate() !== day
+        || parsed.getHours() !== hour
+        || parsed.getMinutes() !== minute
+        || parsed.getSeconds() !== second
+    ) {
+        return '';
+    }
+
+    return formatDateTimeLocalInput(parsed);
+};
+
 const buildUploadEditForm = (item) => {
     const primaryCamera = item?.cameras?.[0] || {};
     const selectedView = Number.isInteger(item?.selected_views?.[0])
@@ -62,7 +96,37 @@ const buildUploadEditForm = (item) => {
         detectionRoi: primaryCamera?.detection_roi || null,
         isFisheye: Boolean(item?.is_fisheye),
         selectedView,
+        uploadedVideoStartTime: formatDateTimeLocalInput(
+            item?.uploaded_video_start_time || item?.uploaded_video_start_time_override,
+        ),
     };
+};
+
+function formatDateTimeLocalInput(value) {
+    if (!value) {
+        return '';
+    }
+
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+        return '';
+    }
+
+    const pad = (segment) => String(segment).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+const formatVideoDateTime = (value) => {
+    if (!value) {
+        return '-';
+    }
+
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+        return '-';
+    }
+
+    return date.toLocaleString();
 };
 
 const formatVideoDuration = (durationSeconds) => {
@@ -109,6 +173,8 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
     const [selectedFile, setSelectedFile] = useState(null);
     const [cameraNamePrefix, setCameraNamePrefix] = useState('');
     const [uploadLocation, setUploadLocation] = useState('');
+    const [uploadVideoStartTime, setUploadVideoStartTime] = useState('');
+    const [uploadFilenameHasTimestamp, setUploadFilenameHasTimestamp] = useState(false);
     const [enableFisheye, setEnableFisheye] = useState(false);
     const [selectedViews, setSelectedViews] = useState(new Set([DEFAULT_FISHEYE_VIEW]));
     const [sourceRoi, setSourceRoi] = useState(null);
@@ -310,7 +376,10 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
 
     const handleFileChange = (event) => {
         const file = event.target.files?.[0] || null;
+        const parsedStartTime = parseFilenameStartTimeForInput(file?.name);
         setSelectedFile(file);
+        setUploadVideoStartTime(parsedStartTime);
+        setUploadFilenameHasTimestamp(Boolean(parsedStartTime));
         setSourceRoi(null);
         setIsDrawingSourceRoi(false);
         setMessage(null);
@@ -480,6 +549,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                     detection_roi: editForm.detectionRoi?.points?.length >= 3 ? editForm.detectionRoi : null,
                     is_fisheye: editForm.isFisheye,
                     view_index: editForm.isFisheye ? editForm.selectedView : -1,
+                    uploaded_video_start_time_override: editForm.uploadedVideoStartTime || null,
                 }),
             });
             const data = await res.json().catch(() => ({}));
@@ -520,6 +590,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
         formData.append('file', selectedFile);
         formData.append('camera_name_prefix', cameraNamePrefix.trim() || 'Uploaded Camera');
         formData.append('location', uploadLocation.trim());
+        formData.append('uploaded_video_start_time', uploadVideoStartTime.trim());
         formData.append('enable_fisheye', String(enableFisheye));
         if (enableFisheye) {
             formData.append('selected_views', Array.from(selectedViews).join(','));
@@ -553,6 +624,8 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
             setIsDrawingSourceRoi(false);
             setUploadPreviewImage('');
             setUploadPreviewUrl('');
+            setUploadVideoStartTime('');
+            setUploadFilenameHasTimestamp(false);
             setSelectedViews(new Set([DEFAULT_FISHEYE_VIEW]));
             setEnableFisheye(false);
             setCameraNamePrefix('');
@@ -698,27 +771,29 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                         </CardDescription>
                     </CardHeader>
                     <CardContent className="space-y-4">
-                        <div className="space-y-2">
-                            <Label htmlFor="upload-name">Camera Name / Prefix</Label>
-                            <input
-                                id="upload-name"
-                                type="text"
-                                value={cameraNamePrefix}
-                                onChange={(event) => setCameraNamePrefix(event.target.value)}
-                                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                                placeholder="e.g. Warehouse Test Video"
-                            />
-                        </div>
-                        <div className="space-y-2">
-                            <Label htmlFor="upload-location">Location</Label>
-                            <input
-                                id="upload-location"
-                                type="text"
-                                value={uploadLocation}
-                                onChange={(event) => setUploadLocation(event.target.value)}
-                                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                                placeholder="e.g. Building A"
-                            />
+                        <div className="grid gap-4 md:grid-cols-2">
+                            <div className="space-y-2">
+                                <Label htmlFor="upload-name">Camera Name / Prefix</Label>
+                                <input
+                                    id="upload-name"
+                                    type="text"
+                                    value={cameraNamePrefix}
+                                    onChange={(event) => setCameraNamePrefix(event.target.value)}
+                                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                    placeholder="e.g. Warehouse Test Video"
+                                />
+                            </div>
+                            <div className="space-y-2">
+                                <Label htmlFor="upload-location">Location</Label>
+                                <input
+                                    id="upload-location"
+                                    type="text"
+                                    value={uploadLocation}
+                                    onChange={(event) => setUploadLocation(event.target.value)}
+                                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                    placeholder="e.g. Building A"
+                                />
+                            </div>
                         </div>
 
                         <div className="relative rounded-xl border border-dashed border-border bg-muted/20 p-6 text-center">
@@ -738,20 +813,42 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                         </div>
 
                         {selectedFile && (
-                            <div className="grid gap-3 rounded-lg border p-3 sm:grid-cols-3">
-                                <div className="rounded-md bg-muted/30 px-3 py-3">
-                                    <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Duration</div>
-                                    <div className="mt-1 text-sm font-medium">{formatVideoDuration(uploadPreviewMeta.durationSeconds)}</div>
-                                </div>
-                                <div className="rounded-md bg-muted/30 px-3 py-3">
-                                    <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Resolution</div>
-                                    <div className="mt-1 text-sm font-medium">{uploadPreviewMeta.resolution || 'Loading...'}</div>
-                                </div>
-                                <div className="rounded-md bg-muted/30 px-3 py-3">
-                                    <div className="text-[11px] uppercase tracking-wide text-muted-foreground">FPS</div>
-                                    <div className="mt-1 text-sm font-medium">
-                                        {uploadPreviewMeta.fps != null ? `${formatVideoFps(uploadPreviewMeta.fps)} FPS` : 'Loading...'}
+                            <div className="space-y-3 rounded-lg border p-3">
+                                <div className="grid gap-3 sm:grid-cols-3">
+                                    <div className="rounded-md bg-muted/30 px-3 py-3">
+                                        <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Duration</div>
+                                        <div className="mt-1 text-sm font-medium">{formatVideoDuration(uploadPreviewMeta.durationSeconds)}</div>
                                     </div>
+                                    <div className="rounded-md bg-muted/30 px-3 py-3">
+                                        <div className="text-[11px] uppercase tracking-wide text-muted-foreground">Resolution</div>
+                                        <div className="mt-1 text-sm font-medium">{uploadPreviewMeta.resolution || 'Loading...'}</div>
+                                    </div>
+                                    <div className="rounded-md bg-muted/30 px-3 py-3">
+                                        <div className="text-[11px] uppercase tracking-wide text-muted-foreground">FPS</div>
+                                        <div className="mt-1 text-sm font-medium">
+                                            {uploadPreviewMeta.fps != null ? `${formatVideoFps(uploadPreviewMeta.fps)} FPS` : 'Loading...'}
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="space-y-2">
+                                    <Label htmlFor="upload-video-start-time">Start Time</Label>
+                                    <input
+                                        id="upload-video-start-time"
+                                        type="datetime-local"
+                                        step="1"
+                                        value={uploadVideoStartTime}
+                                        onChange={(event) => setUploadVideoStartTime(event.target.value)}
+                                        className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                        placeholder="YYYY-MM-DDTHH:mm:ss"
+                                    />
+                                    <p className={cn(
+                                        'text-xs',
+                                        uploadFilenameHasTimestamp ? 'text-muted-foreground' : 'text-amber-600',
+                                    )}>
+                                        {uploadFilenameHasTimestamp
+                                            ? 'Auto-filled from the filename. You can adjust it before upload.'
+                                            : 'No valid 14-digit timestamp was found at the start of the filename. You can enter the start time manually or leave it empty.'}
+                                    </p>
                                 </div>
                             </div>
                         )}
@@ -812,6 +909,9 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                                         </Button>
                                     </div>
                                 </div>
+                                <p className="text-xs text-muted-foreground">
+                                    If ROI is never set, the whole image is used for detection.
+                                </p>
                                 <div ref={previewContainerRef} className="relative aspect-video overflow-hidden rounded-md bg-black">
                                     {uploadPreviewImage ? (
                                         <img
@@ -993,7 +1093,14 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                                             <>
                                                 <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
                                                     <div>
-                                                        <div className="text-lg font-semibold">{activeDisplayName}</div>
+                                                        <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-3">
+                                                            <div className="text-lg font-semibold">{activeDisplayName}</div>
+                                                            {activeItem.cameras?.[0]?.location && (
+                                                                <div className="text-sm text-muted-foreground">
+                                                                    {activeItem.cameras[0].location}
+                                                                </div>
+                                                            )}
+                                                        </div>
                                                         <div className="text-sm text-muted-foreground">
                                                             Video source preview and runtime status
                                                         </div>
@@ -1047,6 +1154,20 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                                                                     placeholder="e.g. Building A"
                                                                 />
                                                             </div>
+                                                        </div>
+                                                        <div className="mt-4 space-y-2">
+                                                            <Label htmlFor="edit-video-start-time">Start Time</Label>
+                                                            <input
+                                                                id="edit-video-start-time"
+                                                                type="datetime-local"
+                                                                step="1"
+                                                                value={editForm.uploadedVideoStartTime}
+                                                                onChange={handleEditFieldChange('uploadedVideoStartTime')}
+                                                                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                                                            />
+                                                            <p className="text-xs text-muted-foreground">
+                                                                Auto-filled from the filename during upload when available. You can correct it here.
+                                                            </p>
                                                         </div>
                                                         <div className="mt-4 space-y-2">
                                                             <Label htmlFor="edit-upload-path">Source Path</Label>
@@ -1143,7 +1264,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                                                                 )}
                                                             </div>
                                                             <p className="text-xs text-muted-foreground">
-                                                                ROI changes are allowed here and will apply to this video source. Clear ROI to use the full frame again.
+                                                                ROI changes are allowed here and will apply to this video source. If ROI is never set, the whole image is used for detection. Clear ROI to use the full frame again.
                                                             </p>
                                                         </div>
                                                         <div className="mt-4 flex justify-end gap-2">
@@ -1204,24 +1325,9 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                                                             </div>
                                                         </div>
                                                         <div className="rounded-lg border p-3">
-                                                            <div className="text-xs uppercase tracking-wide text-muted-foreground">Linked Cameras</div>
-                                                            <div className="mt-2 grid gap-2">
-                                                                {(activeItem.cameras || []).map((camera) => (
-                                                                    <div key={camera.id} className="flex items-center justify-between rounded-md bg-muted/30 px-3 py-2">
-                                                                        <div>
-                                                                            <div className="text-sm font-medium">{camera.name}</div>
-                                                                            <div className="text-xs text-muted-foreground">
-                                                                                {camera.analysis_tags?.join(', ') || 'Unassigned'}
-                                                                            </div>
-                                                                        </div>
-                                                                        {camera.producer_running && (
-                                                                            <span className="flex items-center gap-1 text-xs text-green-600">
-                                                                                <CheckCircle2 className="h-3.5 w-3.5" />
-                                                                                Running
-                                                                            </span>
-                                                                        )}
-                                                                    </div>
-                                                                ))}
+                                                            <div className="text-xs uppercase tracking-wide text-muted-foreground">Start Time</div>
+                                                            <div className="mt-1 text-sm font-medium">
+                                                                {formatVideoDateTime(activeItem.uploaded_video_start_time || activeItem.uploaded_video_start_time_override)}
                                                             </div>
                                                         </div>
                                                     </div>

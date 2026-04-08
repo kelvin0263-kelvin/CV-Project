@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import Column, String, Integer, DateTime, Boolean, JSON, func
+from sqlalchemy import Column, String, Integer, DateTime, Boolean, JSON
 
 from app.models.base import Base
 
@@ -9,7 +9,8 @@ class BuildingCountingSnapshot(Base):
     __tablename__ = "building_counting_snapshots"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    timestamp = Column(DateTime(timezone=True), nullable=True)
+    processed_at = Column(DateTime(timezone=True), nullable=True)
     enabled = Column(Boolean, nullable=False, default=True)
     raw_in = Column(Integer, nullable=False, default=0)
     raw_out = Column(Integer, nullable=False, default=0)

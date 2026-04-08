@@ -52,14 +52,49 @@ const getTimestampMs = (value) => parseApiTimestamp(value)?.getTime() ?? 0;
 // Currently unused.
 // const getTimestampIsoDate = (value) => parseApiTimestamp(value)?.toISOString().split('T')[0] ?? '';
 const formatTimestamp = (value) => parseApiTimestamp(value)?.toLocaleString() ?? '-';
+const getSortableTimeValue = (row, field) => {
+    const candidate = field === 'processed_at' ? row?.processed_at : row?.timestamp;
+    const parsed = parseApiTimestamp(candidate);
+    return parsed ? parsed.getTime() : null;
+};
+const normalizeSourceFilterKind = (rawValue) => {
+    const normalized = String(rawValue || '').trim().toLowerCase();
+    if (normalized === 'uploaded_video') return 'uploaded';
+    if (normalized === 'rtsp' || normalized === 'network') return 'live';
+    return 'other';
+};
+
+const getReportSourceFilterKind = (item, cameraSourceKindById) => {
+    if (item?.details?.scope === 'building') return 'building';
+    const mapped = normalizeSourceFilterKind(cameraSourceKindById?.[item?.camera_id]);
+    if (mapped !== 'other') return mapped;
+    if (item?.processed_at) return 'uploaded';
+    return 'live';
+};
+const isSourceOnlySnapshotScope = (rows, cameraSourceKindById, expectedKind, fallbackSourceFilter = 'all') => {
+    if (fallbackSourceFilter === expectedKind) return true;
+    const cameraIds = Array.from(new Set(
+        (rows || [])
+            .map((row) => row?.camera_id)
+            .filter(Boolean),
+    ));
+    if (!cameraIds.length) return false;
+    return cameraIds.every((cameraId) => normalizeSourceFilterKind(cameraSourceKindById?.[cameraId]) === expectedKind);
+};
+
 const getCameraLabel = (item) => {
-    if (item?.details?.scope === 'building') return 'Building';
+    if (item?.details?.scope === 'building') {
+        return item?.details?.building_id ? `Building ${item.details.building_id}` : 'Building';
+    }
     return (item?.camera_name || '').trim() || item?.camera_id || 'Unknown Camera';
 };
 const EMPTY_BUILDING_SUMMARY = {
     enabled: true,
     max_capacity: null,
     capacity_exceeded: false,
+    exceeded_building_ids: [],
+    default_max_capacity: null,
+    capacity_by_building_id: {},
     manual_offset: 0,
     raw_in: 0,
     raw_out: 0,
@@ -67,6 +102,123 @@ const EMPTY_BUILDING_SUMMARY = {
     occupancy: 0,
     active_camera_count: 0,
     entrance_summaries: {},
+};
+
+const doesCameraMatchReportScope = (
+    cameraId,
+    {
+        selectedSourceFilter = 'all',
+        selectedCameraFilter = 'all',
+        cameraSourceKindById = {},
+    } = {},
+) => {
+    if (!cameraId) return false;
+    if (selectedCameraFilter !== 'all' && cameraId !== selectedCameraFilter) return false;
+    if (selectedSourceFilter === 'all') return true;
+    return normalizeSourceFilterKind(cameraSourceKindById?.[cameraId]) === selectedSourceFilter;
+};
+
+const sumBuildingCameraSummaries = (cameraSummaries = {}) => {
+    const entries = Object.values(cameraSummaries || {});
+    const totalIn = entries.reduce((sum, camera) => sum + Number(camera?.total_in ?? 0), 0);
+    const totalOut = entries.reduce((sum, camera) => sum + Number(camera?.total_out ?? 0), 0);
+    const occupancy = entries.reduce(
+        (sum, camera) => sum + Number(camera?.occupancy ?? Math.max(0, Number(camera?.total_in ?? 0) - Number(camera?.total_out ?? 0))),
+        0,
+    );
+    return {
+        totalIn,
+        totalOut,
+        occupancy,
+    };
+};
+
+const filterBuildingAggregateForScope = (
+    snapshotLike,
+    {
+        selectedSourceFilter = 'all',
+        selectedCameraFilter = 'all',
+        cameraSourceKindById = {},
+    } = {},
+) => {
+    if (!snapshotLike) return snapshotLike;
+
+    const hasScopedCameraFilter = selectedSourceFilter !== 'all' || selectedCameraFilter !== 'all';
+    if (!hasScopedCameraFilter) {
+        return snapshotLike;
+    }
+
+    const originalEntranceSummaries = snapshotLike.entrance_summaries || {};
+    const filteredEntranceSummaries = Object.entries(originalEntranceSummaries).reduce((acc, [entranceId, entrance]) => {
+        const rawCameraIds = new Set([
+            ...(Array.isArray(entrance?.camera_ids) ? entrance.camera_ids : []),
+            ...Object.keys(entrance?.camera_summaries || {}),
+        ]);
+        const filteredCameraIds = Array.from(rawCameraIds).filter((cameraId) => (
+            doesCameraMatchReportScope(cameraId, {
+                selectedSourceFilter,
+                selectedCameraFilter,
+                cameraSourceKindById,
+            })
+        ));
+
+        if (!filteredCameraIds.length) {
+            return acc;
+        }
+
+        const filteredCameraSummaries = filteredCameraIds.reduce((cameraAcc, cameraId) => {
+            cameraAcc[cameraId] = entrance?.camera_summaries?.[cameraId] || {
+                total_in: 0,
+                total_out: 0,
+                occupancy: 0,
+            };
+            return cameraAcc;
+        }, {});
+
+        const derived = sumBuildingCameraSummaries(filteredCameraSummaries);
+
+        acc[entranceId] = {
+            ...entrance,
+            camera_ids: filteredCameraIds,
+            camera_summaries: filteredCameraSummaries,
+            total_in: derived.totalIn,
+            total_out: derived.totalOut,
+            occupancy: derived.occupancy,
+            capacity_exceeded: entrance?.max_capacity != null
+                ? derived.occupancy >= Number(entrance.max_capacity)
+                : false,
+        };
+        return acc;
+    }, {});
+
+    const filteredEntries = Object.entries(filteredEntranceSummaries);
+    const rawIn = filteredEntries.reduce((sum, [, entrance]) => sum + Number(entrance?.total_in ?? 0), 0);
+    const rawOut = filteredEntries.reduce((sum, [, entrance]) => sum + Number(entrance?.total_out ?? 0), 0);
+    const rawOccupancy = filteredEntries.reduce((sum, [, entrance]) => sum + Number(entrance?.occupancy ?? 0), 0);
+    const knownCapacities = filteredEntries.filter(([, entrance]) => entrance?.max_capacity != null);
+    const aggregateCapacityKnown = filteredEntries.length > 0 && knownCapacities.length === filteredEntries.length;
+    const exceededBuildingIds = filteredEntries
+        .filter(([, entrance]) => Boolean(entrance?.capacity_exceeded))
+        .map(([entranceId]) => entranceId);
+    const activeCameraCount = filteredEntries.reduce((sum, [, entrance]) => (
+        sum + (Array.isArray(entrance?.camera_ids) ? entrance.camera_ids.length : 0)
+    ), 0);
+
+    return {
+        ...snapshotLike,
+        manual_offset: 0,
+        raw_in: rawIn,
+        raw_out: rawOut,
+        raw_occupancy: rawOccupancy,
+        occupancy: rawOccupancy,
+        active_camera_count: activeCameraCount,
+        max_capacity: aggregateCapacityKnown
+            ? knownCapacities.reduce((sum, [, entrance]) => sum + Number(entrance.max_capacity || 0), 0)
+            : null,
+        capacity_exceeded: exceededBuildingIds.length > 0,
+        exceeded_building_ids: exceededBuildingIds,
+        entrance_summaries: filteredEntranceSummaries,
+    };
 };
 
 const CAMERA_BADGE_STYLES = [
@@ -536,7 +688,6 @@ const aggregateCountingFlow = (rows, { startMs = null, endMs = null, bucket = '1
     let peakOccupancy = 0;
     let latestSnapshot = null;
     let resetCount = 0;
-    let counterDecreaseDetected = false;
 
     normalizeSnapshotRows(rows).forEach((row) => {
         const existing = groupedRows.get(row.camera_id) || [];
@@ -564,12 +715,6 @@ const aggregateCountingFlow = (rows, { startMs = null, endMs = null, bucket = '1
                     currentIn: row.total_in,
                     currentOut: row.total_out,
                 });
-            if (previousRow && (
-                Number(row.total_in ?? 0) < Number(previousRow.total_in ?? 0)
-                || Number(row.total_out ?? 0) < Number(previousRow.total_out ?? 0)
-            )) {
-                counterDecreaseDetected = true;
-            }
             const deltaIn = previousRow
                 ? Math.max(0, resetDetected ? (row.total_in ?? 0) : ((row.total_in ?? 0) - (previousRow.total_in ?? 0)))
                 : Math.max(0, row.total_in ?? 0);
@@ -615,18 +760,12 @@ const aggregateCountingFlow = (rows, { startMs = null, endMs = null, bucket = '1
         if (!best || point.totalTraffic > best.totalTraffic) return point;
         return best;
     }, null);
-    const displayedTotalIn = counterDecreaseDetected && latestSnapshot
-        ? Number(latestSnapshot.total_in ?? 0)
-        : totalIn;
-    const displayedTotalOut = counterDecreaseDetected && latestSnapshot
-        ? Number(latestSnapshot.total_out ?? 0)
-        : totalOut;
 
     return {
         series,
-        totalIn: displayedTotalIn,
-        totalOut: displayedTotalOut,
-        totalTraffic: displayedTotalIn + displayedTotalOut,
+        totalIn,
+        totalOut,
+        totalTraffic: totalIn + totalOut,
         peakOccupancy,
         estimatedOccupancy: Number(latestSnapshot?.current_occupancy ?? 0),
         peakPeriodLabel: peakPeriod?.fullLabel || '-',
@@ -642,7 +781,6 @@ const aggregateTrafficAnalytics = (rows, { startMs = null, endMs = null, bucket 
     let totalEntries = 0;
     let resetCount = 0;
     let latestSnapshot = null;
-    let counterDecreaseDetected = false;
 
     normalizeSnapshotRows(rows).forEach((row) => {
         const existing = groupedRows.get(row.camera_id) || [];
@@ -679,13 +817,6 @@ const aggregateTrafficAnalytics = (rows, { startMs = null, endMs = null, bucket 
                     currentRight,
                     currentEntries,
                 });
-            if (previousRow && (
-                currentLeft < previousLeft
-                || currentRight < previousRight
-                || currentEntries < previousEntries
-            )) {
-                counterDecreaseDetected = true;
-            }
 
             const deltaLeft = previousRow
                 ? Math.max(0, resetDetected ? currentLeft : (currentLeft - previousLeft))
@@ -745,26 +876,15 @@ const aggregateTrafficAnalytics = (rows, { startMs = null, endMs = null, bucket 
         if (!best || point.captureRate > best.captureRate) return point;
         return best;
     }, null);
-    const displayedLeftTraffic = counterDecreaseDetected && latestSnapshot
-        ? Number(latestSnapshot.foot_traffic_left ?? 0)
-        : totalLeftTraffic;
-    const displayedRightTraffic = counterDecreaseDetected && latestSnapshot
-        ? Number(latestSnapshot.foot_traffic_right ?? 0)
-        : totalRightTraffic;
-    const displayedEntries = counterDecreaseDetected && latestSnapshot
-        ? Number(latestSnapshot.total_in ?? 0)
-        : totalEntries;
-    const totalFootTraffic = counterDecreaseDetected && latestSnapshot
-        ? Number(latestSnapshot.foot_traffic_total ?? (displayedLeftTraffic + displayedRightTraffic))
-        : displayedLeftTraffic + displayedRightTraffic;
+    const totalFootTraffic = totalLeftTraffic + totalRightTraffic;
 
     return {
         series,
-        totalLeftTraffic: displayedLeftTraffic,
-        totalRightTraffic: displayedRightTraffic,
+        totalLeftTraffic,
+        totalRightTraffic,
         totalFootTraffic,
-        totalEntries: displayedEntries,
-        captureRate: totalFootTraffic > 0 ? (displayedEntries / totalFootTraffic) * 100 : 0,
+        totalEntries,
+        captureRate: totalFootTraffic > 0 ? (totalEntries / totalFootTraffic) * 100 : 0,
         peakTrafficPeriodLabel: peakTrafficPeriod?.fullLabel || '-',
         peakConversionPeriodLabel: peakConversionPeriod?.fullLabel || '-',
         resetCount,
@@ -774,84 +894,51 @@ const aggregateTrafficAnalytics = (rows, { startMs = null, endMs = null, bucket 
 const aggregateBuildingFlow = (rows, { startMs = null, endMs = null, bucket = '1d' } = {}) => {
     const sortedRows = [...rows].sort((a, b) => (a.tsMs ?? 0) - (b.tsMs ?? 0));
     const bucketMap = new Map();
-    let totalIn = 0;
-    let totalOut = 0;
     let peakOccupancy = 0;
     let latestSnapshot = null;
-    let resetCount = 0;
-    let counterDecreaseDetected = false;
-    let previousRow = null;
 
     sortedRows.forEach((row) => {
         if (!row?.tsMs) return;
-        if (startMs != null && row.tsMs < startMs) {
-            previousRow = row;
-            return;
-        }
+        if (startMs != null && row.tsMs < startMs) return;
         if (endMs != null && row.tsMs > endMs) {
             return;
         }
 
-        const currentIn = Number(row.raw_in ?? 0);
-        const currentOut = Number(row.raw_out ?? 0);
-        const previousIn = Number(previousRow?.raw_in ?? 0);
-        const previousOut = Number(previousRow?.raw_out ?? 0);
-        const resetDetected = previousRow && (currentIn < previousIn || currentOut < previousOut);
-        if (previousRow && (currentIn < previousIn || currentOut < previousOut)) {
-            counterDecreaseDetected = true;
-        }
-        const deltaIn = previousRow
-            ? Math.max(0, resetDetected ? currentIn : (currentIn - previousIn))
-            : Math.max(0, currentIn);
-        const deltaOut = previousRow
-            ? Math.max(0, resetDetected ? currentOut : (currentOut - previousOut))
-            : Math.max(0, currentOut);
-
-        if (resetDetected) {
-            resetCount += 1;
-        }
-
-        totalIn += deltaIn;
-        totalOut += deltaOut;
         peakOccupancy = Math.max(peakOccupancy, Number(row.occupancy ?? 0));
         if (!latestSnapshot || row.tsMs > latestSnapshot.tsMs) {
             latestSnapshot = row;
         }
 
         const bucketStartMs = getBucketStartMs(row.tsMs, bucket);
-        const bucketEntry = bucketMap.get(bucketStartMs) || {
+        const existingEntry = bucketMap.get(bucketStartMs);
+        if (existingEntry && existingEntry.sourceTsMs >= row.tsMs) {
+            return;
+        }
+
+        const bucketEntry = {
             tsMs: bucketStartMs,
             label: formatFlowBucketTick(bucketStartMs, bucket),
             fullLabel: formatFlowBucketRange(bucketStartMs, bucket),
-            in: 0,
-            out: 0,
-            totalTraffic: 0,
-            occupancy: 0,
-            rawOccupancy: 0,
-            peakOccupancy: 0,
+            sourceTsMs: row.tsMs,
+            in: Number(row.raw_in ?? 0),
+            out: Number(row.raw_out ?? 0),
+            totalTraffic: Number(row.raw_in ?? 0) + Number(row.raw_out ?? 0),
+            occupancy: Number(row.occupancy ?? 0),
+            rawOccupancy: Number(row.raw_occupancy ?? 0),
+            peakOccupancy: Number(row.occupancy ?? 0),
         };
-
-        bucketEntry.in += deltaIn;
-        bucketEntry.out += deltaOut;
-        bucketEntry.totalTraffic += deltaIn + deltaOut;
-        bucketEntry.occupancy = Number(row.occupancy ?? bucketEntry.occupancy ?? 0);
-        bucketEntry.rawOccupancy = Number(row.raw_occupancy ?? bucketEntry.rawOccupancy ?? 0);
-        bucketEntry.peakOccupancy = Math.max(bucketEntry.peakOccupancy, Number(row.occupancy ?? 0));
         bucketMap.set(bucketStartMs, bucketEntry);
-        previousRow = row;
     });
 
-    const series = Array.from(bucketMap.values()).sort((a, b) => a.tsMs - b.tsMs);
+    const series = Array.from(bucketMap.values())
+        .sort((a, b) => a.tsMs - b.tsMs)
+        .map(({ sourceTsMs, ...point }) => point);
     const peakPeriod = series.reduce((best, point) => {
         if (!best || point.totalTraffic > best.totalTraffic) return point;
         return best;
     }, null);
-    const displayedTotalIn = counterDecreaseDetected && latestSnapshot
-        ? Number(latestSnapshot.raw_in ?? 0)
-        : totalIn;
-    const displayedTotalOut = counterDecreaseDetected && latestSnapshot
-        ? Number(latestSnapshot.raw_out ?? 0)
-        : totalOut;
+    const displayedTotalIn = Number(latestSnapshot?.raw_in ?? 0);
+    const displayedTotalOut = Number(latestSnapshot?.raw_out ?? 0);
 
     return {
         series,
@@ -861,195 +948,91 @@ const aggregateBuildingFlow = (rows, { startMs = null, endMs = null, bucket = '1
         peakOccupancy,
         estimatedOccupancy: Number(latestSnapshot?.occupancy ?? 0),
         peakPeriodLabel: peakPeriod?.fullLabel || '-',
-        resetCount,
+        resetCount: 0,
+    };
+};
+
+const aggregateBuildingRangeTotals = (rows, { startMs = null, endMs = null } = {}) => {
+    const sortedRows = [...rows].sort((a, b) => (a.tsMs ?? 0) - (b.tsMs ?? 0));
+    const latestByDay = new Map();
+
+    sortedRows.forEach((row) => {
+        if (!row?.tsMs) return;
+        if (startMs != null && row.tsMs < startMs) return;
+        if (endMs != null && row.tsMs > endMs) return;
+
+        const dayStartMs = getBucketStartMs(row.tsMs, '1d');
+        const existing = latestByDay.get(dayStartMs);
+        if (!existing || row.tsMs > existing.tsMs) {
+            latestByDay.set(dayStartMs, row);
+        }
+    });
+
+    const latestRows = Array.from(latestByDay.values());
+    const totalIn = latestRows.reduce((sum, row) => sum + Number(row.raw_in ?? 0), 0);
+    const totalOut = latestRows.reduce((sum, row) => sum + Number(row.raw_out ?? 0), 0);
+
+    return {
+        totalIn,
+        totalOut,
+        totalTraffic: totalIn + totalOut,
+        dayCount: latestRows.length,
     };
 };
 
 const aggregateBuildingEntranceContribution = (rows, { startMs = null, endMs = null } = {}) => {
     const sortedRows = [...rows].sort((a, b) => (a.tsMs ?? 0) - (b.tsMs ?? 0));
-    const entranceMap = new Map();
     let latestSnapshot = null;
-    let counterDecreaseDetected = false;
-    let previousRow = null;
 
     sortedRows.forEach((row) => {
         if (!row?.tsMs) return;
-        if (startMs != null && row.tsMs < startMs) {
-            previousRow = row;
-            return;
-        }
+        if (startMs != null && row.tsMs < startMs) return;
         if (endMs != null && row.tsMs > endMs) {
             return;
         }
         if (!latestSnapshot || row.tsMs > latestSnapshot.tsMs) {
             latestSnapshot = row;
         }
+    });
 
-        const currentSummaries = row.entrance_summaries || {};
-        const previousSummaries = previousRow?.entrance_summaries || {};
-        const entranceIds = new Set([
-            ...Object.keys(previousSummaries),
-            ...Object.keys(currentSummaries),
-        ]);
-
-        entranceIds.forEach((entranceId) => {
-            const current = currentSummaries[entranceId] || {};
-            const previous = previousSummaries[entranceId] || {};
-            const currentIn = Number(current.total_in ?? 0);
-            const currentOut = Number(current.total_out ?? 0);
-            const previousIn = Number(previous.total_in ?? 0);
-            const previousOut = Number(previous.total_out ?? 0);
-            const resetDetected = previousRow && (currentIn < previousIn || currentOut < previousOut);
-            if (previousRow && (currentIn < previousIn || currentOut < previousOut)) {
-                counterDecreaseDetected = true;
-            }
-            const deltaIn = previousRow
-                ? Math.max(0, resetDetected ? currentIn : (currentIn - previousIn))
-                : Math.max(0, currentIn);
-            const deltaOut = previousRow
-                ? Math.max(0, resetDetected ? currentOut : (currentOut - previousOut))
-                : Math.max(0, currentOut);
-
-            const existing = entranceMap.get(entranceId) || {
+    const snapshotEntries = Object.entries(latestSnapshot?.entrance_summaries || {})
+        .map(([entranceId, entrance]) => {
+            const cameras = Object.entries(entrance?.camera_summaries || {})
+                .map(([cameraId, camera]) => {
+                    const totalIn = Number(camera?.total_in ?? 0);
+                    const totalOut = Number(camera?.total_out ?? 0);
+                    return {
+                        id: cameraId,
+                        totalIn,
+                        totalOut,
+                        totalTraffic: totalIn + totalOut,
+                        currentOccupancy: Number(camera?.occupancy ?? 0),
+                    };
+                })
+                .sort((a, b) => Number(b.totalTraffic || 0) - Number(a.totalTraffic || 0));
+            const totalIn = Number(entrance?.total_in ?? cameras.reduce((sum, camera) => sum + Number(camera.totalIn || 0), 0));
+            const totalOut = Number(entrance?.total_out ?? cameras.reduce((sum, camera) => sum + Number(camera.totalOut || 0), 0));
+            const totalTrafficForEntrance = totalIn + totalOut;
+            return {
                 name: entranceId,
-                totalIn: 0,
-                totalOut: 0,
-                totalTraffic: 0,
-                currentOccupancy: 0,
-                cameraCount: 0,
-                cameras: new Map(),
+                totalIn,
+                totalOut,
+                totalTraffic: totalTrafficForEntrance,
+                currentOccupancy: Number(entrance?.occupancy ?? 0),
+                cameraCount: Array.isArray(entrance?.camera_ids) ? entrance.camera_ids.length : cameras.length,
+                cameras,
             };
-
-            existing.totalIn += deltaIn;
-            existing.totalOut += deltaOut;
-            existing.totalTraffic += deltaIn + deltaOut;
-            existing.currentOccupancy = Number(current.occupancy ?? existing.currentOccupancy ?? 0);
-            const currentCameraSummaries = current.camera_summaries || {};
-            const previousCameraSummaries = previous.camera_summaries || {};
-            const cameraIds = new Set([
-                ...(Array.isArray(current.camera_ids) ? current.camera_ids : []),
-                ...(Array.isArray(previous.camera_ids) ? previous.camera_ids : []),
-                ...Object.keys(currentCameraSummaries),
-                ...Object.keys(previousCameraSummaries),
-            ]);
-
-            cameraIds.forEach((cameraId) => {
-                const currentCamera = currentCameraSummaries[cameraId] || {};
-                const previousCamera = previousCameraSummaries[cameraId] || {};
-                const currentCameraIn = Number(currentCamera.total_in ?? 0);
-                const currentCameraOut = Number(currentCamera.total_out ?? 0);
-                const previousCameraIn = Number(previousCamera.total_in ?? 0);
-                const previousCameraOut = Number(previousCamera.total_out ?? 0);
-                const cameraResetDetected = previousRow && (
-                    currentCameraIn < previousCameraIn
-                    || currentCameraOut < previousCameraOut
-                );
-                const deltaCameraIn = previousRow
-                    ? Math.max(0, cameraResetDetected ? currentCameraIn : (currentCameraIn - previousCameraIn))
-                    : Math.max(0, currentCameraIn);
-                const deltaCameraOut = previousRow
-                    ? Math.max(0, cameraResetDetected ? currentCameraOut : (currentCameraOut - previousCameraOut))
-                    : Math.max(0, currentCameraOut);
-
-                const existingCamera = existing.cameras.get(cameraId) || {
-                    id: cameraId,
-                    totalIn: 0,
-                    totalOut: 0,
-                    totalTraffic: 0,
-                    currentOccupancy: 0,
-                };
-
-                existingCamera.totalIn += deltaCameraIn;
-                existingCamera.totalOut += deltaCameraOut;
-                existingCamera.totalTraffic += deltaCameraIn + deltaCameraOut;
-                existingCamera.currentOccupancy = Number(currentCamera.occupancy ?? existingCamera.currentOccupancy ?? 0);
-                existing.cameras.set(cameraId, existingCamera);
-            });
-
-            existing.cameraCount = Math.max(existing.cameraCount, existing.cameras.size, Array.isArray(current.camera_ids) ? current.camera_ids.length : 0);
-            entranceMap.set(entranceId, existing);
-        });
-
-        previousRow = row;
-    });
-
-    const rawEntries = Array.from(entranceMap.values()).map((entry) => {
-        const cameras = Array.from(entry.cameras.values())
-            .map((camera) => ({
-                ...camera,
-                share: entry.totalTraffic > 0 ? (Number(camera.totalTraffic || 0) / Number(entry.totalTraffic || 0)) * 100 : 0,
-            }))
-            .sort((a, b) => {
-                const trafficDelta = Number(b.totalTraffic || 0) - Number(a.totalTraffic || 0);
-                if (trafficDelta !== 0) return trafficDelta;
-                return String(a.id || '').localeCompare(String(b.id || ''));
-            });
-
-        return {
-            ...entry,
-            cameraCount: Math.max(entry.cameraCount, cameras.length),
-            cameras,
-        };
-    });
-    const totalTraffic = rawEntries.reduce((sum, entry) => sum + Number(entry.totalTraffic || 0), 0);
-    const entries = rawEntries
-        .map((entry) => ({
-            ...entry,
-            share: totalTraffic > 0 ? (Number(entry.totalTraffic || 0) / totalTraffic) * 100 : 0,
-        }))
-        .sort((a, b) => {
-            const trafficDelta = Number(b.totalTraffic || 0) - Number(a.totalTraffic || 0);
-            if (trafficDelta !== 0) return trafficDelta;
-            return String(a.name || '').localeCompare(String(b.name || ''));
-        });
-
-    if (counterDecreaseDetected && latestSnapshot?.entrance_summaries) {
-        const snapshotEntries = Object.entries(latestSnapshot.entrance_summaries || {})
-            .map(([entranceId, entrance]) => {
-                const cameras = Object.entries(entrance?.camera_summaries || {})
-                    .map(([cameraId, camera]) => {
-                        const totalIn = Number(camera?.total_in ?? 0);
-                        const totalOut = Number(camera?.total_out ?? 0);
-                        return {
-                            id: cameraId,
-                            totalIn,
-                            totalOut,
-                            totalTraffic: totalIn + totalOut,
-                            currentOccupancy: Number(camera?.occupancy ?? 0),
-                        };
-                    })
-                    .sort((a, b) => Number(b.totalTraffic || 0) - Number(a.totalTraffic || 0));
-                const totalIn = cameras.reduce((sum, camera) => sum + Number(camera.totalIn || 0), 0);
-                const totalOut = cameras.reduce((sum, camera) => sum + Number(camera.totalOut || 0), 0);
-                const totalTrafficForEntrance = totalIn + totalOut;
-                return {
-                    name: entranceId,
-                    totalIn,
-                    totalOut,
-                    totalTraffic: totalTrafficForEntrance,
-                    currentOccupancy: Number(entrance?.occupancy ?? 0),
-                    cameraCount: Array.isArray(entrance?.camera_ids) ? entrance.camera_ids.length : cameras.length,
-                    cameras,
-                };
-            })
-            .sort((a, b) => Number(b.totalTraffic || 0) - Number(a.totalTraffic || 0));
-        const snapshotTotalTraffic = snapshotEntries.reduce((sum, entry) => sum + Number(entry.totalTraffic || 0), 0);
-        const normalizedEntries = snapshotEntries.map((entry) => ({
-            ...entry,
-            share: snapshotTotalTraffic > 0 ? (Number(entry.totalTraffic || 0) / snapshotTotalTraffic) * 100 : 0,
-            cameras: (entry.cameras || []).map((camera) => ({
-                ...camera,
-                share: Number(entry.totalTraffic || 0) > 0 ? (Number(camera.totalTraffic || 0) / Number(entry.totalTraffic || 0)) * 100 : 0,
-            })),
-        }));
-        return {
-            entries: normalizedEntries,
-            totalTraffic: snapshotTotalTraffic,
-            totalIn: normalizedEntries.reduce((sum, entry) => sum + Number(entry.totalIn || 0), 0),
-            totalOut: normalizedEntries.reduce((sum, entry) => sum + Number(entry.totalOut || 0), 0),
-            busiestEntrance: normalizedEntries[0] || null,
-        };
-    }
+        })
+        .sort((a, b) => Number(b.totalTraffic || 0) - Number(a.totalTraffic || 0));
+    const totalTraffic = snapshotEntries.reduce((sum, entry) => sum + Number(entry.totalTraffic || 0), 0);
+    const entries = snapshotEntries.map((entry) => ({
+        ...entry,
+        share: totalTraffic > 0 ? (Number(entry.totalTraffic || 0) / totalTraffic) * 100 : 0,
+        cameras: (entry.cameras || []).map((camera) => ({
+            ...camera,
+            share: Number(entry.totalTraffic || 0) > 0 ? (Number(camera.totalTraffic || 0) / Number(entry.totalTraffic || 0)) * 100 : 0,
+        })),
+    }));
 
     return {
         entries,
@@ -1102,10 +1085,18 @@ const normalizeDressCodeSubtype = (label) => {
 const aggregateDressCodeAnalytics = (events, snapshots, { startMs = null, endMs = null, bucket = null } = {}) => {
     const relevantEvents = events.filter((evt) => evt.event_type === 'Dress Code Violation');
     const trafficBucket = bucket || getAdaptiveFlowBucket('custom', startMs, endMs);
-    const trafficSummary = aggregateTrafficAnalytics(snapshots, {
-        startMs,
-        endMs,
-        bucket: trafficBucket,
+    const normalizedSnapshots = normalizeSnapshotRows(snapshots);
+    const snapshotsByCamera = new Map();
+    const cameraLabelById = new Map();
+    const violationCountByCamera = new Map();
+    const uniqueViolatorKeysByCamera = new Map();
+    const uniqueViolatorBucketKeysByCamera = new Map();
+    normalizedSnapshots.forEach((row) => {
+        if (!row?.camera_id) return;
+        const existing = snapshotsByCamera.get(row.camera_id) || [];
+        existing.push(row);
+        snapshotsByCamera.set(row.camera_id, existing);
+        cameraLabelById.set(row.camera_id, getCameraLabel(row));
     });
     const violationBucketMap = new Map();
     const violationBreakdownMap = new Map([
@@ -1114,6 +1105,7 @@ const aggregateDressCodeAnalytics = (events, snapshots, { startMs = null, endMs 
         ['Others', 0],
     ]);
     const violatorKeys = new Set();
+    const violationCameraIds = new Set();
 
     relevantEvents.forEach((evt) => {
         const ts = parseApiTimestamp(evt.timestamp);
@@ -1121,11 +1113,27 @@ const aggregateDressCodeAnalytics = (events, snapshots, { startMs = null, endMs 
         const tsMs = ts.getTime();
         const bucketStartMs = getBucketStartMs(tsMs, trafficBucket);
         const subtype = normalizeDressCodeSubtype(evt.details?.label);
+        if (evt.camera_id) {
+            violationCameraIds.add(evt.camera_id);
+            cameraLabelById.set(evt.camera_id, getCameraLabel(evt));
+            violationCountByCamera.set(evt.camera_id, (violationCountByCamera.get(evt.camera_id) || 0) + 1);
+        }
         const violationKey = evt.details?.track_id != null
             ? `${evt.camera_id || 'unknown'}:${evt.details.track_id}`
             : `${evt.camera_id || 'unknown'}:${evt.id}`;
 
         violatorKeys.add(violationKey);
+        if (evt.camera_id) {
+            const perCameraViolators = uniqueViolatorKeysByCamera.get(evt.camera_id) || new Set();
+            perCameraViolators.add(violationKey);
+            uniqueViolatorKeysByCamera.set(evt.camera_id, perCameraViolators);
+
+            const perCameraBuckets = uniqueViolatorBucketKeysByCamera.get(evt.camera_id) || new Map();
+            const bucketViolators = perCameraBuckets.get(bucketStartMs) || new Set();
+            bucketViolators.add(violationKey);
+            perCameraBuckets.set(bucketStartMs, bucketViolators);
+            uniqueViolatorBucketKeysByCamera.set(evt.camera_id, perCameraBuckets);
+        }
         violationBreakdownMap.set(subtype, (violationBreakdownMap.get(subtype) || 0) + 1);
 
         const bucketEntry = violationBucketMap.get(bucketStartMs) || {
@@ -1138,30 +1146,99 @@ const aggregateDressCodeAnalytics = (events, snapshots, { startMs = null, endMs 
         violationBucketMap.set(bucketStartMs, bucketEntry);
     });
 
-    const trafficByBucket = new Map(trafficSummary.series.map((point) => [point.tsMs, point]));
+    const scopedCameraIds = new Set([
+        ...Array.from(snapshotsByCamera.keys()),
+        ...Array.from(violationCameraIds),
+    ]);
+    const denominatorSeriesByCamera = new Map();
+    const denominatorTotalByCamera = new Map();
+    const denominatorSourceByCamera = new Map();
+
+    snapshotsByCamera.forEach((cameraRows, cameraId) => {
+        const trafficSummary = aggregateTrafficAnalytics(cameraRows, {
+            startMs,
+            endMs,
+            bucket: trafficBucket,
+        });
+        const movementSummary = aggregateCountingFlow(cameraRows, {
+            startMs,
+            endMs,
+            bucket: trafficBucket,
+        });
+
+        if (Number(trafficSummary.totalFootTraffic || 0) > 0) {
+            const adjustedTrafficBase = Number(trafficSummary.totalFootTraffic || 0) + Number(movementSummary.totalOut || 0);
+            denominatorSourceByCamera.set(cameraId, 'foot_traffic_plus_out');
+            denominatorTotalByCamera.set(cameraId, adjustedTrafficBase);
+            denominatorSeriesByCamera.set(
+                cameraId,
+                new Map(
+                    Array.from(new Set([
+                        ...trafficSummary.series.map((point) => point.tsMs),
+                        ...movementSummary.series.map((point) => point.tsMs),
+                    ])).map((tsMs) => {
+                        const trafficPoint = trafficSummary.series.find((point) => point.tsMs === tsMs);
+                        const movementPoint = movementSummary.series.find((point) => point.tsMs === tsMs);
+                        return [
+                            tsMs,
+                            Number(trafficPoint?.totalFootTraffic || 0) + Number(movementPoint?.out || 0),
+                        ];
+                    }),
+                ),
+            );
+            return;
+        }
+
+        if (Number(movementSummary.totalTraffic || 0) > 0) {
+            denominatorSourceByCamera.set(cameraId, 'movement');
+            denominatorTotalByCamera.set(cameraId, Number(movementSummary.totalTraffic || 0));
+            denominatorSeriesByCamera.set(
+                cameraId,
+                new Map(movementSummary.series.map((point) => [point.tsMs, Number(point.totalTraffic || 0)])),
+            );
+        }
+    });
+
+    const eligibleUniqueViolatorCountByCamera = new Map(
+        Array.from(uniqueViolatorKeysByCamera.entries())
+            .filter(([cameraId]) => denominatorTotalByCamera.has(cameraId))
+            .map(([cameraId, keys]) => [cameraId, keys.size]),
+    );
+
     const mergedRateSeries = Array.from(new Set([
-        ...trafficSummary.series.map((point) => point.tsMs),
+        ...Array.from(denominatorSeriesByCamera.values()).flatMap((seriesMap) => Array.from(seriesMap.keys())),
         ...violationBucketMap.keys(),
     ]))
         .sort((a, b) => a - b)
         .map((tsMs) => {
-            const trafficPoint = trafficByBucket.get(tsMs);
-            const violationPoint = violationBucketMap.get(tsMs);
-            const trafficCount = Number(trafficPoint?.totalFootTraffic ?? 0);
-            const violations = Number(violationPoint?.violations ?? 0);
+            let trafficCount = 0;
+            let eligibleUniqueViolators = 0;
+            denominatorSeriesByCamera.forEach((seriesMap) => {
+                trafficCount += Number(seriesMap.get(tsMs) || 0);
+            });
+            denominatorSeriesByCamera.forEach((_, cameraId) => {
+                const perCameraBuckets = uniqueViolatorBucketKeysByCamera.get(cameraId);
+                eligibleUniqueViolators += perCameraBuckets?.get(tsMs)?.size || 0;
+            });
+            const violations = eligibleUniqueViolators;
             return {
                 tsMs,
                 label: formatFlowBucketTick(tsMs, trafficBucket),
                 fullLabel: formatFlowBucketRange(tsMs, trafficBucket),
                 violations,
                 totalFootTraffic: trafficCount,
-                violationRate: trafficCount > 0 ? (violations / trafficCount) * 100 : 0,
+                violationRate: trafficCount > 0 ? Math.min(100, (violations / trafficCount) * 100) : 0,
             };
         });
 
     const totalViolations = relevantEvents.length;
-    const totalTrafficBase = Number(trafficSummary.totalFootTraffic || 0);
-    const violationRate = totalTrafficBase > 0 ? (totalViolations / totalTrafficBase) * 100 : 0;
+    const rateEligibleUniqueViolators = Array.from(eligibleUniqueViolatorCountByCamera.values())
+        .reduce((sum, value) => sum + Number(value || 0), 0);
+    const totalTrafficBase = Array.from(denominatorTotalByCamera.values())
+        .reduce((sum, value) => sum + Number(value || 0), 0);
+    const violationRate = totalTrafficBase > 0
+        ? Math.min(100, (rateEligibleUniqueViolators / totalTrafficBase) * 100)
+        : 0;
     const peakViolationPoint = mergedRateSeries.reduce((best, point) => {
         if (point.violations <= 0) return best;
         if (!best || point.violations > best.violations) return point;
@@ -1182,16 +1259,129 @@ const aggregateDressCodeAnalytics = (events, snapshots, { startMs = null, endMs 
         };
     });
 
+    const camerasWithRateBase = Array.from(scopedCameraIds).filter((cameraId) => denominatorTotalByCamera.has(cameraId));
+    const violatingCamerasWithoutRateBase = Array.from(violationCameraIds).filter((cameraId) => !denominatorTotalByCamera.has(cameraId));
+    const rateBreakdownByCamera = Array.from(scopedCameraIds)
+        .map((cameraId) => ({
+            cameraId,
+            cameraLabel: cameraLabelById.get(cameraId) || cameraId || 'Unknown Camera',
+            violationCount: Number(violationCountByCamera.get(cameraId) || 0),
+            uniqueViolators: Number(uniqueViolatorKeysByCamera.get(cameraId)?.size || 0),
+            eligibleUniqueViolators: Number(eligibleUniqueViolatorCountByCamera.get(cameraId) || 0),
+            denominatorSource: denominatorSourceByCamera.get(cameraId) || null,
+            denominatorValue: Number(denominatorTotalByCamera.get(cameraId) || 0),
+            includedInRate: denominatorTotalByCamera.has(cameraId),
+        }))
+        .sort((a, b) => {
+            if (Number(b.includedInRate) !== Number(a.includedInRate)) {
+                return Number(b.includedInRate) - Number(a.includedInRate);
+            }
+            if (b.violationCount !== a.violationCount) {
+                return b.violationCount - a.violationCount;
+            }
+            return a.cameraLabel.localeCompare(b.cameraLabel);
+        });
+
     return {
         totalViolations,
+        rateEligibleUniqueViolators,
         uniqueViolators: violatorKeys.size,
         violationRate,
         peakViolationTimeLabel: peakViolationPoint?.fullLabel || '-',
         peakConversionLabel: peakRatePoint?.fullLabel || '-',
         breakdown,
         rateSeries: mergedRateSeries,
-        trafficSummary,
+        totalTrafficBase,
+        scopedCameraCount: scopedCameraIds.size,
+        camerasWithRateBaseCount: camerasWithRateBase.length,
+        violatingCameraCount: violationCameraIds.size,
+        violatingCamerasWithoutRateBaseCount: violatingCamerasWithoutRateBase.length,
+        hasTrafficBase: totalTrafficBase > 0,
+        denominatorSourceByCamera,
+        rateBreakdownByCamera,
     };
+};
+
+const getDressCodeRateCoverageNote = (analytics) => {
+    if (!analytics) return null;
+
+    if (!analytics.hasTrafficBase) {
+        if (analytics.scopedCameraCount > 0) {
+            return `No valid traffic base for ${formatNumber(analytics.scopedCameraCount)} camera(s)`;
+        }
+        return 'No valid traffic base in selected scope';
+    }
+
+    if (
+        Number(analytics.camerasWithRateBaseCount || 0) > 0
+        && Number(analytics.scopedCameraCount || 0) > Number(analytics.camerasWithRateBaseCount || 0)
+    ) {
+        return `Rate based on ${formatNumber(analytics.camerasWithRateBaseCount)} of ${formatNumber(analytics.scopedCameraCount)} cameras`;
+    }
+
+    return null;
+};
+
+const formatDressCodeDenominatorSource = (source) => {
+    if (source === 'foot_traffic_plus_out') return 'Foot traffic + total out';
+    if (source === 'movement') return 'Total traffic fallback';
+    return 'No traffic base';
+};
+
+const DressCodeRateBreakdown = ({ analytics, compact = false }) => {
+    const [isExpanded, setIsExpanded] = useState(false);
+    const rows = analytics?.rateBreakdownByCamera || [];
+
+    if (!rows.length) return null;
+
+    return (
+        <div className={cn('mt-2', compact ? 'space-y-1' : 'space-y-2')}>
+            <button
+                type="button"
+                onClick={() => setIsExpanded((prev) => !prev)}
+                className="inline-flex items-center gap-1 text-xs font-medium text-blue-700 transition hover:text-blue-800"
+            >
+                {isExpanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+                {isExpanded ? 'Hide rate basis' : 'Show rate basis'}
+            </button>
+            {isExpanded && (
+                <div className={cn(
+                    'rounded-lg border border-slate-200 bg-white/70',
+                    compact ? 'p-2' : 'p-3',
+                )}>
+                    <div className="grid grid-cols-[minmax(0,1.4fr)_auto_auto_auto] gap-2 border-b border-slate-200 pb-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                        <span>Camera</span>
+                        <span className="text-right">Unique</span>
+                        <span className="text-right">Traffic Base</span>
+                        <span className="text-right">Used</span>
+                    </div>
+                    <div className="mt-2 space-y-2">
+                        {rows.map((row) => (
+                            <div key={row.cameraId} className="grid grid-cols-[minmax(0,1.4fr)_auto_auto_auto] gap-2 text-xs text-slate-700">
+                                <div className="min-w-0">
+                                    <div className="truncate font-medium text-slate-900">{row.cameraLabel}</div>
+                                    <div className="truncate text-[11px] text-muted-foreground">
+                                        {formatDressCodeDenominatorSource(row.denominatorSource)}
+                                        {row.violationCount > 0 ? ` | ${formatNumber(row.violationCount)} violation${row.violationCount !== 1 ? 's' : ''}` : ''}
+                                    </div>
+                                </div>
+                                <div className="text-right font-medium">{formatNumber(row.uniqueViolators)}</div>
+                                <div className="text-right font-medium">
+                                    {row.includedInRate ? formatNumber(row.denominatorValue) : '-'}
+                                </div>
+                                <div className={cn(
+                                    'text-right font-medium',
+                                    row.includedInRate ? 'text-green-700' : 'text-slate-500',
+                                )}>
+                                    {row.includedInRate ? 'Yes' : 'No'}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
+        </div>
+    );
 };
 
 const aggregateFallDetectionAnalytics = (events) => {
@@ -1279,6 +1469,10 @@ const DetailModal = ({ record, onClose, apiUrl }) => {
                             <p>{formatTimestamp(record.timestamp)}</p>
                         </div>
                         <div>
+                            <p className="text-muted-foreground font-medium">Processed At</p>
+                            <p>{formatTimestamp(record.processed_at)}</p>
+                        </div>
+                        <div>
                             <p className="text-muted-foreground font-medium">Camera Name</p>
                             <p className="truncate">{getCameraLabel(record)}</p>
                         </div>
@@ -1300,6 +1494,10 @@ const DetailModal = ({ record, onClose, apiUrl }) => {
                                 <div>
                                     <p className="text-muted-foreground font-medium">Occupancy</p>
                                     <p className="text-primary font-bold">{record.current_occupancy}</p>
+                                </div>
+                                <div>
+                                    <p className="text-muted-foreground font-medium">Foot Traffic</p>
+                                    <p className="text-slate-700 font-bold">{formatNumber(record.foot_traffic_total)}</p>
                                 </div>
                             </>
                         ) : (
@@ -1333,6 +1531,12 @@ const DetailModal = ({ record, onClose, apiUrl }) => {
                                     <div>
                                         <p className="text-muted-foreground font-medium">Occupancy</p>
                                         <p>{record.details.occupancy}</p>
+                                    </div>
+                                )}
+                                {record.details?.building_id && (
+                                    <div>
+                                        <p className="text-muted-foreground font-medium">Building ID</p>
+                                        <p>{record.details.building_id}</p>
                                     </div>
                                 )}
                                 {record.details?.max_capacity !== undefined && (
@@ -1615,12 +1819,6 @@ const TrafficAnalyticsPanel = ({ snapshots, cameraLabel, startMs, endMs, isAllCa
                 </div>
             )}
 
-            {trafficSummary.resetCount > 0 && (
-                <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-700">
-                    {/* Traffic counter resets were detected in the selected report range. Foot-traffic and capture-rate trends are rebuilt from changes between saved snapshots. */}
-                </div>
-            )}
-
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
                   <div className="rounded-xl border border-sky-500/20 bg-sky-500/10 p-4">
                       <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -1889,6 +2087,10 @@ const DressCodeAnalyticsPanel = ({ events, snapshots, cameraLabel, startMs, endM
             bucket: effectiveBucket,
         });
     }, [analytics, chartRangeBounds.endMs, chartRangeBounds.startMs, chartRangeBounds.valid, effectiveBucket, events, snapshots]);
+    const violationRateCoverageNote = useMemo(
+        () => getDressCodeRateCoverageNote(analytics),
+        [analytics],
+    );
 
     return (
         <div className="space-y-6">
@@ -1925,7 +2127,13 @@ const DressCodeAnalyticsPanel = ({ events, snapshots, cameraLabel, startMs, endM
                         <TrendingUp className="h-4 w-4 text-amber-600" />
                         Violation Rate
                     </div>
-                    <div className="mt-2 text-3xl font-bold text-amber-700">{formatPercent(analytics.violationRate)}</div>
+                    <div className="mt-2 text-3xl font-bold text-amber-700">
+                        {analytics.hasTrafficBase ? formatPercent(analytics.violationRate) : '-'}
+                    </div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                        {violationRateCoverageNote || 'Based on available traffic denominator'}
+                    </div>
+                    <DressCodeRateBreakdown analytics={analytics} />
                 </div>
                 <div className="rounded-xl border border-indigo-500/20 bg-indigo-500/10 p-4">
                     <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -2030,10 +2238,17 @@ const DressCodeAnalyticsPanel = ({ events, snapshots, cameraLabel, startMs, endM
                     <CardContent className="flex-1 min-h-[260px]">
                         {chartAnalytics.rateSeries.length > 0 ? (
                             <ResponsiveContainer width="100%" height="100%">
-                                <LineChart data={chartAnalytics.rateSeries} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                                <LineChart data={chartAnalytics.rateSeries} margin={{ top: 10, right: 10, left: 8, bottom: 0 }}>
                                     <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
                                     <XAxis dataKey="label" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
-                                    <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} tickFormatter={(value) => `${value}%`} domain={[0, 'auto']} />
+                                    <YAxis
+                                        width={42}
+                                        className="text-xs text-muted-foreground"
+                                        tickLine={false}
+                                        axisLine={false}
+                                        tickFormatter={(value) => `${Math.round(Number(value || 0))}%`}
+                                        domain={[0, 'auto']}
+                                    />
                                     <RechartsTooltip
                                         cursor={{ strokeDasharray: '3 3' }}
                                         labelFormatter={(_, payload) => payload?.[0]?.payload?.fullLabel || ''}
@@ -2068,10 +2283,14 @@ const BuildingOccupancyPanel = ({
     visible,
     cameraNameById,
     countingSnapshots,
+    selectedSourceFilter = 'all',
+    selectedCameraFilter = 'all',
+    cameraSourceKindById = {},
     preferLatestSnapshotTotals = false,
 }) => {
     const [buildingSummary, setBuildingSummary] = useState(EMPTY_BUILDING_SUMMARY);
     const [buildingHistory, setBuildingHistory] = useState([]);
+    const [selectedBuildingId, setSelectedBuildingId] = useState('all');
     const [loading, setLoading] = useState(false);
     const [rangeNowMs, setRangeNowMs] = useState(() => Date.now());
     const [brushWindow, setBrushWindow] = useState({ key: '', startTs: null, endTs: null });
@@ -2128,7 +2347,7 @@ const BuildingOccupancyPanel = ({
 
             const normalizedRows = rows
                 .map((row) => {
-                    const ts = parseApiTimestamp(row.timestamp);
+                    const ts = parseApiTimestamp(row.timestamp) || parseApiTimestamp(row.processed_at);
                     if (!ts) return null;
                     return {
                         ...row,
@@ -2183,23 +2402,123 @@ const BuildingOccupancyPanel = ({
         endMs: reportEndMs ?? rangeNowMs,
     }), [rangeNowMs, reportEndMs, reportStartMs]);
 
+    const scopedBuildingSummaryByCameraScope = useMemo(() => (
+        filterBuildingAggregateForScope(buildingSummary, {
+            selectedSourceFilter,
+            selectedCameraFilter,
+            cameraSourceKindById,
+        })
+    ), [buildingSummary, cameraSourceKindById, selectedCameraFilter, selectedSourceFilter]);
+
+    const scopedBuildingHistoryByCameraScope = useMemo(() => (
+        buildingHistory
+            .map((row) => filterBuildingAggregateForScope(row, {
+                selectedSourceFilter,
+                selectedCameraFilter,
+                cameraSourceKindById,
+            }))
+            .filter((row) => {
+                if (selectedSourceFilter === 'all' && selectedCameraFilter === 'all') return true;
+                return Object.keys(row?.entrance_summaries || {}).length > 0;
+            })
+    ), [buildingHistory, cameraSourceKindById, selectedCameraFilter, selectedSourceFilter]);
+
     const filteredHistory = useMemo(() => {
         if (!panelRangeBounds.valid) return [];
-        return buildingHistory.filter((row) => {
+        return scopedBuildingHistoryByCameraScope.filter((row) => {
             if (panelRangeBounds.startMs !== null && row.tsMs < panelRangeBounds.startMs) return false;
             if (panelRangeBounds.endMs !== null && row.tsMs > panelRangeBounds.endMs) return false;
             return true;
         });
-    }, [buildingHistory, panelRangeBounds]);
+    }, [panelRangeBounds, scopedBuildingHistoryByCameraScope]);
+
+    const buildingIdOptions = useMemo(() => {
+        const ids = new Set();
+        Object.keys(scopedBuildingSummaryByCameraScope.entrance_summaries ?? {}).forEach((buildingId) => {
+            if (buildingId) ids.add(buildingId);
+        });
+        filteredHistory.forEach((row) => {
+            Object.keys(row.entrance_summaries ?? {}).forEach((buildingId) => {
+                if (buildingId) ids.add(buildingId);
+            });
+        });
+        return ['all', ...Array.from(ids).sort((left, right) => String(left).localeCompare(String(right), undefined, {
+            numeric: true,
+            sensitivity: 'base',
+        }))];
+    }, [filteredHistory, scopedBuildingSummaryByCameraScope.entrance_summaries]);
+
+    useEffect(() => {
+        if (buildingIdOptions.includes(selectedBuildingId)) return;
+        setSelectedBuildingId('all');
+    }, [buildingIdOptions, selectedBuildingId]);
+
+    const scopedBuildingSummary = useMemo(() => {
+        if (selectedBuildingId === 'all') {
+            return scopedBuildingSummaryByCameraScope;
+        }
+
+        const entrance = scopedBuildingSummaryByCameraScope.entrance_summaries?.[selectedBuildingId] || {};
+        const cameraIds = Array.isArray(entrance.camera_ids) ? entrance.camera_ids : [];
+        const maxCapacity = entrance.max_capacity ?? null;
+        const occupancy = Number(entrance.occupancy ?? 0);
+
+        return {
+            ...scopedBuildingSummaryByCameraScope,
+            max_capacity: maxCapacity,
+            capacity_exceeded: Boolean(entrance.capacity_exceeded),
+            exceeded_building_ids: entrance.capacity_exceeded ? [selectedBuildingId] : [],
+            manual_offset: 0,
+            raw_in: Number(entrance.total_in ?? 0),
+            raw_out: Number(entrance.total_out ?? 0),
+            raw_occupancy: occupancy,
+            occupancy,
+            active_camera_count: cameraIds.length,
+            entrance_summaries: {
+                [selectedBuildingId]: {
+                    ...entrance,
+                    camera_ids: cameraIds,
+                },
+            },
+        };
+    }, [scopedBuildingSummaryByCameraScope, selectedBuildingId]);
+
+    const scopedHistory = useMemo(() => {
+        if (selectedBuildingId === 'all') {
+            return filteredHistory;
+        }
+
+        return filteredHistory.map((row) => {
+            const entrance = row.entrance_summaries?.[selectedBuildingId] || {};
+            const occupancy = Number(entrance.occupancy ?? 0);
+            return {
+                ...row,
+                raw_in: Number(entrance.total_in ?? 0),
+                raw_out: Number(entrance.total_out ?? 0),
+                raw_occupancy: occupancy,
+                max_capacity: entrance.max_capacity ?? null,
+                capacity_exceeded: Boolean(entrance.capacity_exceeded),
+                manual_offset: 0,
+                occupancy,
+                active_camera_count: Array.isArray(entrance.camera_ids) ? entrance.camera_ids.length : 0,
+                entrance_summaries: {
+                    [selectedBuildingId]: {
+                        ...entrance,
+                        camera_ids: Array.isArray(entrance.camera_ids) ? entrance.camera_ids : [],
+                    },
+                },
+            };
+        });
+    }, [filteredHistory, selectedBuildingId]);
 
     const historyRangeKey = useMemo(() => {
-        if (filteredHistory.length < 2) return '24h';
-        const durationMs = filteredHistory[filteredHistory.length - 1].tsMs - filteredHistory[0].tsMs;
+        if (scopedHistory.length < 2) return '24h';
+        const durationMs = scopedHistory[scopedHistory.length - 1].tsMs - scopedHistory[0].tsMs;
         return durationMs <= OCCUPANCY_RANGE_LOOKBACK_MS['24h'] ? '24h' : '7d';
-    }, [filteredHistory]);
+    }, [scopedHistory]);
 
     const chartData = useMemo(() => {
-        const sampledRows = downsampleSeries(filteredHistory, 2000);
+        const sampledRows = downsampleSeries(scopedHistory, 2000);
         return sampledRows.map((row) => ({
             time: getOccupancyTickLabel(row.ts, historyRangeKey),
             fullTime: row.ts.toLocaleString(),
@@ -2207,7 +2526,7 @@ const BuildingOccupancyPanel = ({
             occupancy: row.occupancy,
             rawOccupancy: row.raw_occupancy,
         }));
-    }, [filteredHistory, historyRangeKey]);
+    }, [historyRangeKey, scopedHistory]);
 
     const effectiveBucket = useMemo(() => {
         if (selectedBucket !== 'auto') return selectedBucket;
@@ -2271,18 +2590,22 @@ const BuildingOccupancyPanel = ({
             };
         }
 
-        return aggregateBuildingFlow(buildingHistory, {
+        return aggregateBuildingFlow(scopedHistory, {
             startMs: panelRangeBounds.startMs,
             endMs: panelRangeBounds.endMs,
             bucket: effectiveBucket,
         });
-    }, [buildingHistory, effectiveBucket, panelRangeBounds]);
+    }, [effectiveBucket, panelRangeBounds, scopedHistory]);
 
-    const rangeSummary = useMemo(() => aggregateBuildingFlow(buildingHistory, {
+    const rangeSummary = useMemo(() => aggregateBuildingFlow(scopedHistory, {
         startMs: panelRangeBounds.valid ? panelRangeBounds.startMs : null,
         endMs: panelRangeBounds.valid ? panelRangeBounds.endMs : null,
         bucket: effectiveBucket,
-    }), [buildingHistory, effectiveBucket, panelRangeBounds]);
+    }), [effectiveBucket, panelRangeBounds, scopedHistory]);
+    const rangeTotalsSummary = useMemo(() => aggregateBuildingRangeTotals(scopedHistory, {
+        startMs: panelRangeBounds.valid ? panelRangeBounds.startMs : null,
+        endMs: panelRangeBounds.valid ? panelRangeBounds.endMs : null,
+    }), [panelRangeBounds, scopedHistory]);
 
     const latestBuildingSnapshotSummary = useMemo(() => summarizeLatestSnapshots(countingSnapshots, {
         startMs: panelRangeBounds.valid ? panelRangeBounds.startMs : null,
@@ -2292,12 +2615,12 @@ const BuildingOccupancyPanel = ({
     const latestBuildingEntranceContribution = useMemo(() => (
         buildEntranceContributionFromLatestSnapshots({
             latestSnapshotSummary: latestBuildingSnapshotSummary,
-            entranceSummaries: buildingSummary.entrance_summaries,
+            entranceSummaries: scopedBuildingSummary.entrance_summaries,
         })
-    ), [buildingSummary.entrance_summaries, latestBuildingSnapshotSummary]);
+    ), [latestBuildingSnapshotSummary, scopedBuildingSummary.entrance_summaries]);
 
     const entranceContribution = useMemo(() => {
-        const aggregated = aggregateBuildingEntranceContribution(buildingHistory, {
+        const aggregated = aggregateBuildingEntranceContribution(scopedHistory, {
             startMs: panelRangeBounds.valid ? panelRangeBounds.startMs : null,
             endMs: panelRangeBounds.valid ? panelRangeBounds.endMs : null,
         });
@@ -2305,7 +2628,7 @@ const BuildingOccupancyPanel = ({
             return aggregated;
         }
 
-        const liveEntries = Object.entries(buildingSummary.entrance_summaries ?? {})
+        const liveEntries = Object.entries(scopedBuildingSummary.entrance_summaries ?? {})
             .map(([entranceId, entrance]) => ({
                 name: entranceId,
                 totalIn: Number(entrance?.total_in ?? 0),
@@ -2341,11 +2664,11 @@ const BuildingOccupancyPanel = ({
             totalOut: entries.reduce((sum, entry) => sum + Number(entry.totalOut || 0), 0),
             busiestEntrance: entries[0] || null,
         };
-    }, [buildingHistory, buildingSummary.entrance_summaries, panelRangeBounds]);
+    }, [panelRangeBounds, scopedBuildingSummary.entrance_summaries, scopedHistory]);
     const deltaEntranceContributionWithCameraBreakdown = useMemo(() => {
         const entries = entranceContribution.entries.map((entry) => {
-            const configuredCameraIds = Array.isArray(buildingSummary.entrance_summaries?.[entry.name]?.camera_ids)
-                ? buildingSummary.entrance_summaries[entry.name].camera_ids
+            const configuredCameraIds = Array.isArray(scopedBuildingSummary.entrance_summaries?.[entry.name]?.camera_ids)
+                ? scopedBuildingSummary.entrance_summaries[entry.name].camera_ids
                 : [];
 
             if (!configuredCameraIds.length) {
@@ -2398,38 +2721,52 @@ const BuildingOccupancyPanel = ({
             entries,
             busiestEntrance: entries[0] || null,
         };
-    }, [buildingSummary.entrance_summaries, countingSnapshots, entranceContribution, panelRangeBounds]);
-    const useLatestBuildingSnapshotTotals = preferLatestSnapshotTotals && latestBuildingSnapshotSummary.snapshotCount > 0;
-    const entranceContributionWithCameraBreakdown = useLatestBuildingSnapshotTotals
+    }, [countingSnapshots, entranceContribution, panelRangeBounds, scopedBuildingSummary.entrance_summaries]);
+    const latestScopedHistoryRow = scopedHistory.length > 0 ? scopedHistory[scopedHistory.length - 1] : null;
+    const useLatestBuildingSnapshotTotals = selectedBuildingId === 'all' && preferLatestSnapshotTotals && latestBuildingSnapshotSummary.snapshotCount > 0;
+    const useLatestBuildingRangeTotals = preferLatestSnapshotTotals && (
+        selectedBuildingId === 'all'
+            ? latestBuildingSnapshotSummary.snapshotCount > 0
+            : Boolean(latestScopedHistoryRow)
+    );
+    const entranceContributionWithCameraBreakdown = selectedBuildingId === 'all' && useLatestBuildingSnapshotTotals
         ? latestBuildingEntranceContribution
         : deltaEntranceContributionWithCameraBreakdown;
-    const displayedRangeIn = useLatestBuildingSnapshotTotals
+    const latestScopedRangeIn = selectedBuildingId === 'all'
         ? Number(latestBuildingSnapshotSummary.totalIn ?? 0)
-        : Number(rangeSummary.totalIn ?? 0);
-    const displayedRangeOut = useLatestBuildingSnapshotTotals
+        : Number(latestScopedHistoryRow?.raw_in ?? 0);
+    const latestScopedRangeOut = selectedBuildingId === 'all'
         ? Number(latestBuildingSnapshotSummary.totalOut ?? 0)
-        : Number(rangeSummary.totalOut ?? 0);
-    const displayedFlowIn = useLatestBuildingSnapshotTotals
-        ? Number(latestBuildingSnapshotSummary.totalIn ?? 0)
-        : Number(flowSummary.totalIn ?? 0);
-    const displayedFlowOut = useLatestBuildingSnapshotTotals
-        ? Number(latestBuildingSnapshotSummary.totalOut ?? 0)
-        : Number(flowSummary.totalOut ?? 0);
-    const displayedFlowTraffic = useLatestBuildingSnapshotTotals
-        ? Number(latestBuildingSnapshotSummary.totalTraffic ?? 0)
-        : Number(flowSummary.totalTraffic ?? 0);
-    const displayedBuildingOccupancy = useLatestBuildingSnapshotTotals
-        ? Number(latestBuildingSnapshotSummary.estimatedOccupancy ?? 0)
-        : Number(buildingSummary.occupancy ?? 0);
+        : Number(latestScopedHistoryRow?.raw_out ?? 0);
+    const displayedRangeIn = useLatestBuildingRangeTotals
+        ? latestScopedRangeIn
+        : Number(rangeTotalsSummary.totalIn ?? 0);
+    const displayedRangeOut = useLatestBuildingRangeTotals
+        ? latestScopedRangeOut
+        : Number(rangeTotalsSummary.totalOut ?? 0);
+    const displayedFlowIn = useLatestBuildingRangeTotals
+        ? latestScopedRangeIn
+        : Number(rangeTotalsSummary.totalIn ?? 0);
+    const displayedFlowOut = useLatestBuildingRangeTotals
+        ? latestScopedRangeOut
+        : Number(rangeTotalsSummary.totalOut ?? 0);
+    const displayedFlowTraffic = useLatestBuildingRangeTotals
+        ? latestScopedRangeIn + latestScopedRangeOut
+        : Number(rangeTotalsSummary.totalTraffic ?? 0);
+    const displayedBuildingOccupancy = selectedBuildingId === 'all'
+        ? (useLatestBuildingSnapshotTotals
+            ? Number(latestBuildingSnapshotSummary.estimatedOccupancy ?? 0)
+            : Number(scopedBuildingSummary.occupancy ?? 0))
+        : Number(latestScopedHistoryRow?.occupancy ?? scopedBuildingSummary.occupancy ?? 0);
 
-    const capacityUtilization = buildingSummary.max_capacity
-        ? (displayedBuildingOccupancy / Number(buildingSummary.max_capacity)) * 100
+    const capacityUtilization = scopedBuildingSummary.max_capacity
+        ? (displayedBuildingOccupancy / Number(scopedBuildingSummary.max_capacity)) * 100
         : null;
     const capacityUtilizationLabel = capacityUtilization == null
         ? 'Capacity not configured'
         : `${Math.round(capacityUtilization)}% Capacity Utilization`;
     const peakOccupancyValue = Math.max(
-        Number(buildingSummary.occupancy ?? 0),
+        Number(scopedBuildingSummary.occupancy ?? 0),
         Number(flowSummary.peakOccupancy ?? 0),
     );
     const busiestCamera = useMemo(() => {
@@ -2502,27 +2839,47 @@ const BuildingOccupancyPanel = ({
                         <div>
                             <CardTitle className="flex items-center gap-2">
                                 <Building2 className="w-4 h-4" />
-                                Building View
+                                {selectedBuildingId === 'all' ? 'Building View' : `Building View: ${selectedBuildingId}`}
                             </CardTitle>
                             <p className="mt-1 text-sm text-muted-foreground">
-                                Building-wide occupancy, throughput, and entrance contribution from persisted counting snapshots.
+                                {selectedBuildingId === 'all'
+                                    ? 'Building-wide occupancy, throughput, and entrance contribution from persisted counting snapshots.'
+                                    : 'Occupancy, throughput, and camera contribution for the selected building ID from persisted counting snapshots.'}
                             </p>
                         </div>
-                        <div className="text-xs text-muted-foreground">
-                            Uses the global report range and building-only grouping control above.
+                        <div className="flex flex-col items-start gap-2 xl:items-end">
+                            <div className="text-xs text-muted-foreground">
+                                Uses the global report range plus the selected grouping, source, and camera filters above.
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <span className="text-xs font-medium text-muted-foreground">Building ID</span>
+                                <select
+                                    className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                                    value={selectedBuildingId}
+                                    onChange={(e) => setSelectedBuildingId(e.target.value)}
+                                >
+                                    {buildingIdOptions.map((option) => (
+                                        <option key={option} value={option}>
+                                            {option === 'all' ? 'All Building IDs' : option}
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
                         </div>
                     </div>
 
                     <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
-                        <span>Building counting: {buildingSummary.enabled ? 'Enabled' : 'Disabled'}</span>
-                        <span>Active cameras: {buildingSummary.active_camera_count ?? 0}</span>
-                        <span>Raw occupancy: {buildingSummary.raw_occupancy ?? 0}</span>
-                        <span>Manual offset: {buildingSummary.manual_offset ?? 0}</span>
+                        <span>Building counting: {scopedBuildingSummary.enabled ? 'Enabled' : 'Disabled'}</span>
+                        <span>Active cameras: {scopedBuildingSummary.active_camera_count ?? 0}</span>
+                        <span>Raw occupancy: {scopedBuildingSummary.raw_occupancy ?? 0}</span>
+                        <span>Manual offset: {selectedBuildingId === 'all' ? (scopedBuildingSummary.manual_offset ?? 0) : 'N/A'}</span>
                     </div>
 
-                    {buildingSummary.capacity_exceeded && (
+                    {scopedBuildingSummary.capacity_exceeded && (
                         <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600">
-                            Building capacity exceeded.
+                            {selectedBuildingId === 'all'
+                                ? `Building capacity exceeded${Array.isArray(scopedBuildingSummary.exceeded_building_ids) && scopedBuildingSummary.exceeded_building_ids.length > 0 ? `: ${scopedBuildingSummary.exceeded_building_ids.join(', ')}` : '.'}`
+                                : `${selectedBuildingId} capacity exceeded.`}
                         </div>
                     )}
                 </CardHeader>
@@ -2530,13 +2887,13 @@ const BuildingOccupancyPanel = ({
                     <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
                         <div className={cn(
                             'rounded-xl border p-4',
-                            buildingSummary.capacity_exceeded ? 'border-red-500/30 bg-red-500/10' : 'border-primary/20 bg-primary/10',
+                            scopedBuildingSummary.capacity_exceeded ? 'border-red-500/30 bg-red-500/10' : 'border-primary/20 bg-primary/10',
                         )}>
                             <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                                <Users className={cn('h-4 w-4', buildingSummary.capacity_exceeded ? 'text-red-600' : 'text-primary')} />
+                                <Users className={cn('h-4 w-4', scopedBuildingSummary.capacity_exceeded ? 'text-red-600' : 'text-primary')} />
                                 Current Occupancy
                             </div>
-                            <div className={cn('mt-2 text-3xl font-bold', buildingSummary.capacity_exceeded ? 'text-red-600' : 'text-primary')}>
+                            <div className={cn('mt-2 text-3xl font-bold', scopedBuildingSummary.capacity_exceeded ? 'text-red-600' : 'text-primary')}>
                                 {formatNumber(displayedBuildingOccupancy)}
                             </div>
                             <div className="mt-1 text-xs text-muted-foreground">{capacityUtilizationLabel}</div>
@@ -2574,16 +2931,16 @@ const BuildingOccupancyPanel = ({
                                 <Target className="h-4 w-4 text-amber-600" />
                                 Busiest Camera
                             </div>
-                            <div className="mt-2 text-xl font-bold text-amber-700">
-                                {busiestCamera ? (cameraNameById?.[busiestCamera.id] || busiestCamera.id) : '-'}
+                                    <div className="mt-2 text-xl font-bold text-amber-700">
+                                        {busiestCamera ? (cameraNameById?.[busiestCamera.id] || busiestCamera.id) : '-'}
+                                    </div>
+                                    <div className="mt-1 text-xs text-muted-foreground">
+                                        {busiestCamera
+                                            ? `${formatNumber(busiestCamera.totalTraffic)} traffic | Building ID ${busiestCamera.entranceName}`
+                                            : 'No entrance flow in range'}
+                                    </div>
+                                </div>
                             </div>
-                            <div className="mt-1 text-xs text-muted-foreground">
-                                {busiestCamera
-                                    ? `${formatNumber(busiestCamera.totalTraffic)} traffic | Building ID ${busiestCamera.entranceName}`
-                                    : 'No entrance flow in range'}
-                            </div>
-                        </div>
-                    </div>
                 </CardContent>
             </Card>
 
@@ -2651,17 +3008,12 @@ const BuildingOccupancyPanel = ({
                             In/Out Over Time
                         </CardTitle>
                         <p className="mt-1 text-sm text-muted-foreground">
-                            Building-level flow trend with adaptive {effectiveBucket === '15m' ? '15-minute' : effectiveBucket === '1h' ? 'hourly' : 'daily'} buckets.
+                            Building-level flow trend with adaptive {effectiveBucket === '15m' ? '15-minute' : effectiveBucket === '1h' ? 'hourly' : 'daily'} buckets using latest saved building snapshots.
                         </p>
                     </div>
                     <p className="text-xs text-muted-foreground">
-                        This matches the people-counting camera report pattern, but uses the merged building snapshot history.
+                        Each bucket shows the latest settled building snapshot in that period instead of rebuilding flow from deltas.
                     </p>
-                    {flowSummary.resetCount > 0 && (
-                        <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700">
-                            {flowSummary.resetCount} building counter reset{flowSummary.resetCount !== 1 ? 's were' : ' was'} detected in this trend range. Flow totals are derived from deltas, while occupancy should be treated as an estimate.
-                        </div>
-                    )}
                 </CardHeader>
                 <CardContent className="flex-1">
                     <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -2759,11 +3111,13 @@ const BuildingOccupancyPanel = ({
 
             <Card className={cn(REPORT_SURFACE_CARD_CLASS, "flex flex-col min-h-[400px]")}>
                 <CardHeader className="space-y-2">
-                    <CardTitle>Entrance Contribution</CardTitle>
-                    <p className="text-sm text-muted-foreground">
-                        Entrance-level contribution share of total building traffic for the selected range.
-                    </p>
-                </CardHeader>
+                        <CardTitle>Entrance Contribution</CardTitle>
+                        <p className="text-sm text-muted-foreground">
+                            {selectedBuildingId === 'all'
+                                ? 'Entrance-level contribution share of total building traffic for the selected range.'
+                                : 'Camera contribution share within the selected building ID for the selected range.'}
+                        </p>
+                    </CardHeader>
                 <CardContent className="grid gap-6 xl:grid-cols-[minmax(0,1.5fr)_320px]">
                     <div className="h-[320px]">
                         {entranceContributionChartData.length > 0 ? (
@@ -2919,6 +3273,7 @@ const BuildingAlertsPanel = ({ rows, onSelectRecord, loading, visible }) => {
                                     </span>
                                 </td>
                                 <td className="px-4 py-3 text-muted-foreground">
+                                    {row.details?.building_id ? `${row.details.building_id} | ` : ''}
                                     Occupancy: {row.details?.occupancy ?? '-'} / {row.details?.max_capacity ?? '-'}
                                 </td>
                                 <td className="px-4 py-3 text-right">
@@ -2941,7 +3296,16 @@ const BuildingAlertsPanel = ({ rows, onSelectRecord, loading, visible }) => {
     );
 };
 
-const AllOverviewPanel = ({ events, snapshots, startMs, endMs, cameraOptions, cameraFilter, preferLatestSnapshotTotals = false }) => {
+const AllOverviewPanel = ({
+    events,
+    snapshots,
+    startMs,
+    endMs,
+    cameraOptions,
+    cameraFilter,
+    preferLatestSnapshotTotals = false,
+    useSnapshotCountingTotals = false,
+}) => {
     const summaryBucket = useMemo(() => {
         const nowMs = Date.now();
         const effectiveEndMs = endMs ?? nowMs;
@@ -2964,7 +3328,10 @@ const AllOverviewPanel = ({ events, snapshots, startMs, endMs, cameraOptions, ca
         startMs,
         endMs,
     }), [endMs, snapshots, startMs]);
-    const useLatestSnapshotTotals = preferLatestSnapshotTotals && latestSnapshotSummary.snapshotCount > 0;
+    const useLatestSnapshotTotals = (
+        (preferLatestSnapshotTotals || useSnapshotCountingTotals)
+        && latestSnapshotSummary.snapshotCount > 0
+    );
     const displayedOverviewOccupancy = useLatestSnapshotTotals
         ? Number(latestSnapshotSummary.estimatedOccupancy ?? 0)
         : Number(peopleSummary.estimatedOccupancy ?? 0);
@@ -2978,9 +3345,11 @@ const AllOverviewPanel = ({ events, snapshots, startMs, endMs, cameraOptions, ca
         ? Number(latestSnapshotSummary.totalOut ?? 0)
         : Number(peopleSummary.totalOut ?? 0);
     const displayedOverviewCaptureRate = useLatestSnapshotTotals
-        ? (Number(latestSnapshotSummary.footTrafficTotal ?? 0) > 0
-            ? (Number(latestSnapshotSummary.totalIn ?? 0) / Number(latestSnapshotSummary.footTrafficTotal ?? 0)) * 100
-            : 0)
+        ? (
+            Number(latestSnapshotSummary.footTrafficTotal ?? 0) > 0
+                ? (Number(latestSnapshotSummary.totalIn ?? 0) / Number(latestSnapshotSummary.footTrafficTotal ?? 0)) * 100
+                : 0
+        )
         : Number(trafficSummary.captureRate ?? 0);
     const displayedOverviewPeakOccupancy = useMemo(() => (
         cameraFilter === 'all'
@@ -3021,6 +3390,7 @@ const AllOverviewPanel = ({ events, snapshots, startMs, endMs, cameraOptions, ca
         if (!best || Number(item.count || 0) > Number(best.count || 0)) return item;
         return best;
     }, null);
+    const dressCodeRateCoverageNote = getDressCodeRateCoverageNote(dressCodeSummary);
 
     const camerasInScope = cameraFilter === 'all'
         ? cameraOptions.length
@@ -3119,7 +3489,13 @@ const AllOverviewPanel = ({ events, snapshots, startMs, endMs, cameraOptions, ca
                     </div>
                     <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-4">
                         <div className="text-sm text-muted-foreground">Violation Rate</div>
-                        <div className="mt-2 text-3xl font-bold text-amber-700">{formatPercent(dressCodeSummary.violationRate)}</div>
+                        <div className="mt-2 text-3xl font-bold text-amber-700">
+                            {dressCodeSummary.hasTrafficBase ? formatPercent(dressCodeSummary.violationRate) : '-'}
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                            {dressCodeRateCoverageNote || 'Based on available traffic denominator'}
+                        </div>
+                        <DressCodeRateBreakdown analytics={dressCodeSummary} compact />
                     </div>
                     <div className="rounded-xl border border-indigo-500/20 bg-indigo-500/10 p-4">
                         <div className="text-sm text-muted-foreground">Top Violation</div>
@@ -3172,6 +3548,7 @@ const Reporting = () => {
     const [selectedCategory, setSelectedCategory] = useState('All');
     const [selectedPeopleCountingView, setSelectedPeopleCountingView] = useState('building');
     const [selectedCameraFilter, setSelectedCameraFilter] = useState('all');
+    const [selectedSourceFilter, setSelectedSourceFilter] = useState('live');
     const [selectedQuickRange, setSelectedQuickRange] = useState('today');
     const [buildingGrouping, setBuildingGrouping] = useState('auto');
     const [startDate, setStartDate] = useState(() => {
@@ -3194,6 +3571,7 @@ const Reporting = () => {
     const [showExportModal, setShowExportModal] = useState(false);
     const [currentPage, setCurrentPage] = useState(1);
     const [rowsPerPage, setRowsPerPage] = useState(20);
+    const [detectionLogSort, setDetectionLogSort] = useState({ field: 'timestamp', direction: 'desc' });
     const [refreshToken, setRefreshToken] = useState(0);
     const effectiveDateRange = useMemo(
         () => getQuickRangeDateBounds(selectedQuickRange, startDate, endDate),
@@ -3365,31 +3743,82 @@ const Reporting = () => {
         acc[cam.id] = cam.name || cam.id;
         return acc;
     }, {});
-    const cameraOptions = useMemo(() => {
+    const currentCameraIdSet = useMemo(() => new Set(cameras.map((cam) => cam.id)), [cameras]);
+    const cameraSourceKindById = useMemo(() => (
+        cameras.reduce((acc, cam) => {
+            acc[cam.id] = cam.source_kind || '';
+            return acc;
+        }, {})
+    ), [cameras]);
+    const baseCameraOptions = useMemo(() => {
         const options = new Map();
+        const upsertOption = (id, name, kind = 'other') => {
+            if (!id) return;
+            const normalizedKind = kind || 'other';
+            const isHistorical = !currentCameraIdSet.has(id);
+            const existing = options.get(id);
+            if (!existing) {
+                options.set(id, {
+                    id,
+                    name: name || id,
+                    kind: normalizedKind,
+                    isHistorical,
+                });
+                return;
+            }
+            options.set(id, {
+                id,
+                name: existing.name || name || id,
+                kind: existing.kind !== 'other' ? existing.kind : normalizedKind,
+                isHistorical: existing.isHistorical && isHistorical,
+            });
+        };
 
         cameras.forEach((cam) => {
-            options.set(cam.id, cam.name || cam.id);
+            upsertOption(
+                cam.id,
+                cam.name || cam.id,
+                normalizeSourceFilterKind(cam.source_kind),
+            );
         });
 
         events.forEach((evt) => {
             if (!evt?.camera_id) return;
-            if (!options.has(evt.camera_id)) {
-                options.set(evt.camera_id, evt.camera_name || evt.camera_id);
-            }
+            upsertOption(
+                evt.camera_id,
+                evt.camera_name || evt.camera_id,
+                getReportSourceFilterKind(evt, cameraSourceKindById),
+            );
         });
 
         countingSnapshots.forEach((snapshot) => {
             if (!snapshot?.camera_id) return;
-            if (!options.has(snapshot.camera_id)) {
-                options.set(snapshot.camera_id, snapshot.camera_name || snapshot.camera_id);
-            }
+            upsertOption(
+                snapshot.camera_id,
+                snapshot.camera_name || snapshot.camera_id,
+                getReportSourceFilterKind(snapshot, cameraSourceKindById),
+            );
         });
 
-        return Array.from(options.entries())
-            .map(([id, name]) => ({ id, name }))
+        return Array.from(options.values())
             .sort((a, b) => a.name.localeCompare(b.name));
-    }, [cameras, events, countingSnapshots]);
+    }, [cameraSourceKindById, cameras, countingSnapshots, currentCameraIdSet, events]);
+    const isOverviewCategory = selectedCategory === 'All';
+    const isPeopleCountingCategory = selectedCategory === 'People Counting';
+    const isDressCodeCategory = selectedCategory === 'Dress Code';
+    const isPeopleCountingBuildingView = isPeopleCountingCategory && selectedPeopleCountingView === 'building';
+    const isPeopleCountingCameraView = isPeopleCountingCategory && selectedPeopleCountingView === 'camera';
+    const isPeopleCountingTrafficView = isPeopleCountingCategory && selectedPeopleCountingView === 'traffic';
+    const effectiveSourceFilter = selectedSourceFilter;
+    const cameraOptions = useMemo(() => (
+        baseCameraOptions
+            .filter((option) => effectiveSourceFilter === 'all' || option.kind === effectiveSourceFilter)
+            .map(({ id, name, isHistorical }) => ({
+                id,
+                name: isHistorical ? `${name} (Historical)` : name,
+            }))
+    ), [baseCameraOptions, effectiveSourceFilter]);
+
     // Date filter helper
     const dateFilter = (timestamp) => {
         const tsMs = getTimestampMs(timestamp);
@@ -3399,11 +3828,15 @@ const Reporting = () => {
         return true;
     };
     const cameraFilter = (cameraId) => selectedCameraFilter === 'all' || cameraId === selectedCameraFilter;
+    const sourceFilter = useCallback((item) => {
+        if (effectiveSourceFilter === 'all') return true;
+        return getReportSourceFilterKind(item, cameraSourceKindById) === effectiveSourceFilter;
+    }, [cameraSourceKindById, effectiveSourceFilter]);
 
     // Filtered events
     const filteredEvents = events
         .map(evt => ({ ...evt, camera_name: cameraNameById[evt.camera_id] || evt.camera_name }))
-        .filter(evt => dateFilter(evt.timestamp) && cameraFilter(evt.camera_id));
+        .filter(evt => dateFilter(evt.timestamp) && cameraFilter(evt.camera_id) && sourceFilter(evt));
     const filteredBuildingAlerts = filteredEvents
         .filter((evt) => evt.event_type === 'Capacity Exceeded' && evt.details?.scope === 'building')
         .sort((a, b) => getTimestampMs(b.timestamp) - getTimestampMs(a.timestamp));
@@ -3411,19 +3844,10 @@ const Reporting = () => {
     // Filtered counting snapshots
     const filteredSnapshots = countingSnapshots
         .map(s => ({ ...s, camera_name: s.camera_name || cameraNameById[s.camera_id] || s.camera_id }))
-        .filter(s => dateFilter(s.timestamp) && cameraFilter(s.camera_id));
-    const buildingViewSnapshots = countingSnapshots
-        .map(s => ({ ...s, camera_name: s.camera_name || cameraNameById[s.camera_id] || s.camera_id }))
-        .filter(s => dateFilter(s.timestamp));
-    const isOverviewCategory = selectedCategory === 'All';
-    const isPeopleCountingCategory = selectedCategory === 'People Counting';
-    const isDressCodeCategory = selectedCategory === 'Dress Code';
-    const isPeopleCountingBuildingView = isPeopleCountingCategory && selectedPeopleCountingView === 'building';
-    const isPeopleCountingCameraView = isPeopleCountingCategory && selectedPeopleCountingView === 'camera';
-    const isPeopleCountingTrafficView = isPeopleCountingCategory && selectedPeopleCountingView === 'traffic';
+        .filter(s => dateFilter(s.timestamp) && cameraFilter(s.camera_id) && sourceFilter(s));
     const selectedCountingSnapshots = countingSnapshots
         .map(s => ({ ...s, camera_name: s.camera_name || cameraNameById[s.camera_id] || s.camera_id }))
-        .filter(s => cameraFilter(s.camera_id));
+        .filter(s => cameraFilter(s.camera_id) && sourceFilter(s));
     const selectedCameraMeta = selectedCameraFilter === 'all'
         ? null
         : cameraOptions.find((cam) => cam.id === selectedCameraFilter);
@@ -3431,6 +3855,21 @@ const Reporting = () => {
         || (selectedCameraFilter === 'all'
             ? `Selected cameras${cameraOptions.length ? ` (${cameraOptions.length})` : ''}`
             : selectedCameraFilter);
+    const getCameraBadgeLabel = useCallback((item) => {
+        const baseLabel = getCameraLabel(item);
+        const sourceKind = getReportSourceFilterKind(item, cameraSourceKindById);
+        if (sourceKind === 'building') return baseLabel;
+        if (sourceKind === 'uploaded') return `Video | ${baseLabel}`;
+        if (sourceKind === 'live') return `RTSP | ${baseLabel}`;
+        return `Other | ${baseLabel}`;
+    }, [cameraSourceKindById]);
+    const selectedSourceFilterLabel = (
+        effectiveSourceFilter === 'uploaded'
+            ? 'Uploaded Video'
+            : effectiveSourceFilter === 'live'
+                ? 'RTSP / Network'
+                : 'All Sources'
+    );
     const peopleCountingSummaryBucket = useMemo(() => {
         const nowMs = Date.now();
         const effectiveEndMs = reportingDateBounds.endMs ?? nowMs;
@@ -3453,18 +3892,29 @@ const Reporting = () => {
             bucket: '1d',
         }).series.slice(-14)
     ), [reportingDateBounds.endMs, reportingDateBounds.startMs, selectedCountingSnapshots]);
+    const shouldUseRtspSnapshotTotals = useMemo(() => (
+        isSourceOnlySnapshotScope(selectedCountingSnapshots, cameraSourceKindById, 'live', effectiveSourceFilter)
+    ), [cameraSourceKindById, effectiveSourceFilter, selectedCountingSnapshots]);
+    const shouldUseUploadedSnapshotTotals = useMemo(() => (
+        isSourceOnlySnapshotScope(selectedCountingSnapshots, cameraSourceKindById, 'uploaded', effectiveSourceFilter)
+    ), [cameraSourceKindById, effectiveSourceFilter, selectedCountingSnapshots]);
+    const shouldUseSnapshotCountingTotals = shouldUseRtspSnapshotTotals || shouldUseUploadedSnapshotTotals;
+    const shouldUseRangeScopedSnapshotCountingTotals = (
+        shouldPreferSnapshotTotalsForAppliedRange
+        && shouldUseSnapshotCountingTotals
+    );
     const shouldUseLatestSnapshotTotals = shouldPreferSnapshotTotalsForAppliedRange
         && latestSelectedSnapshotSummary.snapshotCount > 0;
-    const displayedPeopleCountingTotalIn = shouldUseLatestSnapshotTotals
+    const displayedPeopleCountingTotalIn = shouldUseRangeScopedSnapshotCountingTotals
         ? Number(latestSelectedSnapshotSummary.totalIn ?? 0)
         : Number(peopleCountingSummary.totalIn ?? 0);
-    const displayedPeopleCountingTotalOut = shouldUseLatestSnapshotTotals
+    const displayedPeopleCountingTotalOut = shouldUseRangeScopedSnapshotCountingTotals
         ? Number(latestSelectedSnapshotSummary.totalOut ?? 0)
         : Number(peopleCountingSummary.totalOut ?? 0);
-    const displayedPeopleCountingTotalTraffic = shouldUseLatestSnapshotTotals
+    const displayedPeopleCountingTotalTraffic = shouldUseRangeScopedSnapshotCountingTotals
         ? Number(latestSelectedSnapshotSummary.totalTraffic ?? 0)
         : Number(peopleCountingSummary.totalTraffic ?? 0);
-    const displayedPeopleCountingOccupancy = shouldUseLatestSnapshotTotals
+    const displayedPeopleCountingOccupancy = (shouldUseLatestSnapshotTotals || shouldUseRangeScopedSnapshotCountingTotals)
         ? Number(latestSelectedSnapshotSummary.estimatedOccupancy ?? 0)
         : Number(peopleCountingSummary.estimatedOccupancy ?? 0);
     const displayedPeopleCountingPeakOccupancy = useMemo(() => (
@@ -3489,23 +3939,40 @@ const Reporting = () => {
             const snapshotRows = filteredSnapshots.map(s => ({
                 id: s.id,
                 timestamp: s.timestamp,
+                processed_at: s.processed_at,
                 event_type: 'Counting Snapshot',
                 camera_id: s.camera_id,
                 camera_name: s.camera_name,
                 total_in: s.total_in,
                 total_out: s.total_out,
                 current_occupancy: s.current_occupancy,
+                foot_traffic_total: s.foot_traffic_total,
                 _isSnapshot: true,
             }));
             const eventRows = filteredEvents.map(e => ({ ...e, _isSnapshot: false }));
-            // Merge and sort by timestamp desc
-            return [...eventRows, ...snapshotRows].sort((a, b) => getTimestampMs(b.timestamp) - getTimestampMs(a.timestamp));
+            return [...eventRows, ...snapshotRows].sort((a, b) => {
+                const aValue = getSortableTimeValue(a, detectionLogSort.field);
+                const bValue = getSortableTimeValue(b, detectionLogSort.field);
+                if (aValue == null && bValue == null) return 0;
+                if (aValue == null) return 1;
+                if (bValue == null) return -1;
+                return detectionLogSort.direction === 'asc' ? aValue - bValue : bValue - aValue;
+            });
         }
+        const detectionRows = filteredEvents.map(e => ({ ...e, _isSnapshot: false }));
+        detectionRows.sort((a, b) => {
+            const aValue = getSortableTimeValue(a, detectionLogSort.field);
+            const bValue = getSortableTimeValue(b, detectionLogSort.field);
+            if (aValue == null && bValue == null) return 0;
+            if (aValue == null) return 1;
+            if (bValue == null) return -1;
+            return detectionLogSort.direction === 'asc' ? aValue - bValue : bValue - aValue;
+        });
         if (selectedCategory === 'All') {
-            return filteredEvents.map(e => ({ ...e, _isSnapshot: false }));
+            return detectionRows;
         }
         // Detection-only categories
-        return filteredEvents.map(e => ({ ...e, _isSnapshot: false }));
+        return detectionRows;
     })();
 
     // Build chart data
@@ -3541,7 +4008,13 @@ const Reporting = () => {
 
     useEffect(() => {
         setCurrentPage(1);
-    }, [selectedCategory, selectedPeopleCountingView, selectedCameraFilter, selectedQuickRange, startDate, endDate]);
+    }, [selectedCategory, selectedPeopleCountingView, selectedCameraFilter, selectedSourceFilter, selectedQuickRange, startDate, endDate, detectionLogSort]);
+
+    useEffect(() => {
+        if (selectedCameraFilter === 'all') return;
+        if (cameraOptions.some((cam) => cam.id === selectedCameraFilter)) return;
+        setSelectedCameraFilter('all');
+    }, [cameraOptions, selectedCameraFilter]);
 
     useEffect(() => {
         if (currentPage > totalPages) {
@@ -3557,6 +4030,30 @@ const Reporting = () => {
     }, [effectiveEndDate, effectiveStartDate, isCustomQuickRange]);
 
     // Handlers
+    const toggleDetectionLogSort = (field) => {
+        setDetectionLogSort((current) => {
+            if (current.field === field) {
+                return {
+                    field,
+                    direction: current.direction === 'desc' ? 'asc' : 'desc',
+                };
+            }
+            return {
+                field,
+                direction: 'desc',
+            };
+        });
+    };
+    const renderDetectionSortIndicator = (field) => {
+        if (detectionLogSort.field !== field) {
+            return <span className="text-[11px] text-muted-foreground/70">↕</span>;
+        }
+        return (
+            <span className="text-[11px] text-foreground">
+                {detectionLogSort.direction === 'desc' ? '↓' : '↑'}
+            </span>
+        );
+    };
     const handleCategoryChange = (cat) => setSelectedCategory(cat);
     const applyCustomRange = useCallback(() => {
         if (!isCustomRangeValid) return;
@@ -3579,20 +4076,23 @@ const Reporting = () => {
                 return;
             }
             if (isPeopleCountingCategory) {
-                csv = 'Timestamp,Camera Name,Camera ID,Total In,Total Out,Occupancy\n';
+                csv = 'Timestamp,Processed At,Camera Name,Camera ID,Total In,Total Out,Occupancy,Foot Traffic\n';
                 csv += filteredSnapshots.map(s => [
                     toCsvCell(s.timestamp),
+                    toCsvCell(s.processed_at),
                     toCsvCell(getCameraLabel(s)),
                     toCsvCell(s.camera_id),
                     toCsvCell(s.total_in),
                     toCsvCell(s.total_out),
                     toCsvCell(s.current_occupancy),
+                    toCsvCell(s.foot_traffic_total),
                 ].join(',')).join('\n');
             } else {
-                csv = 'ID,Timestamp,Event Type,Camera Name,Camera ID,Label,Confidence\n';
+                csv = 'ID,Timestamp,Processed At,Event Type,Camera Name,Camera ID,Label,Confidence\n';
                 csv += filteredEvents.map(e => [
                     toCsvCell(e.id),
                     toCsvCell(e.timestamp),
+                    toCsvCell(e.processed_at),
                     toCsvCell(e.event_type),
                     toCsvCell(getCameraLabel(e)),
                     toCsvCell(e.camera_id),
@@ -3619,25 +4119,29 @@ const Reporting = () => {
                 `Generated: ${new Date().toLocaleString()}`,
                 `Category: ${selectedCategory}`,
                 `Quick Range: ${selectedQuickRange}`,
+                selectedSourceFilter !== 'all' ? `Source Type: ${selectedSourceFilterLabel}` : null,
                 selectedCameraFilter !== 'all' ? `Camera Filter: ${selectedCameraFilter}` : null,
                 isCounting ? `Mode: ${selectedPeopleCountingView}` : null,
                 `Rows: ${isCounting ? filteredSnapshots.length : filteredEvents.length}`,
             ].filter(Boolean);
             const headers = isCounting
-                ? ['Timestamp', 'Camera Name', 'Camera ID', 'Total In', 'Total Out', 'Occupancy']
-                : ['ID', 'Timestamp', 'Event Type', 'Camera Name', 'Camera ID', 'Label', 'Confidence'];
+                ? ['Timestamp', 'Processed At', 'Camera Name', 'Camera ID', 'Total In', 'Total Out', 'Occupancy', 'Foot Traffic']
+                : ['ID', 'Timestamp', 'Processed At', 'Event Type', 'Camera Name', 'Camera ID', 'Label', 'Confidence'];
             const rows = isCounting
                 ? filteredSnapshots.map((s) => [
                     s.timestamp,
+                    s.processed_at,
                     getCameraLabel(s),
                     s.camera_id,
                     s.total_in,
                     s.total_out,
                     s.current_occupancy,
+                    s.foot_traffic_total,
                 ])
                 : filteredEvents.map((e) => [
                     e.id,
                     e.timestamp,
+                    e.processed_at,
                     e.event_type,
                     getCameraLabel(e),
                     e.camera_id,
@@ -3763,11 +4267,11 @@ const Reporting = () => {
                         "grid gap-4 xl:items-end",
                         isPeopleCountingBuildingView
                             ? (isCustomQuickRange
-                                ? "xl:grid-cols-[minmax(180px,0.8fr)_minmax(180px,1fr)_minmax(180px,1fr)_minmax(140px,0.6fr)_auto_auto]"
-                                : "xl:grid-cols-[minmax(180px,0.8fr)_minmax(180px,1fr)_minmax(180px,1fr)_minmax(140px,0.6fr)_auto]")
+                                ? "xl:grid-cols-[minmax(180px,0.8fr)_minmax(180px,1fr)_minmax(180px,1fr)_minmax(140px,0.6fr)_minmax(180px,0.9fr)_minmax(220px,1fr)_auto_auto]"
+                                : "xl:grid-cols-[minmax(180px,0.8fr)_minmax(180px,1fr)_minmax(180px,1fr)_minmax(140px,0.6fr)_minmax(180px,0.9fr)_minmax(220px,1fr)_auto]")
                             : (isCustomQuickRange
-                                ? "xl:grid-cols-[minmax(180px,0.8fr)_minmax(180px,1fr)_minmax(180px,1fr)_minmax(220px,1fr)_auto_auto]"
-                                : "xl:grid-cols-[minmax(180px,0.8fr)_minmax(180px,1fr)_minmax(180px,1fr)_minmax(220px,1fr)_auto]"),
+                                ? "xl:grid-cols-[minmax(180px,0.8fr)_minmax(180px,1fr)_minmax(180px,1fr)_minmax(180px,0.9fr)_minmax(220px,1fr)_auto_auto]"
+                                : "xl:grid-cols-[minmax(180px,0.8fr)_minmax(180px,1fr)_minmax(180px,1fr)_minmax(180px,0.9fr)_minmax(220px,1fr)_auto]"),
                     )}>
                         <div className="space-y-2">
                             <label className="text-sm font-medium">Quick Range</label>
@@ -3815,33 +4319,77 @@ const Reporting = () => {
                         </div>
 
                         {isPeopleCountingBuildingView ? (
-                            <div className="space-y-2">
-                                <label className="text-sm font-medium">Grouping</label>
-                                <select
-                                    className={cn("h-10 w-full rounded-md border px-3 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring", REPORT_INPUT_CLASS)}
-                                    value={buildingGrouping}
-                                    onChange={(e) => setBuildingGrouping(e.target.value)}
-                                >
-                                    <option value="auto">Auto</option>
-                                    <option value="15m">15 min</option>
-                                    <option value="1h">Hourly</option>
-                                    <option value="1d">Daily</option>
-                                </select>
-                            </div>
+                            <>
+                                <div className="space-y-2">
+                                    <label className="text-sm font-medium">Grouping</label>
+                                    <select
+                                        className={cn("h-10 w-full rounded-md border px-3 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring", REPORT_INPUT_CLASS)}
+                                        value={buildingGrouping}
+                                        onChange={(e) => setBuildingGrouping(e.target.value)}
+                                    >
+                                        <option value="auto">Auto</option>
+                                        <option value="15m">15 min</option>
+                                        <option value="1h">Hourly</option>
+                                        <option value="1d">Daily</option>
+                                    </select>
+                                </div>
+
+                                <div className="space-y-2">
+                                    <label className="text-sm font-medium">Source Type</label>
+                                    <select
+                                        className={cn("h-10 w-full rounded-md border px-3 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring", REPORT_INPUT_CLASS)}
+                                        value={selectedSourceFilter}
+                                        onChange={(e) => setSelectedSourceFilter(e.target.value)}
+                                    >
+                                        <option value="all">All Sources</option>
+                                        <option value="live">RTSP / Network</option>
+                                        <option value="uploaded">Uploaded Video</option>
+                                    </select>
+                                </div>
+
+                                <div className="space-y-2">
+                                    <label className="text-sm font-medium">Camera</label>
+                                    <select
+                                        className={cn("h-10 w-full min-w-[220px] rounded-md border px-3 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring", REPORT_INPUT_CLASS)}
+                                        value={selectedCameraFilter}
+                                        onChange={(e) => setSelectedCameraFilter(e.target.value)}
+                                    >
+                                        <option value="all">All Cameras</option>
+                                        {cameraOptions.map(cam => (
+                                            <option key={cam.id} value={cam.id}>{cam.name || cam.id}</option>
+                                        ))}
+                                    </select>
+                                </div>
+                            </>
                         ) : (
-                            <div className="space-y-2">
-                                <label className="text-sm font-medium">Camera</label>
-                                <select
-                                    className={cn("h-10 w-full min-w-[220px] rounded-md border px-3 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring", REPORT_INPUT_CLASS)}
-                                    value={selectedCameraFilter}
-                                    onChange={(e) => setSelectedCameraFilter(e.target.value)}
-                                >
-                                    <option value="all">All Cameras</option>
-                                    {cameraOptions.map(cam => (
-                                        <option key={cam.id} value={cam.id}>{cam.name || cam.id}</option>
-                                    ))}
-                                </select>
-                            </div>
+                            <>
+                                <div className="space-y-2">
+                                    <label className="text-sm font-medium">Source Type</label>
+                                    <select
+                                        className={cn("h-10 w-full rounded-md border px-3 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring", REPORT_INPUT_CLASS)}
+                                        value={selectedSourceFilter}
+                                        onChange={(e) => setSelectedSourceFilter(e.target.value)}
+                                    >
+                                        <option value="all">All Sources</option>
+                                        <option value="live">RTSP / Network</option>
+                                        <option value="uploaded">Uploaded Video</option>
+                                    </select>
+                                </div>
+
+                                <div className="space-y-2">
+                                    <label className="text-sm font-medium">Camera</label>
+                                    <select
+                                        className={cn("h-10 w-full min-w-[220px] rounded-md border px-3 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring", REPORT_INPUT_CLASS)}
+                                        value={selectedCameraFilter}
+                                        onChange={(e) => setSelectedCameraFilter(e.target.value)}
+                                    >
+                                        <option value="all">All Cameras</option>
+                                        {cameraOptions.map(cam => (
+                                            <option key={cam.id} value={cam.id}>{cam.name || cam.id}</option>
+                                        ))}
+                                    </select>
+                                </div>
+                            </>
                         )}
 
                         {isCustomQuickRange && (
@@ -3880,6 +4428,7 @@ const Reporting = () => {
                         cameraOptions={cameraOptions}
                         cameraFilter={selectedCameraFilter}
                         preferLatestSnapshotTotals={shouldPreferSnapshotTotalsForAppliedRange}
+                        useSnapshotCountingTotals={shouldUseRangeScopedSnapshotCountingTotals}
                     />
                 )}
 
@@ -3891,7 +4440,10 @@ const Reporting = () => {
                     refreshToken={refreshToken}
                     visible={isPeopleCountingBuildingView}
                     cameraNameById={cameraNameById}
-                    countingSnapshots={buildingViewSnapshots}
+                    countingSnapshots={selectedCountingSnapshots}
+                    selectedSourceFilter={selectedSourceFilter}
+                    selectedCameraFilter={selectedCameraFilter}
+                    cameraSourceKindById={cameraSourceKindById}
                     preferLatestSnapshotTotals={shouldPreferSnapshotTotalsForAppliedRange}
                 />
 
@@ -3986,7 +4538,7 @@ const Reporting = () => {
                                   startMs={reportingDateBounds.startMs}
                                   endMs={reportingDateBounds.endMs}
                                   isAllCameras={selectedCameraFilter === 'all'}
-                                  latestSnapshotTotals={shouldUseLatestSnapshotTotals ? latestSelectedSnapshotSummary : null}
+                                  latestSnapshotTotals={(shouldUseLatestSnapshotTotals || shouldUseRangeScopedSnapshotCountingTotals) ? latestSelectedSnapshotSummary : null}
                               />
                         )}
 
@@ -4058,15 +4610,35 @@ const Reporting = () => {
                         </div>
                     </CardHeader>
                     <CardContent className="flex-1 p-0 overflow-auto">
-                        <table className="w-full min-w-[980px] text-sm text-left">
+                        <table className="w-full min-w-[1220px] text-sm text-left">
                             <thead className="text-muted-foreground bg-muted/50 sticky top-0">
                                 <tr>
-                                    <th className="px-4 py-3 font-medium">Timestamp</th>
+                                    <th className="px-4 py-3 font-medium">
+                                        <button
+                                            type="button"
+                                            className="inline-flex items-center gap-2 text-left"
+                                            onClick={() => toggleDetectionLogSort('timestamp')}
+                                        >
+                                            <span>Timestamp</span>
+                                            {renderDetectionSortIndicator('timestamp')}
+                                        </button>
+                                    </th>
+                                    <th className="px-4 py-3 font-medium">
+                                        <button
+                                            type="button"
+                                            className="inline-flex items-center gap-2 text-left"
+                                            onClick={() => toggleDetectionLogSort('processed_at')}
+                                        >
+                                            <span>Processed At</span>
+                                            {renderDetectionSortIndicator('processed_at')}
+                                        </button>
+                                    </th>
                                     <th className="px-4 py-3 font-medium">Camera</th>
                                     <th className="px-4 py-3 font-medium">Event Type</th>
                                     <th className="px-4 py-3 font-medium">Subtype</th>
                                     <th className="px-4 py-3 font-medium text-right">In</th>
                                     <th className="px-4 py-3 font-medium text-right">Out</th>
+                                    <th className="px-4 py-3 font-medium text-right">Foot Traffic</th>
                                     <th className="px-4 py-3 font-medium text-right">Occupancy</th>
                                     <th className="px-4 py-3 font-medium text-right">Action</th>
                                 </tr>
@@ -4078,13 +4650,14 @@ const Reporting = () => {
                                             <tr key={row.id} className="group hover:bg-muted/30 transition-colors cursor-pointer"
                                                 onClick={() => setSelectedRecord(row)}>
                                                 <td className="px-4 py-3">{formatTimestamp(row.timestamp)}</td>
+                                                <td className="px-4 py-3">{formatTimestamp(row.processed_at)}</td>
                                                 <td className="px-4 py-3">
                                                     <span className={cn(
                                                         "inline-flex items-center gap-2 rounded-full border px-2 py-1 text-xs font-medium",
                                                         getCameraBadgeStyle(row.camera_id).badge,
                                                     )}>
                                                         <span className={cn("h-1.5 w-1.5 rounded-full", getCameraBadgeStyle(row.camera_id).dot)} />
-                                                        {getCameraLabel(row)}
+                                                        {getCameraBadgeLabel(row)}
                                                     </span>
                                                 </td>
                                                 <td className="px-4 py-3">
@@ -4096,6 +4669,7 @@ const Reporting = () => {
                                                 <td className="px-4 py-3 text-muted-foreground">Snapshot</td>
                                                 <td className="px-4 py-3 text-right font-medium text-green-600">{formatNumber(row.total_in)}</td>
                                                 <td className="px-4 py-3 text-right font-medium text-red-600">{formatNumber(row.total_out)}</td>
+                                                <td className="px-4 py-3 text-right font-medium text-slate-700">{formatNumber(row.foot_traffic_total)}</td>
                                                 <td className="px-4 py-3 text-right font-medium text-blue-700">{formatNumber(row.current_occupancy)}</td>
                                                 <td className="px-4 py-3 text-right">
                                                     <Button variant="ghost" size="icon" className="h-8 w-8 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -4110,18 +4684,21 @@ const Reporting = () => {
                                     const dotColor = isCapacity ? 'bg-orange-500' : 'bg-red-500';
                                     const eventSubtype = row.details?.label
                                         ? String(row.details.label).replace(/_/g, ' ')
-                                        : (isCapacity ? 'Capacity alert' : '-');
+                                        : (isCapacity
+                                            ? `Capacity alert${row.details?.building_id ? ` (${row.details.building_id})` : ''}`
+                                            : '-');
                                     return (
                                         <tr key={row.id} className="hover:bg-muted/30 transition-colors group cursor-pointer"
                                             onClick={() => setSelectedRecord(row)}>
                                             <td className="px-4 py-3">{formatTimestamp(row.timestamp)}</td>
+                                            <td className="px-4 py-3">{formatTimestamp(row.processed_at)}</td>
                                             <td className="px-4 py-3">
                                                 <span className={cn(
                                                     "inline-flex items-center gap-2 rounded-full border px-2 py-1 text-xs font-medium",
                                                     getCameraBadgeStyle(row.camera_id).badge,
                                                 )}>
                                                     <span className={cn("h-1.5 w-1.5 rounded-full", getCameraBadgeStyle(row.camera_id).dot)} />
-                                                    {getCameraLabel(row)}
+                                                    {getCameraBadgeLabel(row)}
                                                 </span>
                                             </td>
                                             <td className="px-4 py-3">
@@ -4131,6 +4708,7 @@ const Reporting = () => {
                                                 </div>
                                             </td>
                                             <td className="px-4 py-3 text-muted-foreground">{eventSubtype}</td>
+                                            <td className="px-4 py-3 text-right text-muted-foreground">-</td>
                                             <td className="px-4 py-3 text-right text-muted-foreground">-</td>
                                             <td className="px-4 py-3 text-right text-muted-foreground">-</td>
                                             <td className="px-4 py-3 text-right font-medium text-blue-700">
@@ -4145,7 +4723,7 @@ const Reporting = () => {
                                     );
                                 }) : (
                                     <tr>
-                                        <td colSpan={8} className="px-4 py-8 text-center text-muted-foreground">
+                                        <td colSpan={10} className="px-4 py-8 text-center text-muted-foreground">
                                             {loading ? "Loading..." : "No records found."}
                                         </td>
                                     </tr>

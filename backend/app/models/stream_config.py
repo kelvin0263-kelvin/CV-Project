@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, Integer, Boolean, ForeignKey, JSON
+from sqlalchemy import Column, String, Integer, Boolean, ForeignKey, JSON, DateTime
 from sqlalchemy.orm import relationship
 from app.models.base import Base
 
@@ -14,6 +14,7 @@ class StreamConfig(Base):
     view_index = Column(Integer, nullable=False, default=-1)
     is_fisheye = Column(Boolean, nullable=False, default=False)
     detection_roi = Column(JSON, nullable=True)
+    uploaded_video_start_time_override = Column(DateTime(timezone=True), nullable=True)
 
     # Relationship back to Camera
     camera = relationship("Camera", backref="stream_config", uselist=False)

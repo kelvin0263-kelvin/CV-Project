@@ -51,6 +51,7 @@ const SECONDARY_NAV_ITEMS = [
 const EMPTY_BUILDING_SUMMARY = {
     occupancy: 0,
     max_capacity: null,
+    exceeded_building_ids: [],
     capacity_exceeded: false,
 };
 
@@ -75,6 +76,10 @@ const formatNotificationTime = (value) => {
     if (!timestampMs) return '-';
     return new Date(timestampMs).toLocaleString();
 };
+
+const getNotificationTimestampValue = (event) => (
+    event?.processed_at || event?.timestamp || null
+);
 
 const getInitialNotificationReadAt = () => {
     if (typeof window === 'undefined') {
@@ -104,16 +109,17 @@ const getInitialNotificationClearedAt = () => {
 
 const getNotificationSourceLabel = (event) => {
     if (event?.details?.scope === 'building') {
-        return 'Building';
+        return event?.details?.building_id ? `Building ${event.details.building_id}` : 'Building';
     }
     return (event?.camera_name || '').trim() || event?.camera_id || 'Unknown Camera';
 };
 
 const describeNotification = (event) => {
     if (event?.event_type === 'Capacity Exceeded') {
+        const buildingId = event?.details?.building_id;
         const occupancy = event?.details?.occupancy ?? 0;
         const maxCapacity = event?.details?.max_capacity;
-        return `Occupancy is ${occupancy}${maxCapacity ? ` / ${maxCapacity}` : ''}.`;
+        return `${buildingId ? `${buildingId}: ` : ''}Occupancy is ${occupancy}${maxCapacity ? ` / ${maxCapacity}` : ''}.`;
     }
     if (event?.event_type === 'Fall Detected') {
         return 'A person remained in a fall pose long enough to trigger an alert.';
@@ -150,7 +156,7 @@ const Layout = ({ onLogout }) => {
         if (!Array.isArray(items) || items.length === 0) {
             return Date.now();
         }
-        return parseApiTimestampMs(items[0]?.timestamp) || Date.now();
+        return parseApiTimestampMs(getNotificationTimestampValue(items[0])) || Date.now();
     }, []);
 
     const clearNotifications = useCallback((timestampMs) => {
@@ -174,6 +180,7 @@ const Layout = ({ onLogout }) => {
                     setBuildingSummary({
                         occupancy: data.occupancy ?? 0,
                         max_capacity: data.max_capacity ?? null,
+                        exceeded_building_ids: data.exceeded_building_ids ?? [],
                         capacity_exceeded: isExceeded,
                     });
                     if (isExceeded && !buildingCapacityWasExceededRef.current) {
@@ -269,11 +276,11 @@ const Layout = ({ onLogout }) => {
     }, [showNotificationsPanel]);
 
     const visibleNotifications = notifications.filter((event) => (
-        parseApiTimestampMs(event?.timestamp) > lastNotificationClearedAt
+        parseApiTimestampMs(getNotificationTimestampValue(event)) > lastNotificationClearedAt
     ));
 
     const unreadCount = visibleNotifications.filter((event) => (
-        parseApiTimestampMs(event?.timestamp) > lastNotificationReadAt
+        parseApiTimestampMs(getNotificationTimestampValue(event)) > lastNotificationReadAt
     )).length;
     const currentUser = getStoredUser();
     const userInitial = (currentUser?.username || currentUser?.email || 'A').charAt(0).toUpperCase();
@@ -311,8 +318,9 @@ const Layout = ({ onLogout }) => {
                             <div className="min-w-0 flex-1">
                                 <div className="text-sm font-semibold text-red-600">Building Capacity Exceeded</div>
                                 <div className="mt-1 text-sm text-muted-foreground">
-                                    Building occupancy is {buildingSummary.occupancy}
-                                    {buildingSummary.max_capacity ? ` / ${buildingSummary.max_capacity}` : ''}.
+                                    {Array.isArray(buildingSummary.exceeded_building_ids) && buildingSummary.exceeded_building_ids.length > 0
+                                        ? `Groups ${buildingSummary.exceeded_building_ids.join(', ')} exceeded capacity.`
+                                        : `Building occupancy is ${buildingSummary.occupancy}${buildingSummary.max_capacity ? ` / ${buildingSummary.max_capacity}` : ''}.`}
                                 </div>
                             </div>
                             <Button
@@ -452,7 +460,7 @@ const Layout = ({ onLogout }) => {
                                             </div>
                                         ) : (
                                             visibleNotifications.map((event) => {
-                                                const isUnread = parseApiTimestampMs(event?.timestamp) > lastNotificationReadAt;
+                                                const isUnread = parseApiTimestampMs(getNotificationTimestampValue(event)) > lastNotificationReadAt;
                                                 const isCapacityEvent = event?.event_type === 'Capacity Exceeded';
                                                 const isFallEvent = event?.event_type === 'Fall Detected';
 
@@ -499,7 +507,7 @@ const Layout = ({ onLogout }) => {
                                                                 </div>
                                                                 <div className="mt-2 flex items-center justify-between gap-3 text-xs text-muted-foreground">
                                                                     <span className="truncate">{getNotificationSourceLabel(event)}</span>
-                                                                    <span>{formatNotificationTime(event.timestamp)}</span>
+                                                                    <span>{formatNotificationTime(getNotificationTimestampValue(event))}</span>
                                                                 </div>
                                                             </div>
                                                         </div>

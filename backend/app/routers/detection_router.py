@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Query, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func
 
 from app.core.database import get_db, AsyncSessionLocal
 from app.models.camera_model import Camera
@@ -56,16 +56,17 @@ async def list_detection_events(
     if start is not None and end is not None and start > end:
         raise HTTPException(status_code=400, detail="start must be earlier than or equal to end")
 
-    query = select(DetectionEvent).order_by(desc(DetectionEvent.timestamp))
+    effective_time = func.coalesce(DetectionEvent.processed_at, DetectionEvent.timestamp)
+    query = select(DetectionEvent).order_by(desc(effective_time))
 
     if camera_id:
         query = query.where(DetectionEvent.camera_id == camera_id)
     if event_type:
         query = query.where(DetectionEvent.event_type == event_type)
     if start is not None:
-        query = query.where(DetectionEvent.timestamp >= start)
+        query = query.where(effective_time >= start)
     if end is not None:
-        query = query.where(DetectionEvent.timestamp <= end)
+        query = query.where(effective_time <= end)
 
     query = query.offset(offset).limit(limit)
     result = await db.execute(query)
@@ -140,6 +141,7 @@ async def violation_persistence_loop():
                     if event_type == "Capacity Exceeded":
                         details = {
                             "scope": scope or "camera",
+                            "building_id": evt.get("building_id"),
                             "occupancy": evt.get("occupancy"),
                             "max_capacity": evt.get("max_capacity"),
                         }
@@ -166,12 +168,20 @@ async def violation_persistence_loop():
                             "source_path": evt.get("source_path"),
                         }
 
+                    db_event_kwargs = {
+                        "id": evt["id"],
+                        "camera_id": camera_id,
+                        "camera_name": camera_name,
+                        "event_type": event_type,
+                        "details": details,
+                    }
+                    if "timestamp" in evt:
+                        db_event_kwargs["timestamp"] = evt.get("timestamp")
+                    if "processed_at" in evt:
+                        db_event_kwargs["processed_at"] = evt.get("processed_at")
+
                     db_event = DetectionEvent(
-                        id=evt["id"],
-                        camera_id=camera_id,
-                        camera_name=camera_name,
-                        event_type=event_type,
-                        details=details,
+                        **db_event_kwargs,
                     )
                     session.add(db_event)
                     await session.commit()

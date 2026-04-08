@@ -1057,11 +1057,9 @@ const SystemConfiguration = () => {
                                                         </Button>
                                                     </div>
                                                 </div>
-                                                {!streamPreview && (
-                                                    <p className="text-xs text-muted-foreground">
-                                                        Test the stream first to load a preview frame, then draw the detector ROI. If ROI is not set, YOLO uses the full frame.
-                                                    </p>
-                                                )}
+                                                <p className="text-xs text-muted-foreground">
+                                                    Test the stream first to load a preview frame, then draw the detector ROI. If ROI is never set, the whole image is used for detection.
+                                                </p>
                                                 {streamPreview && (
                                                     <div ref={previewContainerRef} className="relative aspect-video overflow-hidden rounded-md bg-black">
                                                         <img

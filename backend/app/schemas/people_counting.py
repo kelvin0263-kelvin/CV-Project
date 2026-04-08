@@ -60,6 +60,7 @@ class BuildingCountingConfigRead(BaseModel):
     id: str
     enabled: bool
     max_capacity: Optional[int] = None
+    capacity_by_building_id: dict[str, int] = Field(default_factory=dict)
     manual_offset: int
 
     model_config = {"from_attributes": True}
@@ -68,7 +69,9 @@ class BuildingCountingConfigRead(BaseModel):
 class BuildingCountingConfigUpdate(BaseModel):
     """Schema for updating building-level counting config."""
     enabled: Optional[bool] = None
+    building_id: Optional[str] = None
     max_capacity: Optional[int] = None
+    capacity_by_building_id: Optional[dict[str, Optional[int]]] = None
     manual_offset: Optional[int] = None
 
 
@@ -77,6 +80,9 @@ class BuildingOccupancySummaryRead(BaseModel):
     enabled: bool
     max_capacity: Optional[int] = None
     capacity_exceeded: bool
+    exceeded_building_ids: list[str] = Field(default_factory=list)
+    default_max_capacity: Optional[int] = None
+    capacity_by_building_id: dict[str, int] = Field(default_factory=dict)
     manual_offset: int
     raw_in: int
     raw_out: int
@@ -89,7 +95,8 @@ class BuildingOccupancySummaryRead(BaseModel):
 class BuildingCountingSnapshotRead(BaseModel):
     """Schema for reading historical building-level occupancy snapshots."""
     id: str
-    timestamp: datetime
+    timestamp: Optional[datetime] = None
+    processed_at: Optional[datetime] = None
     enabled: bool
     raw_in: int
     raw_out: int
@@ -113,7 +120,8 @@ class PeopleCountingSnapshotRead(BaseModel):
     id: str
     camera_id: str
     camera_name: Optional[str] = None
-    timestamp: datetime
+    timestamp: Optional[datetime] = None
+    processed_at: Optional[datetime] = None
     total_in: int
     total_out: int
     current_occupancy: int

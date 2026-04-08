@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import and_, func, select, delete as sa_delete, desc
+from sqlalchemy import func, select, delete as sa_delete, desc
 
 from app.core.database import get_db, AsyncSessionLocal
 from app.core.video_capture import is_rtsp_source
@@ -99,6 +99,25 @@ def _serialize_counting_config_row(row: PeopleCountingConfig) -> dict:
         "lines": row.lines or [],
         "frame_exclude_areas": frame_exclude_areas,
     }
+
+
+def _normalize_capacity_by_building_id(raw_value) -> dict[str, int]:
+    normalized: dict[str, int] = {}
+    if not isinstance(raw_value, dict):
+        return normalized
+
+    for raw_building_id, raw_capacity in raw_value.items():
+        building_id = _normalize_building_id(raw_building_id)
+        if not building_id:
+            continue
+        try:
+            parsed_capacity = int(raw_capacity)
+        except (TypeError, ValueError):
+            continue
+        if parsed_capacity > 0:
+            normalized[building_id] = parsed_capacity
+
+    return normalized
 
 
 def get_counting_config(camera_id: str) -> dict | None:
@@ -206,13 +225,41 @@ def _build_empty_live_count(camera_id: str) -> dict:
     }
 
 
-def _is_current_local_day_snapshot(timestamp: datetime | None) -> bool:
-    if timestamp is None:
+def reset_uploaded_runtime_counting_state(camera_ids: list[str] | set[str]) -> None:
+    """Reset in-memory counting state for uploaded-video reruns."""
+    normalized_camera_ids = {
+        str(camera_id).strip()
+        for camera_id in (camera_ids or [])
+        if str(camera_id).strip()
+    }
+    for camera_id in normalized_camera_ids:
+        request_counting_reset(camera_id)
+        reset_camera_rollup(camera_id)
+        reset_cross_camera_state(camera_id)
+        _last_saved_snapshot_signature.pop(camera_id, None)
+        update_live_counts(camera_id, _build_empty_live_count(camera_id))
+    if normalized_camera_ids:
+        request_building_snapshot_if_needed()
+
+
+def _effective_snapshot_datetime(
+    timestamp: datetime | None,
+    processed_at: datetime | None = None,
+) -> datetime | None:
+    return processed_at or timestamp
+
+
+def _is_current_local_day_snapshot(
+    timestamp: datetime | None,
+    processed_at: datetime | None = None,
+) -> bool:
+    candidate = _effective_snapshot_datetime(timestamp, processed_at)
+    if candidate is None:
         return False
-    if timestamp.tzinfo is None:
-        local_timestamp = timestamp.replace(tzinfo=timezone.utc).astimezone()
+    if candidate.tzinfo is None:
+        local_timestamp = candidate.replace(tzinfo=timezone.utc).astimezone()
     else:
-        local_timestamp = timestamp.astimezone()
+        local_timestamp = candidate.astimezone()
     return local_timestamp.date() == datetime.now().astimezone().date()
 
 
@@ -238,31 +285,18 @@ def _build_restored_live_count(camera_id: str, snapshot: PeopleCountingSnapshot)
 async def _load_latest_snapshot_by_camera(
     session: AsyncSession,
     camera_ids: list[str],
+    *,
+    current_day_only: bool = True,
 ) -> dict[str, PeopleCountingSnapshot]:
     if not camera_ids:
         return {}
 
-    latest_timestamp_subquery = (
-        select(
-            PeopleCountingSnapshot.camera_id.label("camera_id"),
-            func.max(PeopleCountingSnapshot.timestamp).label("latest_timestamp"),
-        )
-        .where(PeopleCountingSnapshot.camera_id.in_(camera_ids))
-        .group_by(PeopleCountingSnapshot.camera_id)
-        .subquery()
-    )
-
     result = await session.execute(
         select(PeopleCountingSnapshot)
-        .join(
-            latest_timestamp_subquery,
-            and_(
-                PeopleCountingSnapshot.camera_id == latest_timestamp_subquery.c.camera_id,
-                PeopleCountingSnapshot.timestamp == latest_timestamp_subquery.c.latest_timestamp,
-            ),
-        )
+        .where(PeopleCountingSnapshot.camera_id.in_(camera_ids))
         .order_by(
             PeopleCountingSnapshot.camera_id.asc(),
+            desc(func.coalesce(PeopleCountingSnapshot.processed_at, PeopleCountingSnapshot.timestamp)),
             PeopleCountingSnapshot.timestamp.desc(),
             PeopleCountingSnapshot.id.desc(),
         )
@@ -270,14 +304,15 @@ async def _load_latest_snapshot_by_camera(
 
     latest_by_camera: dict[str, PeopleCountingSnapshot] = {}
     for snapshot in result.scalars():
-        existing = latest_by_camera.get(snapshot.camera_id)
-        if existing is None or snapshot.timestamp > existing.timestamp:
-            latest_by_camera[snapshot.camera_id] = snapshot
+        latest_by_camera.setdefault(snapshot.camera_id, snapshot)
+
+    if not current_day_only:
+        return latest_by_camera
 
     return {
         camera_id: snapshot
         for camera_id, snapshot in latest_by_camera.items()
-        if _is_current_local_day_snapshot(snapshot.timestamp)
+        if _is_current_local_day_snapshot(snapshot.timestamp, snapshot.processed_at)
     }
 
 
@@ -286,12 +321,12 @@ async def _load_latest_building_snapshot(
 ) -> BuildingCountingSnapshot | None:
     latest_snapshot = await session.scalar(
         select(BuildingCountingSnapshot)
-        .order_by(desc(BuildingCountingSnapshot.timestamp))
+        .order_by(desc(func.coalesce(BuildingCountingSnapshot.processed_at, BuildingCountingSnapshot.timestamp)))
         .limit(1)
     )
     if latest_snapshot is None:
         return None
-    if not _is_current_local_day_snapshot(latest_snapshot.timestamp):
+    if not _is_current_local_day_snapshot(latest_snapshot.timestamp, latest_snapshot.processed_at):
         return None
     return latest_snapshot
 
@@ -305,6 +340,7 @@ _building_snapshot_queue: list[dict] = []
 _last_saved_building_snapshot_signature: tuple | None = None
 _last_queued_building_snapshot_signature: tuple | None = None
 _last_building_snapshot_time: float = 0.0
+_building_snapshot_lock = threading.Lock()
 
 
 def _normalize_query_datetime(value: datetime | None) -> datetime | None:
@@ -328,13 +364,15 @@ def _drain_snapshot_queue() -> list[dict]:
 
 def queue_building_snapshot(snapshot: dict):
     """Queue a building occupancy snapshot for async DB persistence."""
-    _building_snapshot_queue.append(snapshot)
+    with _building_snapshot_lock:
+        _building_snapshot_queue.append(snapshot)
 
 
 def _drain_building_snapshot_queue() -> list[dict]:
-    items = list(_building_snapshot_queue)
-    _building_snapshot_queue.clear()
-    return items
+    with _building_snapshot_lock:
+        items = list(_building_snapshot_queue)
+        _building_snapshot_queue.clear()
+        return items
 
 
 def _snapshot_signature(
@@ -381,10 +419,28 @@ def _building_snapshot_signature_from_summary(summary: dict) -> tuple:
     )
 
 
-def _build_building_snapshot(summary: dict) -> dict:
+def _extract_building_snapshot_camera_ids(snapshot: dict) -> list[str]:
+    camera_ids: set[str] = set()
+    for entrance_summary in (snapshot.get("entrance_summaries") or {}).values():
+        if not isinstance(entrance_summary, dict):
+            continue
+        for camera_id in entrance_summary.get("camera_ids") or []:
+            normalized_camera_id = str(camera_id or "").strip()
+            if normalized_camera_id:
+                camera_ids.add(normalized_camera_id)
+    return sorted(camera_ids)
+
+
+def _build_building_snapshot(
+    summary: dict,
+    *,
+    timestamp: datetime | None = None,
+    processed_at: datetime | None = None,
+) -> dict:
     return {
         "id": str(uuid.uuid4()),
-        "timestamp": datetime.now(timezone.utc),
+        "timestamp": timestamp,
+        "processed_at": processed_at,
         "enabled": bool(summary.get("enabled", True)),
         "raw_in": int(summary.get("raw_in", 0) or 0),
         "raw_out": int(summary.get("raw_out", 0) or 0),
@@ -396,6 +452,36 @@ def _build_building_snapshot(summary: dict) -> dict:
         "active_camera_count": int(summary.get("active_camera_count", 0) or 0),
         "entrance_summaries": summary.get("entrance_summaries") or {},
     }
+
+
+async def _derive_building_snapshot_timestamps(
+    session: AsyncSession,
+    snapshot: dict,
+) -> tuple[datetime | None, datetime | None]:
+    camera_ids = _extract_building_snapshot_camera_ids(snapshot)
+    fallback_timestamp = _coerce_snapshot_timestamp(snapshot.get("timestamp"), fallback_now=True)
+    fallback_processed_at = _coerce_snapshot_timestamp(snapshot.get("processed_at"), fallback_now=False)
+
+    if not camera_ids:
+        return fallback_timestamp, fallback_processed_at
+
+    latest_by_camera = await _load_latest_snapshot_by_camera(
+        session,
+        camera_ids,
+        current_day_only=False,
+    )
+    latest_snapshots = list(latest_by_camera.values())
+    if not latest_snapshots:
+        return fallback_timestamp, fallback_processed_at
+
+    timestamp_candidates = [row.timestamp for row in latest_snapshots if row.timestamp is not None]
+    processed_at_candidates = [row.processed_at for row in latest_snapshots if row.processed_at is not None]
+
+    event_timestamp = max(timestamp_candidates) if timestamp_candidates else None
+    processed_at = max(processed_at_candidates) if processed_at_candidates else None
+    if event_timestamp is None and processed_at is None:
+        return fallback_timestamp, fallback_processed_at
+    return event_timestamp, processed_at
 
 
 async def _is_duplicate_snapshot(session: AsyncSession, snapshot: dict) -> tuple[bool, tuple[int, int, int]]:
@@ -414,7 +500,7 @@ async def _is_duplicate_snapshot(session: AsyncSession, snapshot: dict) -> tuple
         latest_row = await session.scalar(
             select(PeopleCountingSnapshot)
             .where(PeopleCountingSnapshot.camera_id == camera_id)
-            .order_by(desc(PeopleCountingSnapshot.timestamp))
+            .order_by(desc(func.coalesce(PeopleCountingSnapshot.processed_at, PeopleCountingSnapshot.timestamp)))
             .limit(1)
         )
         if latest_row is not None:
@@ -439,7 +525,7 @@ async def _is_duplicate_building_snapshot(session: AsyncSession, snapshot: dict)
     if cached_signature is None:
         latest_row = await session.scalar(
             select(BuildingCountingSnapshot)
-            .order_by(desc(BuildingCountingSnapshot.timestamp))
+            .order_by(desc(func.coalesce(BuildingCountingSnapshot.processed_at, BuildingCountingSnapshot.timestamp)))
             .limit(1)
         )
         if latest_row is not None:
@@ -462,23 +548,37 @@ async def _is_duplicate_building_snapshot(session: AsyncSession, snapshot: dict)
     return cached_signature == incoming_signature, incoming_signature
 
 
-def _queue_building_snapshot_if_needed(heartbeat_interval: float = BUILDING_SNAPSHOT_HEARTBEAT_SEC):
+def request_building_snapshot_if_needed(
+    *,
+    heartbeat_interval: float = BUILDING_SNAPSHOT_HEARTBEAT_SEC,
+    timestamp: datetime | None = None,
+    processed_at: datetime | None = None,
+) -> bool:
     global _last_queued_building_snapshot_signature, _last_building_snapshot_time
 
     summary = get_building_summary()
     signature = _building_snapshot_signature_from_summary(summary)
     now = time.time()
 
-    if _last_queued_building_snapshot_signature is None:
-        queue_building_snapshot(_build_building_snapshot(summary))
-        _last_queued_building_snapshot_signature = signature
-        _last_building_snapshot_time = now
-        return
+    with _building_snapshot_lock:
+        should_queue = (
+            _last_queued_building_snapshot_signature is None
+            or signature != _last_queued_building_snapshot_signature
+            or (now - _last_building_snapshot_time) >= heartbeat_interval
+        )
+        if not should_queue:
+            return False
 
-    if signature != _last_queued_building_snapshot_signature or (now - _last_building_snapshot_time) >= heartbeat_interval:
-        queue_building_snapshot(_build_building_snapshot(summary))
+        _building_snapshot_queue.append(
+            _build_building_snapshot(
+                summary,
+                timestamp=timestamp,
+                processed_at=processed_at,
+            )
+        )
         _last_queued_building_snapshot_signature = signature
         _last_building_snapshot_time = now
+        return True
 
 
 async def _restart_rtsp_counting_runtimes():
@@ -555,6 +655,7 @@ async def reset_all_runtime_counts():
     _last_saved_building_snapshot_signature = None
     _last_queued_building_snapshot_signature = None
     _last_building_snapshot_time = 0.0
+    request_building_snapshot_if_needed()
 
     print(
         " ".join(
@@ -591,10 +692,10 @@ async def daily_runtime_reset_loop():
             print(f"[CountingReset] Daily runtime reset failed: {e}")
 
 
-def _coerce_snapshot_timestamp(raw_value) -> datetime:
+def _coerce_snapshot_timestamp(raw_value, *, fallback_now: bool = True) -> datetime | None:
     """
     Normalize incoming snapshot timestamps to UTC-aware datetimes.
-    Falls back to current UTC time if input is missing/invalid.
+    Falls back to current UTC time only when requested.
     """
     if isinstance(raw_value, datetime):
         dt = raw_value
@@ -605,9 +706,9 @@ def _coerce_snapshot_timestamp(raw_value) -> datetime:
         try:
             dt = datetime.fromisoformat(text)
         except ValueError:
-            return datetime.now(timezone.utc)
+            return datetime.now(timezone.utc) if fallback_now else None
     else:
-        return datetime.now(timezone.utc)
+        return datetime.now(timezone.utc) if fallback_now else None
 
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
@@ -623,11 +724,14 @@ async def counting_snapshot_persistence_loop():
 
     while True:
         await asyncio.sleep(5)
-        _queue_building_snapshot_if_needed()
+        request_building_snapshot_if_needed()
         building_alert = poll_building_capacity_alert()
         if building_alert:
             from app.services.video_processor import queue_violation_event
 
+            alert_timestamp = datetime.now(timezone.utc)
+            building_alert.setdefault("timestamp", alert_timestamp)
+            building_alert.setdefault("processed_at", alert_timestamp)
             queue_violation_event(building_alert)
 
         items = _drain_snapshot_queue()
@@ -657,7 +761,8 @@ async def counting_snapshot_persistence_loop():
                         id=snap.get("id", str(uuid.uuid4())),
                         camera_id=snap["camera_id"],
                         camera_name=camera_name,
-                        timestamp=_coerce_snapshot_timestamp(snap.get("timestamp")),
+                        timestamp=_coerce_snapshot_timestamp(snap.get("timestamp"), fallback_now=False),
+                        processed_at=_coerce_snapshot_timestamp(snap.get("processed_at"), fallback_now=False),
                         total_in=snap.get("total_in", 0),
                         total_out=snap.get("total_out", 0),
                         current_occupancy=snap.get("current_occupancy", 0),
@@ -679,10 +784,12 @@ async def counting_snapshot_persistence_loop():
                     duplicate, signature = await _is_duplicate_building_snapshot(session, snap)
                     if duplicate:
                         continue
+                    event_timestamp, processed_at = await _derive_building_snapshot_timestamps(session, snap)
 
                     row = BuildingCountingSnapshot(
                         id=snap.get("id", str(uuid.uuid4())),
-                        timestamp=_coerce_snapshot_timestamp(snap.get("timestamp")),
+                        timestamp=event_timestamp,
+                        processed_at=processed_at,
                         enabled=bool(snap.get("enabled", True)),
                         raw_in=int(snap.get("raw_in", 0) or 0),
                         raw_out=int(snap.get("raw_out", 0) or 0),
@@ -752,6 +859,7 @@ async def _get_or_create_building_config(session: AsyncSession) -> BuildingCount
             id="default-building-counting-config",
             enabled=True,
             max_capacity=None,
+            capacity_by_building_id={},
             manual_offset=0,
         )
         session.add(row)
@@ -905,6 +1013,9 @@ async def sync_counting_runtime_from_db(session: AsyncSession):
         {
             "enabled": building_config.enabled,
             "max_capacity": building_config.max_capacity,
+            "capacity_by_building_id": _normalize_capacity_by_building_id(
+                building_config.capacity_by_building_id
+            ),
             "manual_offset": building_config.manual_offset,
         },
         building_sensor_configs,
@@ -930,7 +1041,7 @@ async def load_counting_configs_from_db():
                 )
                 print(
                     "[Startup] Restored building summary from snapshot "
-                    f"timestamp={latest_building_snapshot.timestamp}"
+                    f"timestamp={_effective_snapshot_datetime(latest_building_snapshot.timestamp, latest_building_snapshot.processed_at)}"
                 )
             print(f"[Startup] Loaded {len(_counting_configs)} people counting config(s)")
     except Exception as e:
@@ -1077,6 +1188,7 @@ async def upsert_config(
     await db.refresh(row)
 
     await sync_counting_runtime_from_db(db)
+    request_building_snapshot_if_needed()
 
     return _serialize_counting_config_row(row)
 
@@ -1090,6 +1202,7 @@ async def delete_config(camera_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="No counting config for this camera")
 
     await sync_counting_runtime_from_db(db)
+    request_building_snapshot_if_needed()
     return {"status": "deleted"}
 
 
@@ -1108,7 +1221,9 @@ async def get_history(
     if start is not None and end is not None and start > end:
         raise HTTPException(status_code=400, detail="start must be earlier than or equal to end")
 
-    query = select(PeopleCountingSnapshot).order_by(desc(PeopleCountingSnapshot.timestamp))
+    query = select(PeopleCountingSnapshot).order_by(
+        desc(func.coalesce(PeopleCountingSnapshot.processed_at, PeopleCountingSnapshot.timestamp))
+    )
     if camera_id:
         query = query.where(PeopleCountingSnapshot.camera_id == camera_id)
     if start is not None:
@@ -1138,6 +1253,7 @@ async def reset_camera_counting(camera_id: str):
 
     empty_data = _build_empty_live_count(camera_id)
     update_live_counts(camera_id, empty_data)
+    request_building_snapshot_if_needed()
 
     return {
         "camera_id": camera_id,
@@ -1149,6 +1265,7 @@ async def reset_camera_counting(camera_id: str):
 @router.get("/api/building-counting-config", response_model=BuildingCountingConfigRead)
 async def get_building_config(db: AsyncSession = Depends(get_db)):
     row = await _get_or_create_building_config(db)
+    row.capacity_by_building_id = _normalize_capacity_by_building_id(row.capacity_by_building_id)
     return row
 
 
@@ -1158,16 +1275,31 @@ async def update_building_config(
     db: AsyncSession = Depends(get_db),
 ):
     row = await _get_or_create_building_config(db)
+    normalized_capacity_map = _normalize_capacity_by_building_id(row.capacity_by_building_id)
+
     if update.enabled is not None:
         row.enabled = update.enabled
-    if update.max_capacity is not None:
+    if update.capacity_by_building_id is not None:
+        normalized_capacity_map = _normalize_capacity_by_building_id(update.capacity_by_building_id)
+    if update.building_id is not None:
+        normalized_building_id = _normalize_building_id(update.building_id)
+        if normalized_building_id:
+            parsed_capacity = int(update.max_capacity or 0)
+            if parsed_capacity > 0:
+                normalized_capacity_map[normalized_building_id] = parsed_capacity
+            else:
+                normalized_capacity_map.pop(normalized_building_id, None)
+    elif update.max_capacity is not None:
         row.max_capacity = int(update.max_capacity) if int(update.max_capacity) > 0 else None
+    row.capacity_by_building_id = normalized_capacity_map
     if update.manual_offset is not None:
         row.manual_offset = int(update.manual_offset)
 
     await db.flush()
     await db.refresh(row)
+    row.capacity_by_building_id = _normalize_capacity_by_building_id(row.capacity_by_building_id)
     await sync_counting_runtime_from_db(db)
+    request_building_snapshot_if_needed()
     return row
 
 
@@ -1184,11 +1316,12 @@ async def get_building_history(
     if start is not None and end is not None and start > end:
         raise HTTPException(status_code=400, detail="start must be earlier than or equal to end")
 
-    query = select(BuildingCountingSnapshot).order_by(desc(BuildingCountingSnapshot.timestamp))
+    effective_time = func.coalesce(BuildingCountingSnapshot.processed_at, BuildingCountingSnapshot.timestamp)
+    query = select(BuildingCountingSnapshot).order_by(desc(effective_time))
     if start is not None:
-        query = query.where(BuildingCountingSnapshot.timestamp >= start)
+        query = query.where(effective_time >= start)
     if end is not None:
-        query = query.where(BuildingCountingSnapshot.timestamp <= end)
+        query = query.where(effective_time <= end)
     query = query.offset(offset).limit(limit)
     result = await db.execute(query)
     return result.scalars().all()
@@ -1203,4 +1336,5 @@ async def get_building_occupancy_summary():
 async def reset_building_occupancy_summary(db: AsyncSession = Depends(get_db)):
     row = await _get_or_create_building_config(db)
     reset_building_runtime(manual_offset=row.manual_offset)
+    request_building_snapshot_if_needed()
     return get_building_summary()

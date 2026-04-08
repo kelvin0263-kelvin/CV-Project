@@ -1,5 +1,6 @@
 import threading
 import time
+from datetime import datetime
 
 from app.services.video_processor import start_producer_thread
 
@@ -15,6 +16,7 @@ def register_pending_upload(
     source_path: str,
     is_fisheye: bool,
     active_views: list[int] | None,
+    uploaded_video_start_time_override: datetime | None = None,
 ) -> int:
     """Register an uploaded source for later synchronized start."""
     normalized_group_id = group_id.strip()
@@ -29,6 +31,7 @@ def register_pending_upload(
             "source_path": source_path,
             "is_fisheye": is_fisheye,
             "active_views": list(active_views) if active_views is not None else None,
+            "uploaded_video_start_time_override": uploaded_video_start_time_override,
         })
         _pending_sync_groups[normalized_group_id] = members
         return len(members)
@@ -69,14 +72,21 @@ def discard_pending_runtime_key(runtime_key: str):
             _pending_sync_groups.pop(group_id, None)
 
 
-def start_sync_group(group_id: str) -> dict:
-    """Start all pending uploads in a group as closely together as possible."""
+def pop_sync_group_members(group_id: str) -> tuple[str, list[dict]]:
+    """Remove and return all pending members for a sync group."""
     normalized_group_id = group_id.strip()
     if not normalized_group_id:
         raise ValueError("sync group id is required")
 
     with _sync_lock:
         members = _pending_sync_groups.pop(normalized_group_id, [])
+
+    return normalized_group_id, members
+
+
+def start_sync_group(group_id: str) -> dict:
+    """Start all pending uploads in a group as closely together as possible."""
+    normalized_group_id, members = pop_sync_group_members(group_id)
 
     if not members:
         return {"group_id": normalized_group_id, "started_sources": 0}
@@ -99,6 +109,7 @@ def start_sync_group(group_id: str) -> dict:
             member["active_views"],
             sync_barrier=sync_barrier,
             sync_state=sync_state,
+            uploaded_video_start_time_override=member.get("uploaded_video_start_time_override"),
         )
 
     return {

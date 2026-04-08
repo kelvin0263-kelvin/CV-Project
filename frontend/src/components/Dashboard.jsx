@@ -58,6 +58,20 @@ const matchesSourceFilter = (camera, sourceFilter) => {
     return camera.source_kind === sourceFilter;
 };
 
+const getSourceAccentClasses = (camera) => {
+    const isUploadedSource = Boolean(camera?.is_uploaded) || camera?.source_kind === 'uploaded_video';
+    if (isUploadedSource) {
+        return {
+            dot: 'fill-blue-500 text-blue-500',
+            label: 'text-blue-300',
+        };
+    }
+    return {
+        dot: 'fill-green-500 text-green-500',
+        label: 'text-green-300',
+    };
+};
+
 const getLineType = (line) => line?.line_type === 'foot_traffic' ? 'foot_traffic' : 'occupancy';
 const getFootTrafficLabelsForLine = (line) => {
     const points = Array.isArray(line?.points) ? line.points : [];
@@ -90,9 +104,11 @@ const CameraFeedCard = ({ camera, apiUrl }) => {
     const [stats, setStats] = useState({ fps: 0, people_count: 0 });
     const [countingData, setCountingData] = useState({});
     const [runtimePreviewImage, setRuntimePreviewImage] = useState('');
+    const [showSourceLabelHint, setShowSourceLabelHint] = useState(true);
     const wsUrl = getWSUrl(`/ws/${camera.id}`);
     const overlayMode = inferOverlayMode(camera.analysis_tags);
     const footTrafficLabels = getFootTrafficSummaryLabels(countingData?.lines);
+    const sourceAccent = getSourceAccentClasses(camera);
 
     const hasCountingData = countingData && (
         countingData.total_in > 0
@@ -138,6 +154,14 @@ const CameraFeedCard = ({ camera, apiUrl }) => {
         };
     }, [apiUrl, camera.runtime_key, shouldLoadStoppedUploadPreview]);
 
+    useEffect(() => {
+        setShowSourceLabelHint(true);
+        const timeoutId = window.setTimeout(() => {
+            setShowSourceLabelHint(false);
+        }, 3200);
+        return () => window.clearTimeout(timeoutId);
+    }, [camera.id]);
+
     return (
         <div className="relative group overflow-hidden bg-black rounded-sm border border-border/50 h-full w-full flex items-center justify-center">
             {/* Live Feed or Image */}
@@ -162,34 +186,49 @@ const CameraFeedCard = ({ camera, apiUrl }) => {
 
 
             {/* Overlays */}
-            <div className="absolute inset-0 p-4 pointer-events-none">
-                {/* Top Bar: Camera Info */}
-                <div className="flex justify-between items-start">
-                    <div className="bg-black/60 text-white text-xs px-2 py-1 rounded backdrop-blur-sm flex items-center gap-2">
-                        <Circle className="w-2 h-2 fill-green-500 text-green-500 animate-pulse" />
-                        {camera.name}
-                    </div>
-                    <div className="flex gap-2 flex-wrap justify-end">
-                        {stats.people_count > 0 && (
-                            <div className="bg-black/60 text-white text-xs px-2 py-1 rounded backdrop-blur-sm flex items-center gap-1">
-                                <Users className="w-3 h-3" />
-                                {stats.people_count}
-                            </div>
-                        )}
-                        {hasCountingData && (
-                            <div className="bg-black/60 text-white text-xs px-2 py-1 rounded backdrop-blur-sm flex items-center gap-1.5">
-                                <span className="text-green-400">IN:{countingData.total_in}</span>
-                                <span className="text-red-400">OUT:{countingData.total_out}</span>
-                                {(countingData.foot_traffic_total ?? 0) > 0 && (
-                                    <span className="text-cyan-300">
-                                        FT:{footTrafficLabels.shortNegative}{countingData.foot_traffic_left ?? 0}/{footTrafficLabels.shortPositive}{countingData.foot_traffic_right ?? 0}/T{countingData.foot_traffic_total ?? 0}
-                                    </span>
-                                )}
-                            </div>
-                        )}
-                        <div className="bg-black/60 text-white text-xs px-2 py-1 rounded backdrop-blur-sm flex items-center gap-1">
-                            {stats.fps > 0 ? stats.fps : camera.fps} FPS
+            <div className="absolute inset-0 pointer-events-none">
+                {/* Top-left corner label */}
+                <div
+                    className={`absolute left-1.5 top-1.5 overflow-hidden rounded-full bg-black/70 backdrop-blur-sm transition-all duration-300 ${showSourceLabelHint
+                        ? 'max-w-[70%] px-2.5 py-1'
+                        : 'max-w-4 px-1.5 py-1'
+                        } group-hover:max-w-[70%] group-hover:px-2.5`}
+                >
+                    <div className="flex items-center gap-2 text-xs text-white">
+                        <Circle className={`h-2 w-2 shrink-0 animate-pulse ${sourceAccent.dot}`} />
+                        <div
+                            className={`flex min-w-0 items-center gap-1.5 overflow-hidden whitespace-nowrap transition-all duration-300 ${showSourceLabelHint ? 'max-w-[260px] opacity-100' : 'max-w-0 opacity-0'
+                                } group-hover:max-w-[260px] group-hover:opacity-100`}
+                        >
+                            <span className={`truncate font-medium ${sourceAccent.label}`}>{camera.name}</span>
+                            {camera.location && (
+                                <span className="truncate text-white/70">- {camera.location}</span>
+                            )}
                         </div>
+                    </div>
+                </div>
+
+                {/* Top-right stats */}
+                <div className="absolute right-1.5 top-1.5 flex gap-2 flex-wrap justify-end">
+                    {stats.people_count > 0 && (
+                        <div className="bg-black/60 text-white text-xs px-2 py-1 rounded backdrop-blur-sm flex items-center gap-1">
+                            <Users className="w-3 h-3" />
+                            {stats.people_count}
+                        </div>
+                    )}
+                    {hasCountingData && (
+                        <div className="bg-black/60 text-white text-xs px-2 py-1 rounded backdrop-blur-sm flex items-center gap-1.5">
+                            <span className="text-green-400">IN:{countingData.total_in}</span>
+                            <span className="text-red-400">OUT:{countingData.total_out}</span>
+                            {(countingData.foot_traffic_total ?? 0) > 0 && (
+                                <span className="text-cyan-300">
+                                    FT:{footTrafficLabels.shortNegative}{countingData.foot_traffic_left ?? 0}/{footTrafficLabels.shortPositive}{countingData.foot_traffic_right ?? 0}/T{countingData.foot_traffic_total ?? 0}
+                                </span>
+                            )}
+                        </div>
+                    )}
+                    <div className="bg-black/60 text-white text-xs px-2 py-1 rounded backdrop-blur-sm flex items-center gap-1">
+                        {stats.fps > 0 ? stats.fps : camera.fps} FPS
                     </div>
                 </div>
             </div>

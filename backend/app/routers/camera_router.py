@@ -2,6 +2,7 @@ from fastapi import APIRouter, UploadFile, File, Form, HTTPException, WebSocket,
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete as sa_delete
 from typing import List, Any
+from datetime import datetime
 import uuid
 import os
 import asyncio
@@ -20,15 +21,20 @@ from pydantic import BaseModel
 
 from app.core.video_capture import is_rtsp_source, open_video_capture
 from app.models.camera_model import Camera
+from app.models.detection_event import DetectionEvent
 from app.models.dresscode_policy import DressCodePolicy
 from app.models.fall_detection_config import FallDetectionConfig
 from app.models.people_counting_config import PeopleCountingConfig
+from app.models.people_counting_snapshot import PeopleCountingSnapshot
 from app.models.stream_config import StreamConfig
 from app.schemas.camera import CameraCreate, CameraRead
 from app.core.database import get_db, AsyncSessionLocal
 from app.core.globals import FRAME_BUFFERS, PRODUCER_META, PRODUCER_LOCK
 from app.services.video_processor import (
     FFMPEG_BIN,
+    LOCAL_TIMEZONE,
+    _get_upload_display_filename,
+    _parse_uploaded_video_start_time,
     start_producer_thread,
     stop_producer_thread,
     is_producer_running,
@@ -38,11 +44,11 @@ from app.services.upload_sync import (
     discard_pending_runtime_key,
     is_pending_runtime_key,
     list_sync_groups,
+    pop_sync_group_members,
     register_pending_upload,
-    start_sync_group,
 )
 from app.routers.policy_router import sync_policy_runtime_from_db
-from app.routers.counting_router import sync_counting_runtime_from_db
+from app.routers.counting_router import reset_uploaded_runtime_counting_state, sync_counting_runtime_from_db
 from DefishVideoCV import FisheyeMultiView
 
 router = APIRouter()
@@ -54,6 +60,7 @@ BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 PROJECT_ROOT = os.path.dirname(BACKEND_ROOT)  # Go up one level to CV-UI/
 UPLOAD_DIR = os.path.join(PROJECT_ROOT, "temp_video_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+UPLOAD_SNAPSHOT_DIR = os.path.join(UPLOAD_DIR, "snapshots")
 
 try:
     WS_MAX_FPS = float(os.getenv("WS_MAX_FPS", "30"))
@@ -98,6 +105,7 @@ class UploadVideoUpdateRequest(BaseModel):
     detection_roi: dict[str, Any] | None = None
     is_fisheye: bool | None = None
     view_index: int | None = None
+    uploaded_video_start_time_override: str | None = None
 
 
 FISHEYE_VIEW_CONFIGS = [
@@ -112,6 +120,34 @@ FISHEYE_VIEW_CONFIGS = [
 ]
 
 FISHEYE_UPLOAD_NAME_PATTERN = re.compile(r"^(?P<prefix>.+?)\s-\sView\s\d+\s*\([^)]*\)$")
+
+
+def _serialize_datetime(value: datetime | None) -> str | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=LOCAL_TIMEZONE)
+    return value.isoformat()
+
+
+def _coerce_uploaded_video_start_time_override(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+        try:
+            dt = datetime.fromisoformat(normalized)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid uploaded_video_start_time_override.") from exc
+
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=LOCAL_TIMEZONE)
+    return dt.astimezone(LOCAL_TIMEZONE)
 
 
 def _build_uploaded_camera_name(base_name: str, view_index: int, is_fisheye: bool) -> str:
@@ -405,11 +441,13 @@ def _build_upload_runtime_payload(
     if matched_prefix:
         display_name = matched_prefix.group("prefix").strip() or first_camera_name
     upload_metadata = _probe_uploaded_video_metadata(source_path)
+    saved_video_start_time = first_stream.uploaded_video_start_time_override
 
     return {
         "runtime_key": runtime_key,
         "source_path": source_path,
         "file_name": os.path.basename(source_path),
+        "original_file_name": _get_upload_display_filename(source_path),
         "display_name": display_name or os.path.basename(source_path),
         "source_kind": _infer_source_kind(source_path),
         "is_fisheye": bool(first_stream.is_fisheye),
@@ -429,6 +467,8 @@ def _build_upload_runtime_payload(
         "video_fps": upload_metadata.get("fps"),
         "video_frame_width": upload_metadata.get("frame_width"),
         "video_frame_height": upload_metadata.get("frame_height"),
+        "uploaded_video_start_time": _serialize_datetime(saved_video_start_time),
+        "uploaded_video_start_time_override": _serialize_datetime(saved_video_start_time),
         "uploaded_at": time.strftime(
             "%Y-%m-%dT%H:%M:%S",
             time.localtime(os.path.getmtime(source_path)),
@@ -494,6 +534,70 @@ async def _get_uploaded_camera_stream(
     return stream_config
 
 
+def _get_uploaded_video_start_time_override_from_rows(
+    rows: list[tuple[Camera, StreamConfig]],
+) -> datetime | None:
+    for _, stream_config in rows:
+        if stream_config.uploaded_video_start_time_override is not None:
+            return stream_config.uploaded_video_start_time_override
+    return None
+
+
+def _get_uploaded_video_start_time_override_from_stream(
+    stream_config: StreamConfig | None,
+) -> datetime | None:
+    if stream_config is None:
+        return None
+    return stream_config.uploaded_video_start_time_override
+
+
+async def _replace_uploaded_runtime_history(
+    session: AsyncSession,
+    rows: list[tuple[Camera, StreamConfig]],
+) -> None:
+    """Clear previous persisted reporting data for an uploaded runtime before rerun."""
+    if not rows:
+        return
+
+    camera_ids = sorted({
+        str(camera.id).strip()
+        for camera, _ in rows
+        if str(camera.id).strip()
+    })
+    if not camera_ids:
+        return
+
+    event_rows = await session.execute(
+        select(DetectionEvent.id)
+        .where(DetectionEvent.camera_id.in_(camera_ids))
+    )
+    event_ids = [
+        str(event_id).strip()
+        for event_id in event_rows.scalars().all()
+        if str(event_id).strip()
+    ]
+
+    if event_ids:
+        await session.execute(
+            sa_delete(DetectionEvent).where(DetectionEvent.id.in_(event_ids))
+        )
+
+    await session.execute(
+        sa_delete(PeopleCountingSnapshot).where(PeopleCountingSnapshot.camera_id.in_(camera_ids))
+    )
+    await session.flush()
+
+    reset_uploaded_runtime_counting_state(camera_ids)
+
+    for event_id in event_ids:
+        snapshot_path = os.path.join(UPLOAD_SNAPSHOT_DIR, f"{event_id}.jpg")
+        if os.path.exists(snapshot_path):
+            try:
+                os.remove(snapshot_path)
+            except OSError:
+                pass
+
+
 
 # make the video sync at run time
 def _start_uploaded_runtime_members(members: list[dict]) -> int:
@@ -518,6 +622,7 @@ def _start_uploaded_runtime_members(members: list[dict]) -> int:
             member["active_views"],
             sync_barrier=sync_barrier,
             sync_state=sync_state,
+            uploaded_video_start_time_override=member.get("uploaded_video_start_time_override"),
         )
     return len(members)
 
@@ -937,11 +1042,19 @@ async def websocket_endpoint(websocket: WebSocket, camera_id: str):
 
                 # Get detections for this specific view
                 all_detections = meta.get("detections", {})
-                view_detections = all_detections.get(target_key, [])
+                if isinstance(all_detections, dict):
+                    view_detections = all_detections.get(target_key, [])
+                elif isinstance(all_detections, list):
+                    view_detections = all_detections if target_key == "original" else []
+                else:
+                    view_detections = []
 
                 # Get counting data for this specific view
                 all_counting = meta.get("counting_data", {})
-                view_counting = all_counting.get(target_key, {})
+                if isinstance(all_counting, dict):
+                    view_counting = all_counting.get(target_key, {})
+                else:
+                    view_counting = {}
 
                 await websocket.send_json({
                     "image": b64_data,
@@ -1302,18 +1415,54 @@ async def get_upload_sync_groups():
 
 
 @router.post("/api/upload-sync-groups/{group_id}/start")
-async def start_upload_sync_group(group_id: str):
+async def start_upload_sync_group(group_id: str, db: AsyncSession = Depends(get_db)):
     try:
-        result = start_sync_group(group_id)
+        normalized_group_id, members = pop_sync_group_members(group_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    if result["started_sources"] <= 0:
+    if not members:
+        raise HTTPException(status_code=404, detail="No pending uploaded videos found for this sync group.")
+
+    runtime_keys = [
+        str(member.get("runtime_key") or "").strip()
+        for member in members
+        if str(member.get("runtime_key") or "").strip()
+    ]
+    rows = await _get_uploaded_runtime_rows(db, runtime_keys)
+    runtime_groups: dict[str, list[tuple[Camera, StreamConfig]]] = {}
+    for camera, stream_config in rows:
+        runtime_groups.setdefault(_get_runtime_key(stream_config), []).append((camera, stream_config))
+
+    members_to_start: list[dict] = []
+    for member in members:
+        runtime_key = str(member.get("runtime_key") or "").strip()
+        group_rows = runtime_groups.get(runtime_key)
+        if not runtime_key or not group_rows or is_producer_running(runtime_key):
+            continue
+        await _replace_uploaded_runtime_history(db, group_rows)
+        first_stream = group_rows[0][1]
+        members_to_start.append(
+            {
+                "runtime_key": runtime_key,
+                "source_path": first_stream.source_path,
+                "is_fisheye": bool(first_stream.is_fisheye),
+                "active_views": await _get_active_views_for_runtime(db, runtime_key, bool(first_stream.is_fisheye)),
+                "uploaded_video_start_time_override": _get_uploaded_video_start_time_override_from_rows(group_rows),
+            }
+        )
+
+    if members_to_start:
+        await db.commit()
+
+    started_sources = _start_uploaded_runtime_members(members_to_start)
+    if started_sources <= 0:
         raise HTTPException(status_code=404, detail="No pending uploaded videos found for this sync group.")
 
     return {
         "status": "started",
-        **result,
+        "group_id": normalized_group_id,
+        "started_sources": started_sources,
     }
 
 
@@ -1356,6 +1505,9 @@ async def update_uploaded_video(
     normalized_location = (payload.location or "").strip()
     first_stream = rows[0][1]
     is_fisheye = bool(first_stream.is_fisheye)
+    uploaded_video_start_time_override = _coerce_uploaded_video_start_time_override(
+        payload.uploaded_video_start_time_override
+    )
     requested_is_fisheye = is_fisheye if payload.is_fisheye is None else bool(payload.is_fisheye)
     if requested_is_fisheye != is_fisheye:
         raise HTTPException(status_code=400, detail="Uploaded source fisheye mode cannot be changed after creation.")
@@ -1371,6 +1523,7 @@ async def update_uploaded_video(
 
     for camera, stream_config in rows:
         stream_config.view_index = requested_view_index if is_fisheye else -1
+        stream_config.uploaded_video_start_time_override = uploaded_video_start_time_override
         camera.name = _build_uploaded_camera_name(
             normalized_name,
             int(stream_config.view_index if stream_config.view_index is not None else -1),
@@ -1383,8 +1536,16 @@ async def update_uploaded_video(
 
     if was_running:
         stop_producer_thread(runtime_key)
+        await _replace_uploaded_runtime_history(db, rows)
+        await db.commit()
         active_views = await _get_active_views_for_runtime(db, runtime_key, is_fisheye)
-        start_producer_thread(runtime_key, source_path, is_fisheye, active_views)
+        start_producer_thread(
+            runtime_key,
+            source_path,
+            is_fisheye,
+            active_views,
+            uploaded_video_start_time_override=uploaded_video_start_time_override,
+        )
 
     await _sync_runtime_state(db)
 
@@ -1421,6 +1582,7 @@ async def start_uploaded_videos(
         if not group_rows or is_producer_running(runtime_key):
             continue
         discard_pending_runtime_key(runtime_key)
+        await _replace_uploaded_runtime_history(db, group_rows)
         first_stream = group_rows[0][1]
         members_to_start.append(
             {
@@ -1428,8 +1590,12 @@ async def start_uploaded_videos(
                 "source_path": first_stream.source_path,
                 "is_fisheye": bool(first_stream.is_fisheye),
                 "active_views": await _get_active_views_for_runtime(db, runtime_key, bool(first_stream.is_fisheye)),
+                "uploaded_video_start_time_override": _get_uploaded_video_start_time_override_from_rows(group_rows),
             }
         )
+
+    if members_to_start:
+        await db.commit()
 
     started_sources = _start_uploaded_runtime_members(members_to_start)
     return {
@@ -1576,6 +1742,7 @@ async def upload_video(
     enable_fisheye: bool = Form(False),
     camera_name_prefix: str = Form("Camera"),
     location: str = Form(""),
+    uploaded_video_start_time: str = Form(""),
     selected_views: str = Form(""),  # Comma separated indices, e.g. "0,2,4"
     detection_roi: str = Form(""),
     sync_start: bool = Form(False),
@@ -1620,6 +1787,11 @@ async def upload_video(
             )
 
         upload_metadata = _probe_uploaded_video_metadata(input_path)
+        saved_uploaded_video_start_time = _coerce_uploaded_video_start_time_override(
+            uploaded_video_start_time
+        )
+        if saved_uploaded_video_start_time is None:
+            saved_uploaded_video_start_time = _parse_uploaded_video_start_time(input_path)
         upload_resolution = upload_metadata.get("resolution") or "640x360"
         upload_fps = int(round(float(upload_metadata.get("fps") or 30)))
         normalized_location = (location or "").strip() or "Uploaded Video"
@@ -1652,6 +1824,7 @@ async def upload_video(
                 view_index=view_idx,
                 is_fisheye=enable_fisheye,
                 detection_roi=upload_detection_roi,
+                uploaded_video_start_time_override=saved_uploaded_video_start_time,
             )
             db.add(db_stream_config)
 
