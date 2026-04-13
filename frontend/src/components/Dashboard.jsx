@@ -1,15 +1,112 @@
-import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { Card, CardContent } from './ui/card';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from './ui/button';
-import { Circle, LayoutGrid, Users, Maximize2, Minimize2 } from 'lucide-react';
+import { Circle, LayoutGrid, Maximize2, Minimize2, Users } from 'lucide-react';
 import StreamPlayer from './StreamPlayer';
 import { getApiBaseUrl, getWSUrl } from '../apiConfig';
 
-const RECENT_DETECTIONS = [
-    { id: 1, type: 'Dress Code', time: '10:42 AM', camera: 'Factory Floor A', image: '/factory.png', person: 'Unknown' },
-    { id: 2, type: 'Person', time: '10:41 AM', camera: 'Main Lobby', image: '/lobby.png', person: 'Staff' },
-    { id: 3, type: 'Person', time: '10:39 AM', camera: 'Corridor B', image: '/hallway.png', person: 'Visitor' },
+const SOURCE_FILTER_OPTIONS = [
+    { value: 'all', label: 'All Sources' },
+    { value: 'live', label: 'Live Streams' },
+    { value: 'uploaded', label: 'Uploaded Videos' },
 ];
+
+const DISPLAY_MODE_OPTIONS = [
+    { value: 'auto', label: 'Auto Layout' },
+    { value: 'custom', label: 'Custom Boxes' },
+];
+
+const DASHBOARD_PREFERENCES_KEY = 'dashboard_preferences_v2';
+const SUPPORTED_LAYOUTS = [1, 4, 9];
+
+const createEmptyPage = (layoutSize) => Array(layoutSize).fill(null);
+
+const createEmptySlotAssignments = () => (
+    SUPPORTED_LAYOUTS.reduce((accumulator, layoutSize) => {
+        accumulator[layoutSize] = { pages: [createEmptyPage(layoutSize)] };
+        return accumulator;
+    }, {})
+);
+
+const normalizeLayoutSize = (value) => (
+    SUPPORTED_LAYOUTS.includes(Number(value)) ? Number(value) : 9
+);
+
+const normalizeDisplayMode = (value) => (
+    value === 'custom' ? 'custom' : 'auto'
+);
+
+const normalizeSourceFilter = (value) => (
+    SOURCE_FILTER_OPTIONS.some((option) => option.value === value) ? value : 'all'
+);
+
+const normalizePageArray = (rawPage, layoutSize) => (
+    Array.from({ length: layoutSize }, (_, index) => {
+        const value = Array.isArray(rawPage) ? rawPage[index] : null;
+        return typeof value === 'string' && value.trim() ? value : null;
+    })
+);
+
+const normalizeLayoutPages = (rawLayoutValue, layoutSize, minPageCount = 1) => {
+    const rawPages = Array.isArray(rawLayoutValue)
+        ? [rawLayoutValue]
+        : Array.isArray(rawLayoutValue?.pages)
+            ? rawLayoutValue.pages
+            : [];
+
+    const normalizedPages = rawPages.map((page) => normalizePageArray(page, layoutSize));
+    const targetPageCount = Math.max(1, minPageCount);
+
+    while (normalizedPages.length < targetPageCount) {
+        normalizedPages.push(createEmptyPage(layoutSize));
+    }
+
+    return normalizedPages.length ? normalizedPages : [createEmptyPage(layoutSize)];
+};
+
+const normalizeSlotAssignments = (rawAssignments, minPageCounts = {}) => (
+    SUPPORTED_LAYOUTS.reduce((accumulator, layoutSize) => {
+        const layoutValue = rawAssignments?.[layoutSize] ?? rawAssignments?.[String(layoutSize)];
+        accumulator[layoutSize] = {
+            pages: normalizeLayoutPages(layoutValue, layoutSize, minPageCounts[layoutSize] ?? 1),
+        };
+        return accumulator;
+    }, createEmptySlotAssignments())
+);
+
+const readStoredDashboardPreferences = () => {
+    const defaults = {
+        layout: 9,
+        displayMode: 'auto',
+        sourceFilter: 'all',
+        cameraFilter: 'all',
+        slotAssignments: createEmptySlotAssignments(),
+    };
+
+    if (typeof window === 'undefined') {
+        return defaults;
+    }
+
+    try {
+        const rawValue = window.localStorage.getItem(DASHBOARD_PREFERENCES_KEY);
+        if (!rawValue) {
+            return defaults;
+        }
+
+        const parsed = JSON.parse(rawValue);
+        return {
+            layout: normalizeLayoutSize(parsed?.layout),
+            displayMode: normalizeDisplayMode(parsed?.displayMode),
+            sourceFilter: normalizeSourceFilter(parsed?.sourceFilter),
+            cameraFilter: typeof parsed?.cameraFilter === 'string' && parsed.cameraFilter.trim()
+                ? parsed.cameraFilter
+                : 'all',
+            slotAssignments: normalizeSlotAssignments(parsed?.slotAssignments),
+        };
+    } catch (error) {
+        console.error('Failed to read stored dashboard preferences:', error);
+        return defaults;
+    }
+};
 
 const inferOverlayMode = (analysisTags = []) => {
     const normalizedTags = new Set(
@@ -24,23 +121,11 @@ const inferOverlayMode = (analysisTags = []) => {
     if (activeModes !== 1) {
         return 'auto';
     }
-    if (hasCounting) {
-        return 'counting';
-    }
-    if (hasFall) {
-        return 'fall';
-    }
-    if (hasDressCode) {
-        return 'dress-code';
-    }
+    if (hasCounting) return 'counting';
+    if (hasFall) return 'fall';
+    if (hasDressCode) return 'dress-code';
     return 'auto';
 };
-
-const SOURCE_FILTER_OPTIONS = [
-    { value: 'all', label: 'All Sources' },
-    { value: 'live', label: 'Live Streams' },
-    { value: 'uploaded', label: 'Uploaded Videos' },
-];
 
 const isRealtimeStreamSource = (camera) =>
     camera.source_kind === 'rtsp'
@@ -58,21 +143,14 @@ const matchesSourceFilter = (camera, sourceFilter) => {
     return camera.source_kind === sourceFilter;
 };
 
-const getSourceAccentClasses = (camera) => {
-    const isUploadedSource = Boolean(camera?.is_uploaded) || camera?.source_kind === 'uploaded_video';
-    if (isUploadedSource) {
-        return {
-            dot: 'fill-blue-500 text-blue-500',
-            label: 'text-blue-300',
-        };
-    }
-    return {
-        dot: 'fill-green-500 text-green-500',
-        label: 'text-green-300',
-    };
-};
+const getSourceAccentClasses = (camera) => (
+    Boolean(camera?.is_uploaded) || camera?.source_kind === 'uploaded_video'
+        ? { dot: 'fill-blue-500 text-blue-500', label: 'text-blue-300' }
+        : { dot: 'fill-green-500 text-green-500', label: 'text-green-300' }
+);
 
 const getLineType = (line) => line?.line_type === 'foot_traffic' ? 'foot_traffic' : 'occupancy';
+
 const getFootTrafficLabelsForLine = (line) => {
     const points = Array.isArray(line?.points) ? line.points : [];
     if (points.length >= 2) {
@@ -94,13 +172,61 @@ const getFootTrafficSummaryLabels = (lines) => {
     const labels = ftLines.map(getFootTrafficLabelsForLine);
     const firstMode = labels[0].mode;
     const mixed = labels.some((label) => label.mode !== firstMode);
-    if (mixed) {
-        return { shortNegative: 'L', shortPositive: 'R', mixed: false };
-    }
-    return { ...labels[0], mixed: false };
+    return mixed ? { shortNegative: 'L', shortPositive: 'R', mixed: false } : { ...labels[0], mixed: false };
 };
 
-const CameraFeedCard = ({ camera, apiUrl }) => {
+const SlotCameraSelector = ({
+    slotIndex,
+    currentPage,
+    selectedCameraId,
+    cameraOptions,
+    assignedCameraLocations,
+    onAssignCamera,
+}) => (
+    <div className="absolute bottom-2 left-2 z-20 rounded-lg bg-black/65 px-2 py-2 backdrop-blur-sm opacity-0 transition-opacity duration-200 group-hover:opacity-100 focus-within:opacity-100">
+        <select
+            value={selectedCameraId || ''}
+            onChange={(event) => onAssignCamera(slotIndex, event.target.value || null)}
+            className="h-8 min-w-56 rounded-md border border-white/20 bg-black/40 px-2 text-xs text-white outline-none"
+            aria-label={`Select camera for page ${currentPage + 1} box ${slotIndex + 1}`}
+        >
+            <option value="" className="text-black">No Camera</option>
+            {cameraOptions.map((camera) => {
+                const assignedLocation = assignedCameraLocations.get(camera.id);
+                const isCurrentSelection = camera.id === selectedCameraId;
+                const isAssignedElsewhere = Boolean(
+                    assignedLocation
+                    && (assignedLocation.pageIndex !== currentPage || assignedLocation.slotIndex !== slotIndex)
+                );
+
+                let optionLabel = camera.name;
+                if (isCurrentSelection) {
+                    optionLabel = `${camera.name} [Current]`;
+                } else if (isAssignedElsewhere) {
+                    optionLabel = `${camera.name} [Page ${assignedLocation.pageIndex + 1} Box ${assignedLocation.slotIndex + 1}]`;
+                }
+
+                return (
+                    <option key={camera.id} value={camera.id} className="text-black">
+                        {optionLabel}
+                    </option>
+                );
+            })}
+        </select>
+    </div>
+);
+
+const CameraFeedCard = ({
+    camera,
+    apiUrl,
+    slotIndex,
+    currentPage,
+    topLabelOffsetClass = 'top-1.5',
+    showSlotSelector,
+    cameraOptions,
+    assignedCameraLocations,
+    onAssignCamera,
+}) => {
     const [stats, setStats] = useState({ fps: 0, people_count: 0 });
     const [countingData, setCountingData] = useState({});
     const [runtimePreviewImage, setRuntimePreviewImage] = useState('');
@@ -109,7 +235,6 @@ const CameraFeedCard = ({ camera, apiUrl }) => {
     const overlayMode = inferOverlayMode(camera.analysis_tags);
     const footTrafficLabels = getFootTrafficSummaryLabels(countingData?.lines);
     const sourceAccent = getSourceAccentClasses(camera);
-
     const hasCountingData = countingData && (
         countingData.total_in > 0
         || countingData.total_out > 0
@@ -163,12 +288,11 @@ const CameraFeedCard = ({ camera, apiUrl }) => {
     }, [camera.id]);
 
     return (
-        <div className="relative group overflow-hidden bg-black rounded-sm border border-border/50 h-full w-full flex items-center justify-center">
-            {/* Live Feed or Image */}
+        <div className="relative group flex h-full min-h-0 w-full items-center justify-center overflow-hidden rounded-sm border border-border/50 bg-black">
             {isRealtimeStreamSource(camera) ? (
                 <StreamPlayer
                     wsUrl={wsUrl}
-                    className="w-full h-full"
+                    className="h-full w-full"
                     alt={camera.name}
                     onStats={setStats}
                     onCountingData={setCountingData}
@@ -176,20 +300,28 @@ const CameraFeedCard = ({ camera, apiUrl }) => {
                     showCountingAnchors={overlayMode === 'counting'}
                 />
             ) : runtimePreviewImage ? (
-                <img src={runtimePreviewImage} className="w-full h-full object-contain bg-black" alt={camera.name} />
+                <img src={runtimePreviewImage} className="h-full w-full bg-black object-contain" alt={camera.name} />
             ) : (
-                <div className="absolute inset-0 bg-muted/20 flex items-center justify-center text-muted-foreground">
-                    <img src={camera.image} className="w-full h-full object-contain bg-black opacity-80" alt={camera.name} onError={(e) => { e.target.style.display = 'none' }} />
+                <div className="absolute inset-0 flex items-center justify-center bg-muted/20 text-muted-foreground">
+                    <img src={camera.image} className="h-full w-full bg-black object-contain opacity-80" alt={camera.name} onError={(event) => { event.target.style.display = 'none'; }} />
                     <span className="absolute">{camera.is_uploaded ? 'Uploaded Video Preview' : 'Stream Placeholder'}</span>
                 </div>
             )}
 
+            {showSlotSelector && (
+                <SlotCameraSelector
+                    slotIndex={slotIndex}
+                    currentPage={currentPage}
+                    selectedCameraId={camera.id}
+                    cameraOptions={cameraOptions}
+                    assignedCameraLocations={assignedCameraLocations}
+                    onAssignCamera={onAssignCamera}
+                />
+            )}
 
-            {/* Overlays */}
-            <div className="absolute inset-0 pointer-events-none">
-                {/* Top-left corner label */}
+            <div className="pointer-events-none absolute inset-0">
                 <div
-                    className={`absolute left-1.5 top-1.5 overflow-hidden rounded-full bg-black/70 backdrop-blur-sm transition-all duration-300 ${showSourceLabelHint
+                    className={`absolute left-1.5 ${topLabelOffsetClass} overflow-hidden rounded-full bg-black/70 backdrop-blur-sm transition-all duration-300 ${showSourceLabelHint
                         ? 'max-w-[70%] px-2.5 py-1'
                         : 'max-w-4 px-1.5 py-1'
                         } group-hover:max-w-[70%] group-hover:px-2.5`}
@@ -201,23 +333,20 @@ const CameraFeedCard = ({ camera, apiUrl }) => {
                                 } group-hover:max-w-[260px] group-hover:opacity-100`}
                         >
                             <span className={`truncate font-medium ${sourceAccent.label}`}>{camera.name}</span>
-                            {camera.location && (
-                                <span className="truncate text-white/70">- {camera.location}</span>
-                            )}
+                            {camera.location && <span className="truncate text-white/70">- {camera.location}</span>}
                         </div>
                     </div>
                 </div>
 
-                {/* Top-right stats */}
-                <div className="absolute right-1.5 top-1.5 flex gap-2 flex-wrap justify-end">
+                <div className="absolute right-1.5 top-1.5 flex flex-wrap justify-end gap-2">
                     {stats.people_count > 0 && (
-                        <div className="bg-black/60 text-white text-xs px-2 py-1 rounded backdrop-blur-sm flex items-center gap-1">
-                            <Users className="w-3 h-3" />
+                        <div className="flex items-center gap-1 rounded bg-black/60 px-2 py-1 text-xs text-white backdrop-blur-sm">
+                            <Users className="h-3 w-3" />
                             {stats.people_count}
                         </div>
                     )}
                     {hasCountingData && (
-                        <div className="bg-black/60 text-white text-xs px-2 py-1 rounded backdrop-blur-sm flex items-center gap-1.5">
+                        <div className="flex items-center gap-1.5 rounded bg-black/60 px-2 py-1 text-xs text-white backdrop-blur-sm">
                             <span className="text-green-400">IN:{countingData.total_in}</span>
                             <span className="text-red-400">OUT:{countingData.total_out}</span>
                             {(countingData.foot_traffic_total ?? 0) > 0 && (
@@ -227,7 +356,7 @@ const CameraFeedCard = ({ camera, apiUrl }) => {
                             )}
                         </div>
                     )}
-                    <div className="bg-black/60 text-white text-xs px-2 py-1 rounded backdrop-blur-sm flex items-center gap-1">
+                    <div className="rounded bg-black/60 px-2 py-1 text-xs text-white backdrop-blur-sm">
                         {stats.fps > 0 ? stats.fps : camera.fps} FPS
                     </div>
                 </div>
@@ -236,26 +365,52 @@ const CameraFeedCard = ({ camera, apiUrl }) => {
     );
 };
 
+const EmptySlotCard = ({
+    slotIndex,
+    currentPage,
+    cameraOptions,
+    assignedCameraLocations,
+    onAssignCamera,
+}) => (
+    <div className="relative group flex min-h-0 items-center justify-center overflow-hidden border border-border/50 bg-black/90 text-muted-foreground">
+        <div className="flex flex-col items-center gap-2 px-4 text-center">
+            <span className="text-sm text-white/80">No Camera Assigned</span>
+            <span className="text-xs text-white/45">Choose a feed for this slot.</span>
+        </div>
+        <SlotCameraSelector
+            slotIndex={slotIndex}
+            currentPage={currentPage}
+            selectedCameraId={null}
+            cameraOptions={cameraOptions}
+            assignedCameraLocations={assignedCameraLocations}
+            onAssignCamera={onAssignCamera}
+        />
+    </div>
+);
+
 const Dashboard = () => {
+    const initialPreferences = useMemo(() => readStoredDashboardPreferences(), []);
     const apiUrl = getApiBaseUrl();
     const [cameras, setCameras] = useState([]);
     const [isFullscreen, setIsFullscreen] = useState(false);
-    const [layout, setLayout] = useState(9); // Default to 9 for multiscreen view
+    const [layout, setLayout] = useState(initialPreferences.layout);
     const [page, setPage] = useState(0);
-    const [sourceFilter, setSourceFilter] = useState('all');
-    const [cameraFilter, setCameraFilter] = useState('all');
+    const [sourceFilter, setSourceFilter] = useState(initialPreferences.sourceFilter);
+    const [cameraFilter, setCameraFilter] = useState(initialPreferences.cameraFilter);
+    const [displayMode, setDisplayMode] = useState(initialPreferences.displayMode);
+    const [slotAssignments, setSlotAssignments] = useState(initialPreferences.slotAssignments);
+    const [assignmentNotice, setAssignmentNotice] = useState('');
     const containerRef = useRef(null);
 
-    async function fetchCameras() {
+    const fetchCameras = useCallback(async () => {
         try {
-            console.log("Dashboard fetching from:", apiUrl);
             const res = await fetch(`${apiUrl}/api/cameras`);
             const data = await res.json();
             setCameras((Array.isArray(data) ? data : []).filter((camera) => camera.enabled));
         } catch (error) {
-            console.error("Failed to fetch cameras:", error);
+            console.error('Failed to fetch cameras:', error);
         }
-    }
+    }, [apiUrl]);
 
     useEffect(() => {
         let cancelled = false;
@@ -265,153 +420,323 @@ const Dashboard = () => {
             }
         };
 
-        const timeoutId = setTimeout(() => {
+        const timeoutId = window.setTimeout(() => {
             void loadCameras();
         }, 0);
-        const intervalId = setInterval(() => {
+        const intervalId = window.setInterval(() => {
             void loadCameras();
         }, 5000);
 
         return () => {
             cancelled = true;
-            clearTimeout(timeoutId);
-            clearInterval(intervalId);
+            window.clearTimeout(timeoutId);
+            window.clearInterval(intervalId);
         };
-    }, [apiUrl]);
+    }, [fetchCameras]);
+
+    useEffect(() => {
+        if (!assignmentNotice) {
+            return undefined;
+        }
+
+        const timeoutId = window.setTimeout(() => {
+            setAssignmentNotice('');
+        }, 2600);
+
+        return () => window.clearTimeout(timeoutId);
+    }, [assignmentNotice]);
+
+    useEffect(() => {
+        const handleFullscreenChange = () => {
+            setIsFullscreen(Boolean(document.fullscreenElement));
+        };
+
+        document.addEventListener('fullscreenchange', handleFullscreenChange);
+        return () => {
+            document.removeEventListener('fullscreenchange', handleFullscreenChange);
+        };
+    }, []);
+
+    const cameraMap = useMemo(
+        () => new Map(cameras.map((camera) => [camera.id, camera])),
+        [cameras],
+    );
+
+    const minCustomPageCounts = useMemo(
+        () => SUPPORTED_LAYOUTS.reduce((accumulator, layoutSize) => {
+            accumulator[layoutSize] = Math.max(1, Math.ceil(cameras.length / layoutSize));
+            return accumulator;
+        }, {}),
+        [cameras.length],
+    );
+
+    const sanitizedSlotAssignments = useMemo(() => {
+        const availableCameraIds = new Set(cameras.map((camera) => camera.id));
+        const nextAssignments = normalizeSlotAssignments(slotAssignments, minCustomPageCounts);
+
+        SUPPORTED_LAYOUTS.forEach((layoutSize) => {
+            const seenCameraIds = new Set();
+            nextAssignments[layoutSize].pages = nextAssignments[layoutSize].pages.map((slotPage) => (
+                slotPage.map((cameraId) => {
+                    if (!cameraId || !availableCameraIds.has(cameraId) || seenCameraIds.has(cameraId)) {
+                        return null;
+                    }
+                    seenCameraIds.add(cameraId);
+                    return cameraId;
+                })
+            ));
+        });
+
+        return nextAssignments;
+    }, [cameras, minCustomPageCounts, slotAssignments]);
+
+    useEffect(() => {
+        if (typeof window === 'undefined') {
+            return;
+        }
+
+        window.localStorage.setItem(DASHBOARD_PREFERENCES_KEY, JSON.stringify({
+            layout,
+            displayMode,
+            sourceFilter,
+            cameraFilter,
+            slotAssignments: sanitizedSlotAssignments,
+        }));
+    }, [cameraFilter, displayMode, layout, sanitizedSlotAssignments, sourceFilter]);
 
     const filteredBySource = useMemo(
         () => cameras.filter((camera) => matchesSourceFilter(camera, sourceFilter)),
         [cameras, sourceFilter],
     );
 
-    const availableCameraOptions = useMemo(
+    const autoModeCameraOptions = useMemo(
         () => filteredBySource.map((camera) => ({ id: camera.id, name: camera.name })),
         [filteredBySource],
     );
 
-    const filteredCameras = useMemo(
-        () => filteredBySource.filter((camera) => cameraFilter === 'all' || camera.id === cameraFilter),
-        [cameraFilter, filteredBySource],
+    const customModeCameraOptions = useMemo(
+        () => cameras.map((camera) => ({ id: camera.id, name: camera.name })),
+        [cameras],
     );
 
-    useEffect(() => {
-        if (cameraFilter === 'all') {
-            return;
+    const effectiveCameraFilter = useMemo(() => {
+        if (displayMode !== 'auto' || cameraFilter === 'all') {
+            return 'all';
         }
-        if (!availableCameraOptions.some((camera) => camera.id === cameraFilter)) {
-            setCameraFilter('all');
+        return autoModeCameraOptions.some((camera) => camera.id === cameraFilter) ? cameraFilter : 'all';
+    }, [autoModeCameraOptions, cameraFilter, displayMode]);
+
+    const filteredCameras = useMemo(
+        () => filteredBySource.filter((camera) => effectiveCameraFilter === 'all' || camera.id === effectiveCameraFilter),
+        [effectiveCameraFilter, filteredBySource],
+    );
+
+    const autoTotalPages = Math.ceil(filteredCameras.length / layout) || 1;
+    const customTotalPages = sanitizedSlotAssignments[layout].pages.length;
+    const totalPages = displayMode === 'custom' ? customTotalPages : autoTotalPages;
+    const currentPage = page % totalPages;
+
+    const displayedSlots = useMemo(() => {
+        if (displayMode === 'auto') {
+            const startIndex = currentPage * layout;
+            const nextCameras = filteredCameras.slice(startIndex, startIndex + layout);
+            return Array.from({ length: layout }, (_, index) => nextCameras[index] || null);
         }
-    }, [availableCameraOptions, cameraFilter]);
 
-    useEffect(() => {
-        setPage(0);
-    }, [cameraFilter, layout, sourceFilter]);
+        return sanitizedSlotAssignments[layout].pages[currentPage] || createEmptyPage(layout);
+    }, [currentPage, displayMode, filteredCameras, layout, sanitizedSlotAssignments]);
 
-    const totalCameras = filteredCameras.length;
-    const totalPages = Math.ceil(totalCameras / layout) || 1;
+    const displayedCameras = useMemo(
+        () => displayedSlots.map((slotValue) => (
+            typeof slotValue === 'string' ? cameraMap.get(slotValue) || null : slotValue
+        )),
+        [cameraMap, displayedSlots],
+    );
 
-    const startIndex = page * layout;
-    const displayedCameras = filteredCameras.slice(startIndex, startIndex + layout);
+    const assignedCameraLocations = useMemo(() => {
+        if (displayMode !== 'custom') {
+            return new Map();
+        }
+
+        return sanitizedSlotAssignments[layout].pages.reduce((accumulator, slotPage, pageIndex) => {
+            slotPage.forEach((cameraId, slotIndex) => {
+                if (cameraId) {
+                    accumulator.set(cameraId, { pageIndex, slotIndex });
+                }
+            });
+            return accumulator;
+        }, new Map());
+    }, [displayMode, layout, sanitizedSlotAssignments]);
+
+    const handleAssignCameraToSlot = (slotIndex, nextCameraId) => {
+        const nextAssignments = normalizeSlotAssignments(sanitizedSlotAssignments, minCustomPageCounts);
+        const currentLayoutPages = nextAssignments[layout].pages.map((slotPage) => [...slotPage]);
+        let nextNotice = '';
+
+        currentLayoutPages.forEach((slotPage, pageIndex) => {
+            slotPage.forEach((cameraId, innerSlotIndex) => {
+                const isCurrentTarget = pageIndex === currentPage && innerSlotIndex === slotIndex;
+                if (!isCurrentTarget && cameraId === nextCameraId) {
+                    currentLayoutPages[pageIndex][innerSlotIndex] = null;
+                    const movedCameraName = cameraMap.get(nextCameraId)?.name || 'Camera';
+                    nextNotice = `${movedCameraName} moved from Page ${pageIndex + 1} to Page ${currentPage + 1}.`;
+                }
+            });
+        });
+
+        currentLayoutPages[currentPage][slotIndex] = nextCameraId || null;
+
+        setSlotAssignments({
+            ...nextAssignments,
+            [layout]: { pages: currentLayoutPages },
+        });
+        setAssignmentNotice(nextNotice);
+    };
 
     const toggleFullscreen = () => {
         if (!document.fullscreenElement) {
-            containerRef.current.requestFullscreen().catch(err => {
-                console.error(`Error attempting to enable fullscreen: ${err.message}`);
+            containerRef.current?.requestFullscreen().catch((error) => {
+                console.error(`Error attempting to enable fullscreen: ${error.message}`);
             });
-            setIsFullscreen(true);
-        } else {
-            document.exitFullscreen();
-            setIsFullscreen(false);
+            return;
         }
+
+        document.exitFullscreen().catch((error) => {
+            console.error(`Error attempting to exit fullscreen: ${error.message}`);
+        });
     };
 
     const handleLayoutChange = (newLayout) => {
         setLayout(newLayout);
-        setPage(0); // Reset to first page on layout change
+        setPage(0);
+    };
+
+    const handleDisplayModeChange = (nextMode) => {
+        setDisplayMode(nextMode);
+        setPage(0);
+    };
+
+    const handleSourceFilterChange = (nextFilter) => {
+        setSourceFilter(nextFilter);
+        setPage(0);
+    };
+
+    const handleCameraFilterChange = (nextFilter) => {
+        setCameraFilter(nextFilter);
+        setPage(0);
     };
 
     const handleNextPage = () => {
-        setPage(old => (old + 1) % totalPages);
+        setPage((currentValue) => (currentValue + 1) % totalPages);
     };
 
     const handlePrevPage = () => {
-        setPage(old => (old - 1 + totalPages) % totalPages);
+        setPage((currentValue) => (currentValue - 1 + totalPages) % totalPages);
     };
 
+    const currentCameraOptions = displayMode === 'custom' ? customModeCameraOptions : autoModeCameraOptions;
+
     return (
-        <div ref={containerRef} className="relative flex h-full w-full bg-background overflow-hidden flex-col">
-            {/* Controls Bar */}
-            <div className="absolute top-4 left-4 z-50 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity hover:opacity-100 p-2 rounded-lg bg-black/50 backdrop-blur-md">
-                <div className="flex gap-1 border-r border-white/20 pr-2 mr-2">
-                    <Button size="icon" variant={layout === 1 ? "secondary" : "ghost"} className="h-8 w-8 text-white" onClick={() => handleLayoutChange(1)}>
-                        <div className="w-4 h-4 border-2 border-current rounded-sm" />
+        <div
+            ref={containerRef}
+            className="relative group flex h-[calc(100vh-5.5rem)] min-h-0 w-full flex-col overflow-hidden bg-background lg:h-[calc(100vh-6.75rem)]"
+        >
+            <div className="absolute left-4 top-4 z-50 flex flex-wrap gap-2 rounded-lg bg-black/50 p-2 opacity-0 transition-opacity backdrop-blur-md group-hover:opacity-100 hover:opacity-100">
+                <div className="mr-2 flex gap-1 border-r border-white/20 pr-2">
+                    <Button size="icon" variant={layout === 1 ? 'secondary' : 'ghost'} className="h-8 w-8 text-white" onClick={() => handleLayoutChange(1)}>
+                        <div className="h-4 w-4 rounded-sm border-2 border-current" />
                     </Button>
-                    <Button size="icon" variant={layout === 4 ? "secondary" : "ghost"} className="h-8 w-8 text-white" onClick={() => handleLayoutChange(4)}>
-                        <LayoutGrid className="w-4 h-4" />
+                    <Button size="icon" variant={layout === 4 ? 'secondary' : 'ghost'} className="h-8 w-8 text-white" onClick={() => handleLayoutChange(4)}>
+                        <LayoutGrid className="h-4 w-4" />
                     </Button>
-                    <Button size="icon" variant={layout === 9 ? "secondary" : "ghost"} className="h-8 w-8 text-white" onClick={() => handleLayoutChange(9)}>
-                        <div className="grid grid-cols-3 gap-0.5 w-4 h-4">
-                            {[...Array(9)].map((_, i) => <div key={i} className="bg-current rounded-[1px]" />)}
+                    <Button size="icon" variant={layout === 9 ? 'secondary' : 'ghost'} className="h-8 w-8 text-white" onClick={() => handleLayoutChange(9)}>
+                        <div className="grid h-4 w-4 grid-cols-3 gap-0.5">
+                            {Array.from({ length: 9 }).map((_, index) => <div key={index} className="rounded-[1px] bg-current" />)}
                         </div>
                     </Button>
                 </div>
 
-                <div className="flex items-center gap-2 border-r border-white/20 pr-2 mr-2">
+                <div className="mr-2 flex items-center gap-2 border-r border-white/20 pr-2">
                     <select
-                        value={sourceFilter}
-                        onChange={(event) => setSourceFilter(event.target.value)}
+                        value={displayMode}
+                        onChange={(event) => handleDisplayModeChange(event.target.value)}
                         className="h-8 rounded-md border border-white/20 bg-black/30 px-2 text-xs text-white"
                     >
-                        {SOURCE_FILTER_OPTIONS.map((option) => (
-                            <option key={option.value} value={option.value} className="text-black">
-                                {option.label}
-                            </option>
+                        {DISPLAY_MODE_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value} className="text-black">{option.label}</option>
                         ))}
                     </select>
+
                     <select
-                        value={cameraFilter}
-                        onChange={(event) => setCameraFilter(event.target.value)}
-                        className="h-8 max-w-44 rounded-md border border-white/20 bg-black/30 px-2 text-xs text-white"
+                        value={sourceFilter}
+                        onChange={(event) => handleSourceFilterChange(event.target.value)}
+                        className="h-8 rounded-md border border-white/20 bg-black/30 px-2 text-xs text-white"
+                        disabled={displayMode !== 'auto'}
+                    >
+                        {SOURCE_FILTER_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value} className="text-black">{option.label}</option>
+                        ))}
+                    </select>
+
+                    <select
+                        value={effectiveCameraFilter}
+                        onChange={(event) => handleCameraFilterChange(event.target.value)}
+                        className="h-8 max-w-44 rounded-md border border-white/20 bg-black/30 px-2 text-xs text-white disabled:cursor-not-allowed disabled:opacity-50"
+                        disabled={displayMode !== 'auto'}
                     >
                         <option value="all" className="text-black">All Cameras</option>
-                        {availableCameraOptions.map((camera) => (
-                            <option key={camera.id} value={camera.id} className="text-black">
-                                {camera.name}
-                            </option>
+                        {autoModeCameraOptions.map((camera) => (
+                            <option key={camera.id} value={camera.id} className="text-black">{camera.name}</option>
                         ))}
                     </select>
                 </div>
 
                 {totalPages > 1 && (
-                    <div className="flex items-center gap-2 text-white text-xs">
+                    <div className="flex items-center gap-2 text-xs text-white">
                         <Button size="icon" variant="ghost" className="h-8 w-8 text-white" onClick={handlePrevPage}>&lt;</Button>
-                        <span>{page + 1}/{totalPages}</span>
+                        <span>{currentPage + 1}/{totalPages}</span>
                         <Button size="icon" variant="ghost" className="h-8 w-8 text-white" onClick={handleNextPage}>&gt;</Button>
                     </div>
                 )}
             </div>
 
-            {/* Fullscreen Toggle */}
-            <div className="absolute top-4 right-4 z-50 opacity-0 group-hover:opacity-100 transition-opacity hover:opacity-100">
+            <div className="absolute right-4 top-4 z-50 opacity-0 transition-opacity group-hover:opacity-100 hover:opacity-100">
                 <Button size="icon" variant="secondary" className="bg-black/50 text-white hover:bg-black/70 backdrop-blur-md" onClick={toggleFullscreen}>
                     {isFullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
                 </Button>
             </div>
 
-            {/* Main Grid */}
-            <div className={`flex-1 grid auto-rows-fr gap-1 bg-background h-full ${layout === 1 ? 'grid-cols-1' :
-                layout === 4 ? 'grid-cols-2' :
-                    'grid-cols-3'
-                }`}>
-                {displayedCameras.map(cam => (
-                    <CameraFeedCard key={cam.id} camera={cam} apiUrl={apiUrl} />
-                ))}
+            {assignmentNotice && (
+                <div className="absolute bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-full bg-black/70 px-4 py-2 text-xs text-white backdrop-blur-md">
+                    {assignmentNotice}
+                </div>
+            )}
 
-                {/* Fill empty slots if last page is not full */}
-                {displayedCameras.length < layout && Array.from({ length: layout - displayedCameras.length }).map((_, i) => (
-                    <div key={`empty-${i}`} className="bg-black/90 flex items-center justify-center text-muted-foreground border border-border/50">
-                        <span className="text-sm">No Signal</span>
-                    </div>
+            <div className={`grid min-h-0 flex-1 auto-rows-fr gap-1 bg-background ${layout === 1 ? 'grid-cols-1' : layout === 4 ? 'grid-cols-2' : 'grid-cols-3'}`}>
+                {displayedCameras.map((camera, index) => (
+                    camera ? (
+                        <CameraFeedCard
+                            key={`${layout}-${currentPage}-${index}-${camera.id}`}
+                            camera={camera}
+                            apiUrl={apiUrl}
+                            slotIndex={index}
+                            currentPage={currentPage}
+                            topLabelOffsetClass={index === 0 ? 'top-16' : 'top-1.5'}
+                            showSlotSelector={displayMode === 'custom'}
+                            cameraOptions={currentCameraOptions}
+                            assignedCameraLocations={assignedCameraLocations}
+                            onAssignCamera={handleAssignCameraToSlot}
+                        />
+                    ) : (
+                        <EmptySlotCard
+                            key={`${layout}-${currentPage}-${index}-empty`}
+                            slotIndex={index}
+                            currentPage={currentPage}
+                            cameraOptions={currentCameraOptions}
+                            assignedCameraLocations={assignedCameraLocations}
+                            onAssignCamera={handleAssignCameraToSlot}
+                        />
+                    )
                 ))}
             </div>
         </div>

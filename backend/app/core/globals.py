@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Any, Dict
 import threading
 
 # --------------------------------------------------------------------------
@@ -6,9 +6,18 @@ import threading
 # These hold ephemeral video frame data and thread tracking.
 # --------------------------------------------------------------------------
 
-# Video Frame Buffers (The latest frames for broadcasting)
-# Format: { runtime_key: { 'original': b64_str, 'partition_X': b64_str, '__meta__': {...} } }
-FRAME_BUFFERS: Dict[str, Dict[str, str]] = {}
+# Video frame buffers (the latest frames for broadcasting).
+# Format:
+# {
+#   runtime_key: {
+#     'original': jpeg_bytes,
+#     'partition_X': jpeg_bytes,
+#     '__meta__': {...},
+#   }
+# }
+FrameBufferValue = bytes | dict[str, Any] | None
+RuntimeFrameBuffer = dict[str, FrameBufferValue]
+FRAME_BUFFERS: Dict[str, RuntimeFrameBuffer] = {}
 
 # Producer thread runtime registries (keyed by runtime_key)
 PRODUCER_THREADS: Dict[str, threading.Thread] = {}

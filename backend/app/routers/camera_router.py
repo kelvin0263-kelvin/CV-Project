@@ -1033,7 +1033,8 @@ async def websocket_endpoint(websocket: WebSocket, camera_id: str):
             # Fetch latest frame + metadata from global buffer
             if runtime_key in FRAME_BUFFERS:
                 frames = FRAME_BUFFERS[runtime_key]
-                b64_data = frames.get(target_key)
+                frame_bytes = frames.get(target_key)
+                has_image = isinstance(frame_bytes, (bytes, bytearray, memoryview)) and len(frame_bytes) > 0
 
                 # Extract metadata
                 meta = frames.get("__meta__", {})
@@ -1056,13 +1057,16 @@ async def websocket_endpoint(websocket: WebSocket, camera_id: str):
                 else:
                     view_counting = {}
 
+                if has_image:
+                    await websocket.send_bytes(bytes(frame_bytes))
+
                 await websocket.send_json({
-                    "image": b64_data,
+                    "has_image": has_image,
                     "fps": fps,
                     "people_count": people_count,
                     "detections": view_detections,
                     "counting_data": view_counting,
-                    "stream_status": meta.get("stream_status", "live" if b64_data else "recovering"),
+                    "stream_status": meta.get("stream_status", "live" if has_image else "recovering"),
                     "stream_reason": meta.get("stream_reason"),
                 })
 

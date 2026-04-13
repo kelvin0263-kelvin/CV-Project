@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
 import { Button } from './ui/button';
 import { Checkbox } from './ui/checkbox';
@@ -52,9 +52,18 @@ const getTimestampMs = (value) => parseApiTimestamp(value)?.getTime() ?? 0;
 // Currently unused.
 // const getTimestampIsoDate = (value) => parseApiTimestamp(value)?.toISOString().split('T')[0] ?? '';
 const formatTimestamp = (value) => parseApiTimestamp(value)?.toLocaleString() ?? '-';
+const getReportTimeValue = (row, preferredField = 'timestamp') => {
+    if (!row) return null;
+    if (preferredField === 'processed_at') {
+        return row?.processed_at || row?.timestamp || null;
+    }
+    return row?.timestamp || row?.processed_at || null;
+};
+const getReportTime = (row, preferredField = 'timestamp') => parseApiTimestamp(getReportTimeValue(row, preferredField));
+const getReportTimeMs = (row, preferredField = 'timestamp') => getReportTime(row, preferredField)?.getTime() ?? 0;
+const formatReportTime = (row, preferredField = 'timestamp') => getReportTime(row, preferredField)?.toLocaleString() ?? '-';
 const getSortableTimeValue = (row, field) => {
-    const candidate = field === 'processed_at' ? row?.processed_at : row?.timestamp;
-    const parsed = parseApiTimestamp(candidate);
+    const parsed = getReportTime(row, field);
     return parsed ? parsed.getTime() : null;
 };
 const normalizeSourceFilterKind = (rawValue) => {
@@ -247,10 +256,83 @@ const toCsvCell = (value) => {
     return text;
 };
 
-const downsampleSeries = (rows, maxPoints = OCCUPANCY_CHART_MAX_POINTS) => {
+const downsampleSeries = (rows, maxPoints = OCCUPANCY_CHART_MAX_POINTS, valueSelectors = []) => {
     if (rows.length <= maxPoints) return rows;
-    const step = Math.ceil(rows.length / maxPoints);
-    return rows.filter((_, idx) => idx % step === 0 || idx === rows.length - 1);
+
+    const interiorRows = rows.slice(1, -1);
+    if (interiorRows.length <= 0 || maxPoints <= 2) {
+        return [rows[0], rows[rows.length - 1]].filter(Boolean);
+    }
+
+    const selectors = Array.isArray(valueSelectors) ? valueSelectors.filter((selector) => typeof selector === 'function') : [];
+    const slotsPerChunk = Math.max(1, selectors.length * 2 || 1);
+    const chunkCount = Math.max(1, Math.floor((maxPoints - 2) / slotsPerChunk));
+    const chunkSize = Math.max(1, Math.ceil(interiorRows.length / chunkCount));
+    const selectedIndexes = new Set([0, rows.length - 1]);
+
+    for (let start = 1; start < rows.length - 1; start += chunkSize) {
+        const end = Math.min(rows.length - 1, start + chunkSize);
+        selectedIndexes.add(start);
+
+        if (!selectors.length) {
+            selectedIndexes.add(Math.min(rows.length - 2, start + Math.floor((end - start) / 2)));
+            continue;
+        }
+
+        selectors.forEach((selector) => {
+            let minIndex = start;
+            let maxIndex = start;
+            let minValue = Number(selector(rows[start]));
+            let maxValue = Number(selector(rows[start]));
+
+            for (let idx = start + 1; idx < end; idx += 1) {
+                const currentValue = Number(selector(rows[idx]));
+                if (!Number.isFinite(currentValue)) continue;
+
+                if (!Number.isFinite(minValue) || currentValue < minValue) {
+                    minValue = currentValue;
+                    minIndex = idx;
+                }
+                if (!Number.isFinite(maxValue) || currentValue > maxValue) {
+                    maxValue = currentValue;
+                    maxIndex = idx;
+                }
+            }
+
+            selectedIndexes.add(minIndex);
+            selectedIndexes.add(maxIndex);
+        });
+    }
+
+    return Array.from(selectedIndexes)
+        .sort((left, right) => left - right)
+        .map((index) => rows[index])
+        .filter(Boolean);
+};
+
+const collapseRowsByTimestamp = (rows, compareFn = null) => {
+    const byTimestamp = new Map();
+
+    rows.forEach((row) => {
+        const tsMs = Number(row?.tsMs ?? 0);
+        if (!Number.isFinite(tsMs) || tsMs <= 0) return;
+
+        const existing = byTimestamp.get(tsMs);
+        if (!existing) {
+            byTimestamp.set(tsMs, row);
+            return;
+        }
+
+        if (!compareFn) {
+            byTimestamp.set(tsMs, row);
+            return;
+        }
+
+        const preferred = compareFn(existing, row);
+        byTimestamp.set(tsMs, preferred === existing ? existing : row);
+    });
+
+    return Array.from(byTimestamp.values()).sort((a, b) => (a.tsMs ?? 0) - (b.tsMs ?? 0));
 };
 
 const isLikelyCounterReset = ({
@@ -670,7 +752,7 @@ const formatFlowBucketRange = (tsMs, bucket) => {
 
 const normalizeSnapshotRows = (rows) => rows
     .map((row) => {
-        const ts = parseApiTimestamp(row.timestamp);
+        const ts = getReportTime(row);
         if (!ts) return null;
         return {
             ...row,
@@ -895,6 +977,7 @@ const aggregateBuildingFlow = (rows, { startMs = null, endMs = null, bucket = '1
     const sortedRows = [...rows].sort((a, b) => (a.tsMs ?? 0) - (b.tsMs ?? 0));
     const bucketMap = new Map();
     let peakOccupancy = 0;
+    let peakOccupancyTsMs = null;
     let latestSnapshot = null;
 
     sortedRows.forEach((row) => {
@@ -904,7 +987,11 @@ const aggregateBuildingFlow = (rows, { startMs = null, endMs = null, bucket = '1
             return;
         }
 
-        peakOccupancy = Math.max(peakOccupancy, Number(row.occupancy ?? 0));
+        const rowOccupancy = Number(row.occupancy ?? 0);
+        if (rowOccupancy > peakOccupancy || peakOccupancyTsMs == null) {
+            peakOccupancy = rowOccupancy;
+            peakOccupancyTsMs = row.tsMs;
+        }
         if (!latestSnapshot || row.tsMs > latestSnapshot.tsMs) {
             latestSnapshot = row;
         }
@@ -939,6 +1026,9 @@ const aggregateBuildingFlow = (rows, { startMs = null, endMs = null, bucket = '1
     }, null);
     const displayedTotalIn = Number(latestSnapshot?.raw_in ?? 0);
     const displayedTotalOut = Number(latestSnapshot?.raw_out ?? 0);
+    const peakOccupancyPeriodLabel = peakOccupancyTsMs != null
+        ? formatFlowBucketRange(getBucketStartMs(peakOccupancyTsMs, bucket), bucket)
+        : '-';
 
     return {
         series,
@@ -946,6 +1036,7 @@ const aggregateBuildingFlow = (rows, { startMs = null, endMs = null, bucket = '1
         totalOut: displayedTotalOut,
         totalTraffic: displayedTotalIn + displayedTotalOut,
         peakOccupancy,
+        peakOccupancyPeriodLabel,
         estimatedOccupancy: Number(latestSnapshot?.occupancy ?? 0),
         peakPeriodLabel: peakPeriod?.fullLabel || '-',
         resetCount: 0,
@@ -1049,7 +1140,7 @@ const getPeakTwoHourLabel = (events) => {
     const byWindow = new Map();
 
     events.forEach((evt) => {
-        const ts = parseApiTimestamp(evt.timestamp);
+        const ts = getReportTime(evt);
         if (!ts) return;
         const bucketHour = Math.floor(ts.getHours() / 2) * 2;
         byWindow.set(bucketHour, (byWindow.get(bucketHour) || 0) + 1);
@@ -1108,7 +1199,7 @@ const aggregateDressCodeAnalytics = (events, snapshots, { startMs = null, endMs 
     const violationCameraIds = new Set();
 
     relevantEvents.forEach((evt) => {
-        const ts = parseApiTimestamp(evt.timestamp);
+        const ts = getReportTime(evt);
         if (!ts) return;
         const tsMs = ts.getTime();
         const bucketStartMs = getBucketStartMs(tsMs, trafficBucket);
@@ -1387,7 +1478,7 @@ const DressCodeRateBreakdown = ({ analytics, compact = false }) => {
 const aggregateFallDetectionAnalytics = (events) => {
     const fallEvents = events
         .filter((evt) => evt.event_type === 'Fall Detected')
-        .sort((a, b) => getTimestampMs(b.timestamp) - getTimestampMs(a.timestamp));
+        .sort((a, b) => getReportTimeMs(b) - getReportTimeMs(a));
 
     const affectedCameraIds = new Set(
         fallEvents
@@ -1400,7 +1491,7 @@ const aggregateFallDetectionAnalytics = (events) => {
     return {
         totalFalls: fallEvents.length,
         affectedCameraCount: affectedCameraIds.size,
-        latestEventLabel: latestEvent ? formatTimestamp(latestEvent.timestamp) : '-',
+        latestEventLabel: latestEvent ? formatReportTime(latestEvent) : '-',
         peakFallTimeLabel: getPeakTwoHourLabel(fallEvents),
     };
 };
@@ -1466,7 +1557,7 @@ const DetailModal = ({ record, onClose, apiUrl }) => {
                         </div>
                         <div>
                             <p className="text-muted-foreground font-medium">Timestamp</p>
-                            <p>{formatTimestamp(record.timestamp)}</p>
+                            <p>{formatReportTime(record)}</p>
                         </div>
                         <div>
                             <p className="text-muted-foreground font-medium">Processed At</p>
@@ -2295,6 +2386,8 @@ const BuildingOccupancyPanel = ({
     const [rangeNowMs, setRangeNowMs] = useState(() => Date.now());
     const [brushWindow, setBrushWindow] = useState({ key: '', startTs: null, endTs: null });
     const [expandedEntranceIds, setExpandedEntranceIds] = useState(() => new Set());
+    const brushFrameRef = useRef(null);
+    const pendingBrushRangeRef = useRef(null);
     const buildingHistoryFetchBounds = useMemo(() => ({
         valid: reportStartMs == null || reportEndMs == null || reportStartMs <= reportEndMs,
         startMs: reportStartMs,
@@ -2517,8 +2610,32 @@ const BuildingOccupancyPanel = ({
         return durationMs <= OCCUPANCY_RANGE_LOOKBACK_MS['24h'] ? '24h' : '7d';
     }, [scopedHistory]);
 
+    const chartRows = useMemo(() => {
+        const collapsedRows = collapseRowsByTimestamp(scopedHistory, (currentBest, candidate) => {
+            const currentOccupancy = Number(currentBest?.occupancy ?? 0);
+            const candidateOccupancy = Number(candidate?.occupancy ?? 0);
+            if (candidateOccupancy > currentOccupancy) return candidate;
+            if (candidateOccupancy < currentOccupancy) return currentBest;
+
+            const currentRawOccupancy = Number(currentBest?.raw_occupancy ?? 0);
+            const candidateRawOccupancy = Number(candidate?.raw_occupancy ?? 0);
+            if (candidateRawOccupancy > currentRawOccupancy) return candidate;
+            if (candidateRawOccupancy < currentRawOccupancy) return currentBest;
+
+            return (Number(candidate?.raw_in ?? 0) + Number(candidate?.raw_out ?? 0))
+                >= (Number(currentBest?.raw_in ?? 0) + Number(currentBest?.raw_out ?? 0))
+                ? candidate
+                : currentBest;
+        });
+
+        return downsampleSeries(collapsedRows, 2000, [
+            (row) => Number(row?.occupancy ?? 0),
+            (row) => Number(row?.raw_occupancy ?? 0),
+        ]);
+    }, [scopedHistory]);
+
     const chartData = useMemo(() => {
-        const sampledRows = downsampleSeries(scopedHistory, 2000);
+        const sampledRows = chartRows;
         return sampledRows.map((row) => ({
             time: getOccupancyTickLabel(row.ts, historyRangeKey),
             fullTime: row.ts.toLocaleString(),
@@ -2526,7 +2643,7 @@ const BuildingOccupancyPanel = ({
             occupancy: row.occupancy,
             rawOccupancy: row.raw_occupancy,
         }));
-    }, [historyRangeKey, scopedHistory]);
+    }, [chartRows, historyRangeKey]);
 
     const effectiveBucket = useMemo(() => {
         if (selectedBucket !== 'auto') return selectedBucket;
@@ -2561,20 +2678,46 @@ const BuildingOccupancyPanel = ({
         }
         return { startIndex, endIndex };
     }, [activeBrushWindow, chartData]);
-    const handleBrushChange = useCallback((range) => {
+
+    useEffect(() => () => {
+        if (brushFrameRef.current != null) {
+            cancelAnimationFrame(brushFrameRef.current);
+        }
+    }, []);
+
+    const commitBrushRange = useCallback((range) => {
         if (!range || !chartData.length) return;
 
         const maxIndex = chartData.length - 1;
-        const startIndex = clamp(Number(range.startIndex ?? 0), 0, maxIndex);
-        const endIndex = clamp(Number(range.endIndex ?? maxIndex), 0, maxIndex);
+        const rawStartIndex = Number(range.startIndex);
+        const rawEndIndex = Number(range.endIndex);
+        if (!Number.isFinite(rawStartIndex) || !Number.isFinite(rawEndIndex)) return;
+
+        const startIndex = clamp(Math.round(rawStartIndex), 0, maxIndex);
+        const endIndex = clamp(Math.round(rawEndIndex), 0, maxIndex);
         const startTs = chartData[startIndex]?.tsMs ?? null;
         const endTs = chartData[endIndex]?.tsMs ?? null;
+        if (startTs == null || endTs == null) return;
 
         setBrushWindow((prev) => {
             if (prev.key === brushContextKey && prev.startTs === startTs && prev.endTs === endTs) return prev;
             return { key: brushContextKey, startTs, endTs };
         });
     }, [brushContextKey, chartData]);
+
+    const handleBrushChange = useCallback((range) => {
+        if (!range || !chartData.length) return;
+
+        pendingBrushRangeRef.current = range;
+        if (brushFrameRef.current != null) return;
+
+        brushFrameRef.current = requestAnimationFrame(() => {
+            brushFrameRef.current = null;
+            const nextRange = pendingBrushRangeRef.current;
+            pendingBrushRangeRef.current = null;
+            commitBrushRange(nextRange);
+        });
+    }, [chartData.length, commitBrushRange]);
 
     const flowSummary = useMemo(() => {
         if (!panelRangeBounds.valid) {
@@ -2584,6 +2727,7 @@ const BuildingOccupancyPanel = ({
                 totalOut: 0,
                 totalTraffic: 0,
                 peakOccupancy: 0,
+                peakOccupancyPeriodLabel: '-',
                 estimatedOccupancy: 0,
                 peakPeriodLabel: '-',
                 resetCount: 0,
@@ -2923,7 +3067,7 @@ const BuildingOccupancyPanel = ({
                                 Peak Occupancy
                             </div>
                             <div className="mt-2 text-3xl font-bold text-blue-700">{formatNumber(peakOccupancyValue)}</div>
-                            <div className="mt-1 text-xs text-muted-foreground">{flowSummary.peakPeriodLabel}</div>
+                            <div className="mt-1 text-xs text-muted-foreground">{flowSummary.peakOccupancyPeriodLabel}</div>
                         </div>
 
                         <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-4">
@@ -3265,7 +3409,7 @@ const BuildingAlertsPanel = ({ rows, onSelectRecord, loading, visible }) => {
                                 className="hover:bg-muted/30 transition-colors group cursor-pointer"
                                 onClick={() => onSelectRecord(row)}
                             >
-                                <td className="px-4 py-3">{formatTimestamp(row.timestamp)}</td>
+                                <td className="px-4 py-3">{formatReportTime(row)}</td>
                                 <td className="px-4 py-3">
                                     <span className="inline-flex items-center gap-2 rounded-full border border-red-200 bg-red-50 px-2 py-1 text-xs font-medium text-red-700">
                                         <span className="h-1.5 w-1.5 rounded-full bg-red-500" />
@@ -3365,7 +3509,7 @@ const AllOverviewPanel = ({
 
     const fallSummary = useMemo(() => aggregateFallDetectionAnalytics(
         events.filter((evt) => {
-            const tsMs = getTimestampMs(evt.timestamp);
+            const tsMs = getReportTimeMs(evt);
             if (!tsMs) return false;
             if (startMs != null && tsMs < startMs) return false;
             if (endMs != null && tsMs > endMs) return false;
@@ -3714,7 +3858,7 @@ const Reporting = () => {
             }
 
             // Sort by timestamp descending (newest first)
-            allSnapshots.sort((a, b) => getTimestampMs(b.timestamp) - getTimestampMs(a.timestamp));
+            allSnapshots.sort((a, b) => getReportTimeMs(b) - getReportTimeMs(a));
             setCountingSnapshots(allSnapshots);
         } catch (err) {
             console.error("Failed to fetch counting snapshots:", err);
@@ -3820,8 +3964,8 @@ const Reporting = () => {
     ), [baseCameraOptions, effectiveSourceFilter]);
 
     // Date filter helper
-    const dateFilter = (timestamp) => {
-        const tsMs = getTimestampMs(timestamp);
+    const dateFilter = (row, field = 'timestamp') => {
+        const tsMs = getReportTimeMs(row, field);
         if (!tsMs) return false;
         if (reportingDateBounds.startMs !== null && tsMs < reportingDateBounds.startMs) return false;
         if (reportingDateBounds.endMs !== null && tsMs > reportingDateBounds.endMs) return false;
@@ -3836,15 +3980,15 @@ const Reporting = () => {
     // Filtered events
     const filteredEvents = events
         .map(evt => ({ ...evt, camera_name: cameraNameById[evt.camera_id] || evt.camera_name }))
-        .filter(evt => dateFilter(evt.timestamp) && cameraFilter(evt.camera_id) && sourceFilter(evt));
+        .filter(evt => dateFilter(evt) && cameraFilter(evt.camera_id) && sourceFilter(evt));
     const filteredBuildingAlerts = filteredEvents
         .filter((evt) => evt.event_type === 'Capacity Exceeded' && evt.details?.scope === 'building')
-        .sort((a, b) => getTimestampMs(b.timestamp) - getTimestampMs(a.timestamp));
+        .sort((a, b) => getReportTimeMs(b) - getReportTimeMs(a));
 
     // Filtered counting snapshots
     const filteredSnapshots = countingSnapshots
         .map(s => ({ ...s, camera_name: s.camera_name || cameraNameById[s.camera_id] || s.camera_id }))
-        .filter(s => dateFilter(s.timestamp) && cameraFilter(s.camera_id) && sourceFilter(s));
+        .filter(s => dateFilter(s) && cameraFilter(s.camera_id) && sourceFilter(s));
     const selectedCountingSnapshots = countingSnapshots
         .map(s => ({ ...s, camera_name: s.camera_name || cameraNameById[s.camera_id] || s.camera_id }))
         .filter(s => cameraFilter(s.camera_id) && sourceFilter(s));
@@ -3987,7 +4131,7 @@ const Reporting = () => {
         // Detection events aggregated by day
         const byDay = {};
         filteredEvents.forEach(evt => {
-            const parsed = parseApiTimestamp(evt.timestamp);
+            const parsed = getReportTime(evt);
             if (!parsed) return;
             const day = parsed.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
             if (!byDay[day]) byDay[day] = { name: day, violations: 0 };
@@ -4649,7 +4793,7 @@ const Reporting = () => {
                                         return (
                                             <tr key={row.id} className="group hover:bg-muted/30 transition-colors cursor-pointer"
                                                 onClick={() => setSelectedRecord(row)}>
-                                                <td className="px-4 py-3">{formatTimestamp(row.timestamp)}</td>
+                                                <td className="px-4 py-3">{formatReportTime(row)}</td>
                                                 <td className="px-4 py-3">{formatTimestamp(row.processed_at)}</td>
                                                 <td className="px-4 py-3">
                                                     <span className={cn(
@@ -4690,7 +4834,7 @@ const Reporting = () => {
                                     return (
                                         <tr key={row.id} className="hover:bg-muted/30 transition-colors group cursor-pointer"
                                             onClick={() => setSelectedRecord(row)}>
-                                            <td className="px-4 py-3">{formatTimestamp(row.timestamp)}</td>
+                                            <td className="px-4 py-3">{formatReportTime(row)}</td>
                                             <td className="px-4 py-3">{formatTimestamp(row.processed_at)}</td>
                                             <td className="px-4 py-3">
                                                 <span className={cn(

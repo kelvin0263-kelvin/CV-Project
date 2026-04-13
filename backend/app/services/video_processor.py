@@ -1,7 +1,6 @@
 import threading
 import cv2
 import time
-import base64
 import sys
 import os
 import uuid
@@ -79,7 +78,7 @@ LOCAL_TIMEZONE = datetime.now().astimezone().tzinfo or timezone.utc
 UPLOAD_FILENAME_PREFIX_PATTERN = re.compile(r"^(?P<prefix>[0-9a-fA-F]{8})_(?P<rest>.+)$")
 UPLOAD_START_TIME_PATTERN = re.compile(r"^(?P<timestamp>\d{14})(?:_|$)")
 
-POSE_MODEL_ENGINE_PATH = os.path.join(BACKEND_ROOT, "yolo26m-pose.engine")
+POSE_MODEL_ENGINE_PATH = os.path.join(BACKEND_ROOT, "yolov8m-pose.engine")
 POSE_MODEL_PT_PATH = "yolov8m-pose.pt"
 # POSE_MODEL_ENGINE_PATH = ""
 
@@ -88,7 +87,7 @@ YOLO_DEVICE = None
 # POSE_TRACK_IMGSZ = (576,1024)
 # POSE_TRACK_IMGSZ = 736
 POSE_TRACK_IMGSZ = (416,736)
-DETECTION_STRIDE = 1
+DETECTION_STRIDE = 2
 COUNTING_SNAPSHOT_HEARTBEAT_SEC = 300
 
 # At DRESSCODE_VIOLATION_WINDOW_SEC appear DRESSCODE_VIOLATION_CONFIRMATIONS times only consider violation
@@ -559,14 +558,14 @@ def _resize_for_web(img: np.ndarray, *, use_cuda: bool) -> np.ndarray:
             pass
     return cv2.resize(img, (640, 360))
 
-# To resize an image, encode it as JPEG, and convert it into a base64 string for web transmission and display.
-def _encode_frame(img: np.ndarray, *, use_cuda: bool) -> str:
+# To resize an image and encode it as JPEG bytes for websocket delivery.
+def _encode_frame(img: np.ndarray, *, use_cuda: bool) -> bytes:
     img_small = _resize_for_web(img, use_cuda=use_cuda)
     if jpeg:
         buf = jpeg.encode(img_small, quality=40)
     else:
         _, buf = cv2.imencode(".jpg", img_small, [cv2.IMWRITE_JPEG_QUALITY, 40])
-    return base64.b64encode(buf).decode("utf-8")
+    return bytes(buf)
 
 # To scale detection coordinates from the original frame size to the target display size for correct frontend rendering.
 def _scale_detections(

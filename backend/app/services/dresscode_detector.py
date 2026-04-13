@@ -20,8 +20,25 @@ from ultralytics import YOLO
 
 BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PROJECT_ROOT = os.path.dirname(BACKEND_ROOT)
-DRESSCODE_MODEL_PATH = os.getenv("DRESSCODE_MODEL_PATH", os.path.join(BACKEND_ROOT, "best.pt"))
-SLIPPER_MODEL_PATH = os.getenv("SLIPPER_MODEL_PATH", os.path.join(BACKEND_ROOT, "slipper-cls-best.pt"))
+DEFAULT_DRESSCODE_MODEL_PT_PATH = os.path.join(BACKEND_ROOT, "best.pt")
+DEFAULT_SLIPPER_MODEL_PT_PATH = os.path.join(BACKEND_ROOT, "slipper-cls-best.pt")
+DEFAULT_DRESSCODE_IMGSZ = int(os.getenv("DRESSCODE_MODEL_IMGSZ", "160"))
+DEFAULT_SLIPPER_IMGSZ = int(os.getenv("SLIPPER_MODEL_IMGSZ", "224"))
+
+
+def _resolve_classifier_model_path(env_var_name: str, default_pt_path: str) -> str:
+    explicit_path = os.getenv(env_var_name)
+    if explicit_path:
+        return explicit_path
+
+    engine_path = os.path.splitext(default_pt_path)[0] + ".engine"
+    if os.path.exists(engine_path):
+        return engine_path
+    return default_pt_path
+
+
+DRESSCODE_MODEL_PATH = _resolve_classifier_model_path("DRESSCODE_MODEL_PATH", DEFAULT_DRESSCODE_MODEL_PT_PATH)
+SLIPPER_MODEL_PATH = _resolve_classifier_model_path("SLIPPER_MODEL_PATH", DEFAULT_SLIPPER_MODEL_PT_PATH)
 
 
 def _register_slipper_checkpoint_custom_classes() -> None:
@@ -45,27 +62,55 @@ def _register_slipper_checkpoint_custom_classes() -> None:
         print(f"[System] Warning: Failed to register slipper checkpoint classes: {e}")
 
 
-def _load_classifier(model_path: str, *, description: str, register_custom_classes: bool = False):
-    print(f"[System] Loading {description} Classification Model ({model_path})...")
-    try:
-        if register_custom_classes:
+def _load_classifier(
+    model_path: str,
+    *,
+    description: str,
+    default_pt_path: str,
+    default_imgsz: int,
+    register_custom_classes: bool = False,
+):
+    def _attempt_load(path: str):
+        print(f"[System] Loading {description} Classification Model ({path})...")
+        if register_custom_classes and path.lower().endswith(".pt"):
             _register_slipper_checkpoint_custom_classes()
-        model = YOLO(model_path)
+        model = YOLO(path, task="classify")
         class_names = model.names
-        print(f"[System] {description} model loaded. Classes: {class_names}")
-        return model, class_names
+        model_args = getattr(model.model, "args", {}) if hasattr(model, "model") else {}
+        imgsz = int(model_args.get("imgsz", default_imgsz)) if isinstance(model_args, dict) else default_imgsz
+        backend = "TensorRT" if path.lower().endswith(".engine") else "PyTorch"
+        print(f"[System] {description} model loaded via {backend}. imgsz={imgsz}. Classes: {class_names}")
+        return model, class_names, imgsz
+
+    try:
+        return _attempt_load(model_path)
     except Exception as e:
+        if model_path != default_pt_path and os.path.exists(default_pt_path):
+            print(
+                f"[System] Warning: Failed to load {description} model '{model_path}', "
+                f"falling back to '{default_pt_path}': {e}"
+            )
+            try:
+                return _attempt_load(default_pt_path)
+            except Exception as fallback_error:
+                print(f"[System] Warning: Failed to load fallback {description} model: {fallback_error}")
+                return None, {}, default_imgsz
+
         print(f"[System] Warning: Failed to load {description} model: {e}")
-        return None, {}
+        return None, {}, default_imgsz
 
 
-dresscode_model, dresscode_class_names = _load_classifier(
+dresscode_model, dresscode_class_names, dresscode_imgsz = _load_classifier(
     DRESSCODE_MODEL_PATH,
     description="Dress Code",
+    default_pt_path=DEFAULT_DRESSCODE_MODEL_PT_PATH,
+    default_imgsz=DEFAULT_DRESSCODE_IMGSZ,
 )
-slipper_model, slipper_class_names = _load_classifier(
+slipper_model, slipper_class_names, slipper_imgsz = _load_classifier(
     SLIPPER_MODEL_PATH,
     description="Slipper",
+    default_pt_path=DEFAULT_SLIPPER_MODEL_PT_PATH,
+    default_imgsz=DEFAULT_SLIPPER_IMGSZ,
     register_custom_classes=True,
 )
 
@@ -179,22 +224,7 @@ def crop_slipper_region(frame: np.ndarray, bbox, keypoints=None) -> tuple:
     return crop, (nx1, ny1, nx2, ny2)
 
 
-def _predict_batch(model, class_names: dict, crops: list[np.ndarray], device: str | None = None) -> list[dict | None]:
-    if model is None or not crops:
-        return [None] * len(crops)
-
-    classify_kwargs = {
-        "verbose": False,
-    }
-    if device:
-        classify_kwargs["device"] = device
-
-    try:
-        raw_results = model(crops, **classify_kwargs)
-    except Exception as e:
-        print(f"[DressCode] Batch classification error: {e}")
-        return [None] * len(crops)
-
+def _parse_predictions(raw_results, class_names: dict) -> list[dict | None]:
     parsed_results: list[dict | None] = []
     for raw in raw_results:
         if raw.probs is None:
@@ -212,6 +242,32 @@ def _predict_batch(model, class_names: dict, crops: list[np.ndarray], device: st
         )
 
     return parsed_results
+
+
+def _predict_batch(
+    model,
+    class_names: dict,
+    crops: list[np.ndarray],
+    *,
+    imgsz: int,
+    device: str | None = None,
+) -> list[dict | None]:
+    if model is None or not crops:
+        return [None] * len(crops)
+
+    classify_kwargs = {
+        "verbose": False,
+        "imgsz": imgsz,
+    }
+    if device:
+        classify_kwargs["device"] = device
+
+    try:
+        raw_results = model(crops, **classify_kwargs)
+        return _parse_predictions(raw_results, class_names)
+    except Exception as e:
+        print(f"[DressCode] Batch classification error: {e}")
+        return [None] * len(crops)
 
 
 def _finalize_combined_result(entry: dict) -> dict | None:
@@ -331,8 +387,20 @@ def classify_lower_body_batch(
             slipper_crops.append(slipper_crop)
             slipper_bboxes.append(slipper_bbox)
 
-    lower_predictions = _predict_batch(dresscode_model, dresscode_class_names, lower_crops, device=device)
-    slipper_predictions = _predict_batch(slipper_model, slipper_class_names, slipper_crops, device=device)
+    lower_predictions = _predict_batch(
+        dresscode_model,
+        dresscode_class_names,
+        lower_crops,
+        imgsz=dresscode_imgsz,
+        device=device,
+    )
+    slipper_predictions = _predict_batch(
+        slipper_model,
+        slipper_class_names,
+        slipper_crops,
+        imgsz=slipper_imgsz,
+        device=device,
+    )
 
     for batch_pos, prediction in enumerate(lower_predictions):
         if prediction is None:
@@ -435,8 +503,20 @@ def classify_lower_body_multi_frame_batch(
             slipper_crops.append(slipper_crop)
             slipper_bboxes.append(slipper_bbox)
 
-    lower_predictions = _predict_batch(dresscode_model, dresscode_class_names, lower_crops, device=device)
-    slipper_predictions = _predict_batch(slipper_model, slipper_class_names, slipper_crops, device=device)
+    lower_predictions = _predict_batch(
+        dresscode_model,
+        dresscode_class_names,
+        lower_crops,
+        imgsz=dresscode_imgsz,
+        device=device,
+    )
+    slipper_predictions = _predict_batch(
+        slipper_model,
+        slipper_class_names,
+        slipper_crops,
+        imgsz=slipper_imgsz,
+        device=device,
+    )
 
     for batch_pos, prediction in enumerate(lower_predictions):
         if prediction is None:

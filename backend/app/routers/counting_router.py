@@ -938,6 +938,111 @@ def _validate_cross_camera_fields(
             raise HTTPException(status_code=400, detail="verification_camera_id must be a different camera.")
 
 
+async def _validate_cross_camera_pair_uniqueness(
+    *,
+    db: AsyncSession,
+    camera_id: str,
+    camera_enabled: bool,
+    cross_camera_enabled: bool,
+    cross_camera_pair_id: str | None,
+    cross_camera_role: str,
+    verification_camera_id: str | None,
+):
+    if not camera_enabled or not cross_camera_enabled:
+        return
+    if cross_camera_role not in {"primary", "verifier"} or not cross_camera_pair_id:
+        return
+
+    result = await db.execute(
+        select(PeopleCountingConfig).where(
+            PeopleCountingConfig.camera_id != camera_id,
+            PeopleCountingConfig.cross_camera_enabled.is_(True),
+        )
+    )
+    other_rows = [
+        row for row in result.scalars().all()
+        if bool(row.enabled)
+    ]
+
+    normalized_pair_id = _normalize_cross_camera_pair_id(cross_camera_pair_id)
+    normalized_verification_camera_id = _normalize_building_id(verification_camera_id)
+
+    same_pair_rows = [
+        row for row in other_rows
+        if _normalize_cross_camera_pair_id(row.cross_camera_pair_id) == normalized_pair_id
+    ]
+
+    if cross_camera_role == "primary":
+        for other in same_pair_rows:
+            other_role = _normalize_cross_camera_role(other.cross_camera_role)
+            if other_role == "primary":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Pair ID '{normalized_pair_id}' is already used by primary camera '{other.camera_id}'.",
+                )
+            if other_role == "verifier" and other.camera_id != normalized_verification_camera_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Pair ID '{normalized_pair_id}' is already assigned to verifier camera '{other.camera_id}'.",
+                )
+
+        if normalized_verification_camera_id:
+            for other in other_rows:
+                other_role = _normalize_cross_camera_role(other.cross_camera_role)
+                other_pair_id = _normalize_cross_camera_pair_id(other.cross_camera_pair_id)
+                other_verification_camera_id = _normalize_building_id(other.verification_camera_id)
+
+                if other_role == "primary" and other_verification_camera_id == normalized_verification_camera_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Verification camera '{normalized_verification_camera_id}' is already paired with primary camera '{other.camera_id}'.",
+                    )
+
+                if (
+                    other.camera_id == normalized_verification_camera_id
+                    and other_role == "verifier"
+                    and other_pair_id
+                    and other_pair_id != normalized_pair_id
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Verification camera '{normalized_verification_camera_id}' already belongs to pair '{other_pair_id}'.",
+                    )
+
+    if cross_camera_role == "verifier":
+        for other in same_pair_rows:
+            other_role = _normalize_cross_camera_role(other.cross_camera_role)
+            other_verification_camera_id = _normalize_building_id(other.verification_camera_id)
+
+            if other_role == "verifier":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Pair ID '{normalized_pair_id}' is already assigned to verifier camera '{other.camera_id}'.",
+                )
+
+            if other_role == "primary" and other_verification_camera_id and other_verification_camera_id != camera_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Pair ID '{normalized_pair_id}' is already linked to verifier camera '{other_verification_camera_id}'.",
+                )
+
+        for other in other_rows:
+            other_role = _normalize_cross_camera_role(other.cross_camera_role)
+            other_pair_id = _normalize_cross_camera_pair_id(other.cross_camera_pair_id)
+            other_verification_camera_id = _normalize_building_id(other.verification_camera_id)
+
+            if (
+                other_role == "primary"
+                and other_verification_camera_id == camera_id
+                and other_pair_id
+                and other_pair_id != normalized_pair_id
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"This verifier camera is already paired under pair '{other_pair_id}'.",
+                )
+
+
 async def sync_counting_runtime_from_db(session: AsyncSession):
     """
     Rebuild counting caches from the database.
@@ -1088,6 +1193,11 @@ async def upsert_config(
         participate_in_building_count=bool(participate_in_building_count),
         building_id=building_id,
     )
+    camera_enabled = (
+        update.enabled
+        if update.enabled is not None
+        else (row.enabled if row is not None else True)
+    )
 
     cross_camera_enabled = (
         update.cross_camera_enabled
@@ -1127,6 +1237,15 @@ async def upsert_config(
         cross_camera_role=cross_camera_role,
         verification_camera_id=verification_camera_id,
     )
+    await _validate_cross_camera_pair_uniqueness(
+        db=db,
+        camera_id=camera_id,
+        camera_enabled=bool(camera_enabled),
+        cross_camera_enabled=bool(cross_camera_enabled),
+        cross_camera_pair_id=cross_camera_pair_id,
+        cross_camera_role=cross_camera_role,
+        verification_camera_id=verification_camera_id,
+    )
 
     frame_exclude_areas = None
     if update.frame_exclude_areas is not None:
@@ -1137,7 +1256,7 @@ async def upsert_config(
         row = PeopleCountingConfig(
             id=str(uuid.uuid4()),
             camera_id=camera_id,
-            enabled=update.enabled if update.enabled is not None else True,
+            enabled=bool(camera_enabled),
             participate_in_building_count=bool(participate_in_building_count),
             building_id=building_id,
             cross_camera_enabled=bool(cross_camera_enabled),
@@ -1221,15 +1340,14 @@ async def get_history(
     if start is not None and end is not None and start > end:
         raise HTTPException(status_code=400, detail="start must be earlier than or equal to end")
 
-    query = select(PeopleCountingSnapshot).order_by(
-        desc(func.coalesce(PeopleCountingSnapshot.processed_at, PeopleCountingSnapshot.timestamp))
-    )
+    effective_time = func.coalesce(PeopleCountingSnapshot.processed_at, PeopleCountingSnapshot.timestamp)
+    query = select(PeopleCountingSnapshot).order_by(desc(effective_time))
     if camera_id:
         query = query.where(PeopleCountingSnapshot.camera_id == camera_id)
     if start is not None:
-        query = query.where(PeopleCountingSnapshot.timestamp >= start)
+        query = query.where(effective_time >= start)
     if end is not None:
-        query = query.where(PeopleCountingSnapshot.timestamp <= end)
+        query = query.where(effective_time <= end)
     query = query.offset(offset).limit(limit)
     result = await db.execute(query)
     return result.scalars().all()

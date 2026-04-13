@@ -2,6 +2,7 @@
 import argparse
 import os
 import sys
+import __main__
 from pathlib import Path
 
 
@@ -94,6 +95,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional export run name. Defaults to '<model-stem>_<format>'.",
     )
+    parser.add_argument(
+        "--register-slipper-classes",
+        action="store_true",
+        help=(
+            "Register the custom slipper classification training classes before loading "
+            "the checkpoint. Use this for slipper-cls-best.pt exports."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -110,6 +119,21 @@ def resolve_model_path(model_arg: str) -> Path:
     if not model_path.is_absolute():
         model_path = (PROJECT_ROOT / model_path).resolve()
     return model_path
+
+
+def register_slipper_checkpoint_classes() -> None:
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+
+    import scripts.train_yolo26_classifier as train_mod
+
+    __main__.ResizePadSquare = train_mod.ResizePadSquare
+    if getattr(train_mod, "SlipperClassificationDataset", None) is not None:
+        __main__.SlipperClassificationDataset = train_mod.SlipperClassificationDataset
+    if getattr(train_mod, "SlipperTrainer", None) is not None:
+        __main__.SlipperTrainer = train_mod.SlipperTrainer
+    if getattr(train_mod, "SlipperValidator", None) is not None:
+        __main__.SlipperValidator = train_mod.SlipperValidator
 
 
 def main() -> int:
@@ -166,6 +190,9 @@ def main() -> int:
 
     print(f"Loading model: {model_path}")
     print(f"Export kwargs: {export_kwargs}")
+
+    if args.register_slipper_classes:
+        register_slipper_checkpoint_classes()
 
     model = YOLO(str(model_path))
     result = model.export(**export_kwargs)

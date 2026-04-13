@@ -1,6 +1,20 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 
 const STREAM_RENDER_INTERVAL_MS = 100;
+const DEFAULT_STREAM_AUTO_RECONNECT_INTERVAL_MS = (() => {
+    const rawMinutes = (
+        typeof import.meta !== 'undefined'
+        && import.meta.env
+        && import.meta.env.VITE_STREAM_AUTO_RECONNECT_MINUTES
+    )
+        ? import.meta.env.VITE_STREAM_AUTO_RECONNECT_MINUTES
+        : '60';
+    const minutes = Number.parseFloat(rawMinutes);
+    if (!Number.isFinite(minutes) || minutes <= 0) {
+        return 60 * 60 * 1000;
+    }
+    return Math.round(minutes * 60 * 1000);
+})();
 
 const StreamPlayer = ({
     wsUrl,
@@ -13,28 +27,59 @@ const StreamPlayer = ({
     onStreamState,
     showCountingAnchors = false,
     overlayMode = 'auto',
+    autoReconnectIntervalMs = DEFAULT_STREAM_AUTO_RECONNECT_INTERVAL_MS,
 }) => {
     const wrapperRef = useRef(null);
     const imgRef = useRef(null);
     const canvasRef = useRef(null);
     const wsRef = useRef(null);
+    const reconnectTimerRef = useRef(null);
+    const refreshInProgressRef = useRef(false);
     const onStatsRef = useRef(onStats);
     const onDetectionsRef = useRef(onDetections);
     const onCountingDataRef = useRef(onCountingData);
     const onMediaLayoutRef = useRef(onMediaLayout);
     const onStreamStateRef = useRef(onStreamState);
     const detectionsRef = useRef([]);
+    const latestFrameBlobRef = useRef(null);
     const latestPayloadRef = useRef(null);
     const renderRafRef = useRef(null);
     const lastRenderedAtRef = useRef(0);
+    const activeImageUrlRef = useRef(null);
     const statusRef = useRef('connecting');
     const [status, setStatus] = useState('connecting');
+    const [connectionVersion, setConnectionVersion] = useState(0);
 
     const setStatusSafe = useCallback((nextStatus) => {
         if (statusRef.current === nextStatus) return;
         statusRef.current = nextStatus;
         setStatus(nextStatus);
     }, []);
+
+    const clearAutoReconnectTimer = useCallback(() => {
+        if (reconnectTimerRef.current === null) return;
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+    }, []);
+
+    const requestStreamReconnect = useCallback(() => {
+        clearAutoReconnectTimer();
+        refreshInProgressRef.current = true;
+        setStatusSafe('refreshing');
+        setConnectionVersion((current) => current + 1);
+    }, [clearAutoReconnectTimer, setStatusSafe]);
+
+    const armAutoReconnectTimer = useCallback(() => {
+        clearAutoReconnectTimer();
+        const intervalMs = Number(autoReconnectIntervalMs);
+        if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+            return;
+        }
+        reconnectTimerRef.current = window.setTimeout(() => {
+            reconnectTimerRef.current = null;
+            requestStreamReconnect();
+        }, intervalMs);
+    }, [autoReconnectIntervalMs, clearAutoReconnectTimer, requestStreamReconnect]);
 
     useEffect(() => {
         onStatsRef.current = onStats;
@@ -103,6 +148,19 @@ const StreamPlayer = ({
         if (!area) return;
         onMediaLayoutRef.current(area);
     }, [getImageDisplayArea]);
+
+    const revokeActiveImageUrl = useCallback(() => {
+        if (!activeImageUrlRef.current) return;
+        URL.revokeObjectURL(activeImageUrlRef.current);
+        activeImageUrlRef.current = null;
+    }, []);
+
+    const clearImage = useCallback(() => {
+        revokeActiveImageUrl();
+        if (imgRef.current) {
+            imgRef.current.removeAttribute('src');
+        }
+    }, [revokeActiveImageUrl]);
 
     const getOverlayVisual = useCallback((det) => {
         const normalizedMode = String(overlayMode || 'auto').toLowerCase();
@@ -284,12 +342,16 @@ const StreamPlayer = ({
     }, [getImageDisplayArea, getOverlayVisual, showCountingAnchors]);
 
     const applyPayload = useCallback((data) => {
-        if (data.image && imgRef.current) {
-            imgRef.current.src = `data:image/jpeg;base64,${data.image}`;
+        const hasImage = Boolean(data.imageBlob);
+
+        if (hasImage && imgRef.current) {
+            const nextImageUrl = URL.createObjectURL(data.imageBlob);
+            revokeActiveImageUrl();
+            activeImageUrlRef.current = nextImageUrl;
+            imgRef.current.src = nextImageUrl;
             setStatusSafe('connected');
         } else if (imgRef.current) {
-            imgRef.current.removeAttribute('src');
-
+            clearImage();
             drawDetections([]);
             setStatusSafe(data.stream_status === 'offline' ? 'disconnected' : 'recovering');
         }
@@ -303,9 +365,9 @@ const StreamPlayer = ({
 
         if (onStreamStateRef.current) {
             onStreamStateRef.current({
-                status: data.stream_status || (data.image ? 'live' : 'recovering'),
+                status: data.stream_status || (hasImage ? 'live' : 'recovering'),
                 reason: data.stream_reason || null,
-                hasImage: Boolean(data.image),
+                hasImage,
             });
         }
 
@@ -320,7 +382,7 @@ const StreamPlayer = ({
         if (onCountingDataRef.current && data.counting_data) {
             onCountingDataRef.current(data.counting_data);
         }
-    }, [drawDetections, setStatusSafe]);
+    }, [clearImage, drawDetections, revokeActiveImageUrl, setStatusSafe]);
 
     const scheduleLatestRender = useCallback(() => {
         if (renderRafRef.current !== null) return;
@@ -350,7 +412,13 @@ const StreamPlayer = ({
     }, [applyPayload]);
 
     useEffect(() => {
-        if (!wsUrl) return;
+        clearAutoReconnectTimer();
+        if (!wsUrl) {
+            refreshInProgressRef.current = false;
+            return undefined;
+        }
+
+        let intentionalClose = false;
 
         // Close existing connection if any
         if (wsRef.current) {
@@ -358,21 +426,38 @@ const StreamPlayer = ({
         }
 
         const ws = new WebSocket(wsUrl);
+        ws.binaryType = 'blob';
         wsRef.current = ws;
+        latestFrameBlobRef.current = null;
         latestPayloadRef.current = null;
         lastRenderedAtRef.current = 0;
-        setStatusSafe('connecting');
+        setStatusSafe(refreshInProgressRef.current ? 'refreshing' : 'connecting');
 
         ws.onopen = () => {
             console.log(`Connected to ${wsUrl}`);
+            refreshInProgressRef.current = false;
             setStatusSafe('connected');
+            armAutoReconnectTimer();
         };
 
         ws.onmessage = (event) => {
             try {
-                const data = JSON.parse(event.data);
-                latestPayloadRef.current = data;
-                scheduleLatestRender();
+                if (typeof event.data === 'string') {
+                    const data = JSON.parse(event.data);
+                    latestPayloadRef.current = {
+                        ...data,
+                        imageBlob: data.has_image ? latestFrameBlobRef.current : null,
+                    };
+                    if (!data.has_image) {
+                        latestFrameBlobRef.current = null;
+                    }
+                    scheduleLatestRender();
+                    return;
+                }
+
+                latestFrameBlobRef.current = event.data instanceof Blob
+                    ? event.data
+                    : new Blob([event.data], { type: 'image/jpeg' });
             } catch (e) {
                 console.error("Error parsing WS message", e);
             }
@@ -380,15 +465,26 @@ const StreamPlayer = ({
 
         ws.onerror = (error) => {
             console.error("WebSocket error:", error);
+            refreshInProgressRef.current = false;
             setStatusSafe('error');
         };
 
         ws.onclose = () => {
             console.log("WebSocket closed");
+            clearAutoReconnectTimer();
+            if (wsRef.current === ws) {
+                wsRef.current = null;
+            }
+            if (intentionalClose) {
+                return;
+            }
+            refreshInProgressRef.current = false;
             setStatusSafe('disconnected');
         };
 
         return () => {
+            intentionalClose = true;
+            clearAutoReconnectTimer();
             if (wsRef.current) {
                 wsRef.current.close();
             }
@@ -396,14 +492,22 @@ const StreamPlayer = ({
                 window.cancelAnimationFrame(renderRafRef.current);
                 renderRafRef.current = null;
             }
+            latestFrameBlobRef.current = null;
             latestPayloadRef.current = null;
             detectionsRef.current = [];
-            if (imgRef.current) {
-                imgRef.current.removeAttribute('src');
-            }
+            clearImage();
             drawDetections([]);
         };
-    }, [drawDetections, scheduleLatestRender, setStatusSafe, wsUrl]);
+    }, [
+        armAutoReconnectTimer,
+        clearAutoReconnectTimer,
+        clearImage,
+        connectionVersion,
+        drawDetections,
+        scheduleLatestRender,
+        setStatusSafe,
+        wsUrl,
+    ]);
 
     useEffect(() => {
         if (!onMediaLayoutRef.current) return undefined;
@@ -444,6 +548,7 @@ const StreamPlayer = ({
             {status !== 'connected' && (
                 <div className="absolute inset-0 flex items-center justify-center bg-black/50 text-white text-xs">
                     {status === 'connecting' && "Connecting..."}
+                    {status === 'refreshing' && "Refreshing stream..."}
                     {status === 'recovering' && "Recovering stream..."}
                     {status === 'error' && "Connection Error"}
                     {status === 'disconnected' && "Offline"}

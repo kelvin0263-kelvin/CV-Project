@@ -5,7 +5,7 @@ import uuid
 
 
 _runtime_lock = threading.Lock()
-CAPACITY_ALERT_PERSIST_SEC = 5.0
+CAPACITY_ALERT_PERSIST_SEC = 60
 _building_config = {
     "enabled": True,
     "max_capacity": None,

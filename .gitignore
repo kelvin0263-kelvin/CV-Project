@@ -52,7 +52,10 @@ backend/yolo26n-pose.pt
 backend/yolo26s-pose.pt
 backend/yolo11m-pose.pt
 backend/yolov8n.pt
-
+backend/best.engine
+backend/best.onnx
+backend/slipper-cls-best.engine
+backend/slipper-cls-best.onnx
 
 scripts/dataset_output
 scripts/prediction_runs

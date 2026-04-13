@@ -13,6 +13,8 @@ const WebSocketPlayer = ({ wsUrl, className, alt, onStats }) => {
     //2. store a value that does not change over time
     const imgRef = useRef(null);
     const wsRef = useRef(null);
+    const latestFrameBlobRef = useRef(null);
+    const activeImageUrlRef = useRef(null);
     // useState is a hook that process state (variable that changes over time)
     //status is the variable
     // setStatus is the only function to update the variable
@@ -21,6 +23,19 @@ const WebSocketPlayer = ({ wsUrl, className, alt, onStats }) => {
     // -> because we want to trigger re-render when status changes
     // if we use normal variable, it will use the old value not the new value
     const [status, setStatus] = useState('connecting');
+
+    const revokeActiveImageUrl = () => {
+        if (!activeImageUrlRef.current) return;
+        URL.revokeObjectURL(activeImageUrlRef.current);
+        activeImageUrlRef.current = null;
+    };
+
+    const clearImage = () => {
+        revokeActiveImageUrl();
+        if (imgRef.current) {
+            imgRef.current.removeAttribute('src');
+        }
+    };
 
     // use effect is a hook that process side effects (action that not related to the render)
     // accept 2 parameters
@@ -37,7 +52,9 @@ const WebSocketPlayer = ({ wsUrl, className, alt, onStats }) => {
         }
 
         const ws = new WebSocket(wsUrl);
+        ws.binaryType = 'blob';
         wsRef.current = ws;
+        latestFrameBlobRef.current = null;
 
         ws.onopen = () => {
             console.log(`Connected to ${wsUrl}`);
@@ -46,12 +63,23 @@ const WebSocketPlayer = ({ wsUrl, className, alt, onStats }) => {
 
         ws.onmessage = (event) => {
             try {
+                if (typeof event.data !== 'string') {
+                    latestFrameBlobRef.current = event.data instanceof Blob
+                        ? event.data
+                        : new Blob([event.data], { type: 'image/jpeg' });
+                    return;
+                }
+
                 const data = JSON.parse(event.data);
-                if (data.image && imgRef.current) {
-                    imgRef.current.src = `data:image/jpeg;base64,${data.image}`;
+                if (data.has_image && latestFrameBlobRef.current && imgRef.current) {
+                    const nextImageUrl = URL.createObjectURL(latestFrameBlobRef.current);
+                    revokeActiveImageUrl();
+                    activeImageUrlRef.current = nextImageUrl;
+                    imgRef.current.src = nextImageUrl;
                     setStatus('connected');
                 } else if (imgRef.current) {
-                    imgRef.current.removeAttribute('src');
+                    latestFrameBlobRef.current = null;
+                    clearImage();
                     setStatus(data.stream_status === 'offline' ? 'disconnected' : 'recovering');
                 }
                 if (data.fps !== undefined && onStats) {
@@ -76,6 +104,8 @@ const WebSocketPlayer = ({ wsUrl, className, alt, onStats }) => {
             if (wsRef.current) {
                 wsRef.current.close();
             }
+            latestFrameBlobRef.current = null;
+            clearImage();
         };
         // parameter 2 dependency array
     }, [wsUrl]);

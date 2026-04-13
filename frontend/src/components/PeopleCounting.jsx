@@ -271,14 +271,14 @@ const PeopleCounting = () => {
     const [isSidebarRestoreHovered, setIsSidebarRestoreHovered] = useState(false);
     const [comparisonCameraConfig, setComparisonCameraConfig] = useState(null);
     const [collapsedSetupSections, setCollapsedSetupSections] = useState({
-        geometry: false,
+        geometry: true,
         activeZone: true,
         buildingGroup: true,
         crossCamera: true,
     });
     const [collapsedBuildingSections, setCollapsedBuildingSections] = useState({
-        occupancy: false,
-        rollups: false,
+        occupancy: true,
+        rollups: true,
     });
 
     const resetCountingConfig = useCallback(() => {
@@ -2158,20 +2158,20 @@ const PeopleCounting = () => {
                     </span>
                 </Button>
             )}
-            <div className="grid gap-6 xl:grid-cols-[auto_minmax(0,1fr)] xl:items-start">
-                <div
-                    className={cn(
-                        'overflow-hidden transition-[max-width,opacity,transform,margin] duration-300 ease-out xl:order-1',
-                        sidebarCollapsed
-                            ? 'max-h-0 opacity-0 -translate-x-4 xl:max-h-none xl:max-w-0 xl:opacity-0 xl:mr-0'
-                            : 'max-h-[4000px] opacity-100 translate-x-0 xl:max-w-[500px] xl:mr-6',
-                    )}
-                >
-                    <div className={cn('min-w-0', sidebarCollapsed && 'pointer-events-none')}>
+            <div
+                className={cn(
+                    'grid gap-6 xl:items-start',
+                    sidebarCollapsed
+                        ? 'xl:grid-cols-[minmax(0,1fr)]'
+                        : 'xl:grid-cols-[minmax(360px,500px)_minmax(0,1fr)]',
+                )}
+            >
+                {!sidebarCollapsed && (
+                    <div className="min-w-0 xl:order-1">
                         {settingsPanel}
                     </div>
-                </div>
-                <div className="min-w-0 xl:order-2">
+                )}
+                <div className={cn('min-w-0', sidebarCollapsed ? 'xl:order-1' : 'xl:order-2')}>
                     {videoPanel}
                 </div>
             </div>
