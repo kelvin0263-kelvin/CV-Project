@@ -1,27 +1,29 @@
 const AUTH_CHANGE_EVENT = 'app-auth-change';
 
+const normalizeBaseUrl = (value) => String(value || '').trim().replace(/\/+$/, '');
+
 // Dynamic API URL getter - must be called at runtime in browser
 export const getApiBaseUrl = () => {
-    if (typeof window === 'undefined') {
-        return 'http://localhost:8000';
-    }
-
     if (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_URL) {
-        return import.meta.env.VITE_API_URL;
+        return normalizeBaseUrl(import.meta.env.VITE_API_URL);
     }
 
-    const hostname = window.location.hostname;
-
-    if (hostname.includes('runpod')) {
-        const newHost = hostname.replace(/-5173/, '-8000');
-        return `${window.location.protocol}//${newHost}`;
+    if (typeof window !== 'undefined') {
+        return normalizeBaseUrl(window.location.origin);
     }
 
     return 'http://localhost:8000';
 };
 
 export const getWSUrl = (endpoint) => {
-    const baseUrl = getApiBaseUrl();
+    const configuredWsBase = (
+        typeof import.meta !== 'undefined' &&
+        import.meta.env &&
+        import.meta.env.VITE_WS_URL
+    )
+        ? normalizeBaseUrl(import.meta.env.VITE_WS_URL)
+        : null;
+    const baseUrl = configuredWsBase || getApiBaseUrl();
     const protocol = baseUrl.startsWith('https') ? 'wss' : 'ws';
     const host = baseUrl.replace(/^https?:\/\//, '');
     return `${protocol}://${host}${endpoint}`;

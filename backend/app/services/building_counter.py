@@ -9,6 +9,7 @@ CAPACITY_ALERT_PERSIST_SEC = 60
 _building_config = {
     "enabled": True,
     "max_capacity": None,
+    "building_ids": [],
     "capacity_by_building_id": {},
     "manual_offset": 0,
 }
@@ -33,6 +34,7 @@ def sync_building_runtime(building_config: dict, sensor_configs: dict[str, dict]
         _building_config = {
             "enabled": bool(building_config.get("enabled", True)),
             "max_capacity": _normalize_max_capacity(building_config.get("max_capacity")),
+            "building_ids": _normalize_building_ids(building_config.get("building_ids")),
             "capacity_by_building_id": _normalize_capacity_map(
                 building_config.get("capacity_by_building_id")
             ),
@@ -107,6 +109,33 @@ def reset_building_runtime(manual_offset: int | None = None):
         _camera_rollups = {}
         _capacity_exceeded_since_by_building_id = {}
         _capacity_alert_fired_by_building_id = {}
+
+
+def remove_building_rollup(building_id: str):
+    """Remove one building's live aggregated totals from runtime state."""
+    global _raw_in, _raw_out
+
+    normalized_building_id = str(building_id or "").strip()
+    if not normalized_building_id:
+        return
+
+    with _runtime_lock:
+        rollup = _entrance_rollups.pop(normalized_building_id, None)
+        if rollup:
+            _raw_in = max(0, _raw_in - int(rollup.get("total_in", 0) or 0))
+            _raw_out = max(0, _raw_out - int(rollup.get("total_out", 0) or 0))
+
+        empty_camera_ids: list[str] = []
+        for camera_id, camera_rollup in _camera_rollups.items():
+            entrances = camera_rollup.get("entrances", {})
+            entrances.pop(normalized_building_id, None)
+            if not entrances:
+                empty_camera_ids.append(camera_id)
+
+        for camera_id in empty_camera_ids:
+            _camera_rollups.pop(camera_id, None)
+
+        _sync_capacity_alert_state_locked()
 
 
 def ingest_sensor_events(camera_id: str, events: list[dict]):
@@ -298,6 +327,7 @@ def get_building_summary() -> dict:
             "capacity_exceeded": bool(monitoring_enabled and exceeded_building_ids),
             "exceeded_building_ids": exceeded_building_ids,
             "default_max_capacity": _normalize_max_capacity(_building_config.get("max_capacity")),
+            "building_ids": list(_building_config.get("building_ids") or []),
             "capacity_by_building_id": dict(_building_config.get("capacity_by_building_id") or {}),
             "manual_offset": manual_offset,
             "raw_in": _raw_in,
@@ -340,12 +370,29 @@ def _normalize_capacity_map(raw_map) -> dict[str, int]:
     return normalized
 
 
+def _normalize_building_ids(raw_value) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    if not isinstance(raw_value, list):
+        return normalized
+
+    for raw_building_id in raw_value:
+        building_id = str(raw_building_id or "").strip()
+        if not building_id or building_id in seen:
+            continue
+        seen.add(building_id)
+        normalized.append(building_id)
+    return normalized
+
+
 def _get_entrance_ids_locked() -> set[str]:
     entrance_ids = {
         cfg["building_id"]
         for cfg in _sensor_configs.values()
         if cfg.get("enabled", True) and cfg.get("building_id")
     }
+    entrance_ids.update(_building_config.get("building_ids") or [])
+    entrance_ids.update((_building_config.get("capacity_by_building_id") or {}).keys())
     entrance_ids.update(_entrance_rollups.keys())
     return entrance_ids
 

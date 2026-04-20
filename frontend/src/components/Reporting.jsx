@@ -1135,6 +1135,21 @@ const aggregateBuildingEntranceContribution = (rows, { startMs = null, endMs = n
 };
 
 const formatPercent = (value) => `${Number(value || 0).toFixed(1)}%`;
+const formatDetailedPercent = (value) => {
+    const numeric = Number(value || 0);
+    if (!Number.isFinite(numeric) || numeric === 0) return '0.0%';
+    if (Math.abs(numeric) >= 10) return `${numeric.toFixed(1)}%`;
+    if (Math.abs(numeric) >= 1) return `${numeric.toFixed(2)}%`;
+    if (Math.abs(numeric) >= 0.1) return `${numeric.toFixed(3)}%`;
+    return `${numeric.toFixed(4)}%`;
+};
+
+const isWithinTimeBounds = (tsMs, { startMs = null, endMs = null } = {}) => {
+    if (!Number.isFinite(tsMs)) return false;
+    if (startMs != null && tsMs < startMs) return false;
+    if (endMs != null && tsMs > endMs) return false;
+    return true;
+};
 
 const getPeakTwoHourLabel = (events) => {
     const byWindow = new Map();
@@ -1174,7 +1189,11 @@ const normalizeDressCodeSubtype = (label) => {
 };
 
 const aggregateDressCodeAnalytics = (events, snapshots, { startMs = null, endMs = null, bucket = null } = {}) => {
-    const relevantEvents = events.filter((evt) => evt.event_type === 'Dress Code Violation');
+    const relevantEvents = events.filter((evt) => {
+        if (evt.event_type !== 'Dress Code Violation') return false;
+        const tsMs = getReportTimeMs(evt);
+        return isWithinTimeBounds(tsMs, { startMs, endMs });
+    });
     const trafficBucket = bucket || getAdaptiveFlowBucket('custom', startMs, endMs);
     const normalizedSnapshots = normalizeSnapshotRows(snapshots);
     const snapshotsByCamera = new Map();
@@ -1237,10 +1256,6 @@ const aggregateDressCodeAnalytics = (events, snapshots, { startMs = null, endMs 
         violationBucketMap.set(bucketStartMs, bucketEntry);
     });
 
-    const scopedCameraIds = new Set([
-        ...Array.from(snapshotsByCamera.keys()),
-        ...Array.from(violationCameraIds),
-    ]);
     const denominatorSeriesByCamera = new Map();
     const denominatorTotalByCamera = new Map();
     const denominatorSourceByCamera = new Map();
@@ -1289,6 +1304,11 @@ const aggregateDressCodeAnalytics = (events, snapshots, { startMs = null, endMs 
             );
         }
     });
+
+    const scopedCameraIds = new Set([
+        ...Array.from(denominatorTotalByCamera.keys()),
+        ...Array.from(violationCameraIds),
+    ]);
 
     const eligibleUniqueViolatorCountByCamera = new Map(
         Array.from(uniqueViolatorKeysByCamera.entries())
@@ -2329,27 +2349,38 @@ const DressCodeAnalyticsPanel = ({ events, snapshots, cameraLabel, startMs, endM
                     <CardContent className="flex-1 min-h-[260px]">
                         {chartAnalytics.rateSeries.length > 0 ? (
                             <ResponsiveContainer width="100%" height="100%">
-                                <LineChart data={chartAnalytics.rateSeries} margin={{ top: 10, right: 10, left: 8, bottom: 0 }}>
+                                <ComposedChart data={chartAnalytics.rateSeries} margin={{ top: 10, right: 10, left: 8, bottom: 0 }}>
                                     <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
                                     <XAxis dataKey="label" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
                                     <YAxis
+                                        yAxisId="rate"
                                         width={42}
                                         className="text-xs text-muted-foreground"
                                         tickLine={false}
                                         axisLine={false}
                                         tickFormatter={(value) => `${Math.round(Number(value || 0))}%`}
-                                        domain={[0, 'auto']}
+                                        domain={[0, 100]}
+                                    />
+                                    <YAxis
+                                        yAxisId="count"
+                                        orientation="right"
+                                        width={42}
+                                        className="text-xs text-muted-foreground"
+                                        tickLine={false}
+                                        axisLine={false}
+                                        allowDecimals={false}
+                                        tickFormatter={(value) => formatNumber(value)}
                                     />
                                     <RechartsTooltip
                                         cursor={{ strokeDasharray: '3 3' }}
                                         labelFormatter={(_, payload) => payload?.[0]?.payload?.fullLabel || ''}
-                                        formatter={(value, name) => [name === 'Violation Rate' ? formatPercent(value) : formatNumber(value), name]}
+                                        formatter={(value, name) => [name === 'Violation Rate' ? formatDetailedPercent(value) : formatNumber(value), name]}
                                         contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
                                     />
                                     <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
-                                    <Bar dataKey="violations" name="Violations" fill="#fca5a5" radius={[4, 4, 0, 0]} maxBarSize={26} />
-                                    <Line type="monotone" dataKey="violationRate" name="Violation Rate" stroke="#dc2626" strokeWidth={2.5} dot={false} />
-                                </LineChart>
+                                    <Bar yAxisId="count" dataKey="violations" name="Violations" fill="#fca5a5" radius={[4, 4, 0, 0]} maxBarSize={26} />
+                                    <Line yAxisId="rate" type="monotone" dataKey="violationRate" name="Violation Rate" stroke="#dc2626" strokeWidth={2.5} dot={false} />
+                                </ComposedChart>
                             </ResponsiveContainer>
                         ) : (
                             <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
@@ -4034,8 +4065,33 @@ const Reporting = () => {
             startMs: reportingDateBounds.startMs,
             endMs: reportingDateBounds.endMs,
             bucket: '1d',
-        }).series.slice(-14)
+        }).series
     ), [reportingDateBounds.endMs, reportingDateBounds.startMs, selectedCountingSnapshots]);
+    const dailyDetectionSeries = useMemo(() => {
+        const byDay = new Map();
+
+        filteredEvents.forEach((evt) => {
+            const tsMs = getReportTimeMs(evt);
+            if (!tsMs) return;
+
+            const dayStartMs = getBucketStartMs(tsMs, '1d');
+            const existing = byDay.get(dayStartMs);
+            if (existing) {
+                existing.violations += 1;
+                return;
+            }
+
+            byDay.set(dayStartMs, {
+                tsMs: dayStartMs,
+                name: formatFlowBucketTick(dayStartMs, '1d'),
+                violations: 1,
+            });
+        });
+
+        return Array.from(byDay.values())
+            .sort((a, b) => a.tsMs - b.tsMs)
+            .map(({ tsMs, ...point }) => point);
+    }, [filteredEvents]);
     const shouldUseRtspSnapshotTotals = useMemo(() => (
         isSourceOnlySnapshotScope(selectedCountingSnapshots, cameraSourceKindById, 'live', effectiveSourceFilter)
     ), [cameraSourceKindById, effectiveSourceFilter, selectedCountingSnapshots]);
@@ -4119,8 +4175,7 @@ const Reporting = () => {
         return detectionRows;
     })();
 
-    // Build chart data
-    const chartData = (() => {
+    const chartData = useMemo(() => {
         if (selectedCategory === 'People Counting') {
             return dailyFlowSeries.map((point) => ({
                 name: point.label,
@@ -4128,17 +4183,9 @@ const Reporting = () => {
                 totalOut: point.out,
             }));
         }
-        // Detection events aggregated by day
-        const byDay = {};
-        filteredEvents.forEach(evt => {
-            const parsed = getReportTime(evt);
-            if (!parsed) return;
-            const day = parsed.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-            if (!byDay[day]) byDay[day] = { name: day, violations: 0 };
-            byDay[day].violations++;
-        });
-        return Object.values(byDay).slice(-7);
-    })();
+
+        return dailyDetectionSeries;
+    }, [dailyDetectionSeries, dailyFlowSeries, selectedCategory]);
 
     const isPeopleCountingChart = isPeopleCountingCategory;
     const showStandardReportSections = !isOverviewCategory && !isPeopleCountingBuildingView && !isPeopleCountingTrafficView;

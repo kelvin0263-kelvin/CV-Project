@@ -14,7 +14,18 @@ export default defineConfig({
     allowedHosts: true, // Allow all hosts (RunPod changing URLs)
     hmr: {
       clientPort: 443, // RunPod exposes via HTTPS (443)
-    }
+    },
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/ws': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+        ws: true,
+      },
+    },
   },
   resolve: {
     alias: {

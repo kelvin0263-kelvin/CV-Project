@@ -38,6 +38,7 @@ from app.schemas.people_counting import (
 from app.services.building_counter import (
     get_building_summary,
     poll_building_capacity_alert,
+    remove_building_rollup,
     reset_camera_rollup,
     reset_building_runtime,
     restore_building_runtime,
@@ -118,6 +119,75 @@ def _normalize_capacity_by_building_id(raw_value) -> dict[str, int]:
             normalized[building_id] = parsed_capacity
 
     return normalized
+
+
+def _normalize_registered_building_ids(raw_value) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    if not isinstance(raw_value, list):
+        return normalized
+
+    for raw_building_id in raw_value:
+        building_id = _normalize_building_id(raw_building_id)
+        if not building_id or building_id in seen:
+            continue
+        seen.add(building_id)
+        normalized.append(building_id)
+
+    return normalized
+
+
+def _merge_registered_building_ids(*building_id_groups) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+
+    for group in building_id_groups:
+        for raw_building_id in group or []:
+            building_id = _normalize_building_id(raw_building_id)
+            if not building_id or building_id in seen:
+                continue
+            seen.add(building_id)
+            merged.append(building_id)
+
+    return merged
+
+
+async def _get_assigned_camera_labels_for_building_id(
+    session: AsyncSession,
+    building_id: str,
+) -> list[str]:
+    normalized_building_id = _normalize_building_id(building_id)
+    if not normalized_building_id:
+        return []
+
+    result = await session.execute(
+        select(PeopleCountingConfig.camera_id, Camera.name)
+        .select_from(PeopleCountingConfig)
+        .join(Camera, Camera.id == PeopleCountingConfig.camera_id, isouter=True)
+        .where(PeopleCountingConfig.participate_in_building_count.is_(True))
+        .where(PeopleCountingConfig.building_id == normalized_building_id)
+    )
+
+    assigned_camera_labels: list[str] = []
+    for camera_id, camera_name in result.all():
+        label = str(camera_name or "").strip() or str(camera_id or "").strip()
+        if label:
+            assigned_camera_labels.append(label)
+
+    return assigned_camera_labels
+
+
+async def _get_assigned_building_ids(session: AsyncSession) -> list[str]:
+    result = await session.execute(
+        select(PeopleCountingConfig.building_id)
+        .where(PeopleCountingConfig.participate_in_building_count.is_(True))
+        .where(PeopleCountingConfig.building_id.is_not(None))
+    )
+
+    return _normalize_registered_building_ids([
+        building_id
+        for (building_id,) in result.all()
+    ])
 
 
 def get_counting_config(camera_id: str) -> dict | None:
@@ -859,6 +929,7 @@ async def _get_or_create_building_config(session: AsyncSession) -> BuildingCount
             id="default-building-counting-config",
             enabled=True,
             max_capacity=None,
+            building_ids=[],
             capacity_by_building_id={},
             manual_offset=0,
         )
@@ -1114,13 +1185,18 @@ async def sync_counting_runtime_from_db(session: AsyncSession):
     _live_counts = next_live_counts
 
     building_config = await _get_or_create_building_config(session)
+    normalized_capacity_map = _normalize_capacity_by_building_id(building_config.capacity_by_building_id)
+    registered_building_ids = _merge_registered_building_ids(
+        _normalize_registered_building_ids(building_config.building_ids),
+        normalized_capacity_map.keys(),
+        [cfg.get("building_id") for cfg in building_sensor_configs.values()],
+    )
     sync_building_runtime(
         {
             "enabled": building_config.enabled,
             "max_capacity": building_config.max_capacity,
-            "capacity_by_building_id": _normalize_capacity_by_building_id(
-                building_config.capacity_by_building_id
-            ),
+            "building_ids": registered_building_ids,
+            "capacity_by_building_id": normalized_capacity_map,
             "manual_offset": building_config.manual_offset,
         },
         building_sensor_configs,
@@ -1383,6 +1459,12 @@ async def reset_camera_counting(camera_id: str):
 @router.get("/api/building-counting-config", response_model=BuildingCountingConfigRead)
 async def get_building_config(db: AsyncSession = Depends(get_db)):
     row = await _get_or_create_building_config(db)
+    assigned_building_ids = await _get_assigned_building_ids(db)
+    row.building_ids = _merge_registered_building_ids(
+        _normalize_registered_building_ids(row.building_ids),
+        _normalize_capacity_by_building_id(row.capacity_by_building_id).keys(),
+        assigned_building_ids,
+    )
     row.capacity_by_building_id = _normalize_capacity_by_building_id(row.capacity_by_building_id)
     return row
 
@@ -1393,15 +1475,28 @@ async def update_building_config(
     db: AsyncSession = Depends(get_db),
 ):
     row = await _get_or_create_building_config(db)
+    assigned_building_ids = await _get_assigned_building_ids(db)
+    normalized_building_ids = _merge_registered_building_ids(
+        _normalize_registered_building_ids(row.building_ids),
+        _normalize_capacity_by_building_id(row.capacity_by_building_id).keys(),
+        assigned_building_ids,
+    )
     normalized_capacity_map = _normalize_capacity_by_building_id(row.capacity_by_building_id)
 
     if update.enabled is not None:
         row.enabled = update.enabled
+    if update.building_ids is not None:
+        normalized_building_ids = _merge_registered_building_ids(
+            _normalize_registered_building_ids(update.building_ids),
+            assigned_building_ids,
+        )
     if update.capacity_by_building_id is not None:
         normalized_capacity_map = _normalize_capacity_by_building_id(update.capacity_by_building_id)
     if update.building_id is not None:
         normalized_building_id = _normalize_building_id(update.building_id)
         if normalized_building_id:
+            if normalized_building_id not in normalized_building_ids:
+                normalized_building_ids.append(normalized_building_id)
             parsed_capacity = int(update.max_capacity or 0)
             if parsed_capacity > 0:
                 normalized_capacity_map[normalized_building_id] = parsed_capacity
@@ -1409,15 +1504,72 @@ async def update_building_config(
                 normalized_capacity_map.pop(normalized_building_id, None)
     elif update.max_capacity is not None:
         row.max_capacity = int(update.max_capacity) if int(update.max_capacity) > 0 else None
+    row.building_ids = _merge_registered_building_ids(
+        normalized_building_ids,
+        normalized_capacity_map.keys(),
+        assigned_building_ids,
+    )
     row.capacity_by_building_id = normalized_capacity_map
     if update.manual_offset is not None:
         row.manual_offset = int(update.manual_offset)
 
     await db.flush()
     await db.refresh(row)
+    assigned_building_ids = await _get_assigned_building_ids(db)
+    row.building_ids = _merge_registered_building_ids(
+        _normalize_registered_building_ids(row.building_ids),
+        _normalize_capacity_by_building_id(row.capacity_by_building_id).keys(),
+        assigned_building_ids,
+    )
     row.capacity_by_building_id = _normalize_capacity_by_building_id(row.capacity_by_building_id)
     await sync_counting_runtime_from_db(db)
     request_building_snapshot_if_needed()
+    return row
+
+
+@router.delete("/api/building-counting-config/{building_id}", response_model=BuildingCountingConfigRead)
+async def delete_building_id_config(
+    building_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    normalized_building_id = _normalize_building_id(building_id)
+    if not normalized_building_id:
+        raise HTTPException(status_code=400, detail="building_id is required.")
+
+    assigned_camera_labels = await _get_assigned_camera_labels_for_building_id(db, normalized_building_id)
+    if assigned_camera_labels:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot delete building ID '{normalized_building_id}' because it is still assigned to: "
+                f"{', '.join(sorted(assigned_camera_labels, key=str.lower))}."
+            ),
+        )
+
+    row = await _get_or_create_building_config(db)
+    normalized_building_ids = [
+        registered_building_id
+        for registered_building_id in _normalize_registered_building_ids(row.building_ids)
+        if registered_building_id != normalized_building_id
+    ]
+    normalized_capacity_map = _normalize_capacity_by_building_id(row.capacity_by_building_id)
+    normalized_capacity_map.pop(normalized_building_id, None)
+
+    row.building_ids = normalized_building_ids
+    row.capacity_by_building_id = normalized_capacity_map
+
+    await db.flush()
+    await db.refresh(row)
+    await sync_counting_runtime_from_db(db)
+    remove_building_rollup(normalized_building_id)
+    request_building_snapshot_if_needed()
+
+    assigned_building_ids = await _get_assigned_building_ids(db)
+    row.building_ids = _merge_registered_building_ids(
+        _normalize_registered_building_ids(row.building_ids),
+        assigned_building_ids,
+    )
+    row.capacity_by_building_id = _normalize_capacity_by_building_id(row.capacity_by_building_id)
     return row
 
 

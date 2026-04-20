@@ -29,6 +29,7 @@ const EMPTY_BUILDING_SUMMARY = {
     capacity_exceeded: false,
     exceeded_building_ids: [],
     default_max_capacity: null,
+    building_ids: [],
     capacity_by_building_id: {},
     manual_offset: 0,
     raw_in: 0,
@@ -38,6 +39,8 @@ const EMPTY_BUILDING_SUMMARY = {
     active_camera_count: 0,
     entrance_summaries: {},
 };
+
+const SUCCESS_REFRESH_DELAY_MS = 1200;
 
 const CONFIG_TABS = [
     { id: 'setup', label: 'Setup', hint: 'Lines, zones, entrance, and verification' },
@@ -256,12 +259,16 @@ const PeopleCounting = () => {
     const [pairedVerifierReady, setPairedVerifierReady] = useState(false);
     const [resolvingPairedVerifier, setResolvingPairedVerifier] = useState(false);
     const [buildingEnabled, setBuildingEnabled] = useState(true);
+    const [registeredBuildingIds, setRegisteredBuildingIds] = useState([]);
+    const [newBuildingId, setNewBuildingId] = useState('');
     const [selectedCapacityBuildingId, setSelectedCapacityBuildingId] = useState('');
     const [buildingCapacityById, setBuildingCapacityById] = useState({});
     const [buildingMaxCapacity, setBuildingMaxCapacity] = useState('');
     const [buildingManualOffset, setBuildingManualOffset] = useState('0');
     const [buildingSummary, setBuildingSummary] = useState(EMPTY_BUILDING_SUMMARY);
+    const [addingBuildingId, setAddingBuildingId] = useState(false);
     const [resettingBuilding, setResettingBuilding] = useState(false);
+    const [deletingBuildingId, setDeletingBuildingId] = useState('');
     const [resettingCamera, setResettingCamera] = useState(false);
     const [confirmDialog, setConfirmDialog] = useState(null);
     const [activeTab, setActiveTab] = useState('setup');
@@ -277,7 +284,7 @@ const PeopleCounting = () => {
         crossCamera: true,
     });
     const [collapsedBuildingSections, setCollapsedBuildingSections] = useState({
-        occupancy: true,
+        occupancy: false,
         rollups: true,
     });
 
@@ -509,6 +516,7 @@ const PeopleCounting = () => {
                 }
                 const data = await res.json();
                 setBuildingEnabled(data.enabled ?? true);
+                setRegisteredBuildingIds(Array.isArray(data.building_ids) ? data.building_ids : []);
                 setBuildingCapacityById(data.capacity_by_building_id ?? {});
                 setBuildingManualOffset(String(data.manual_offset ?? 0));
             } catch (err) {
@@ -524,43 +532,104 @@ const PeopleCounting = () => {
     }, [stoppedPreviewStateByCamera]);
 
     const buildingIdOptions = useMemo(() => Array.from(new Set([
+        ...(Array.isArray(registeredBuildingIds) ? registeredBuildingIds : []),
         ...Object.keys(buildingSummary.entrance_summaries ?? {}),
         ...Object.keys(buildingCapacityById ?? {}),
+    ]))
+        .filter(Boolean)
+        .sort((left, right) => String(left).localeCompare(String(right), undefined, {
+            numeric: true,
+            sensitivity: 'base',
+        })), [buildingCapacityById, buildingSummary.entrance_summaries, registeredBuildingIds]);
+
+    const cameraBuildingIdOptions = useMemo(() => Array.from(new Set([
+        ...buildingIdOptions,
         ...(buildingId ? [buildingId] : []),
     ]))
         .filter(Boolean)
         .sort((left, right) => String(left).localeCompare(String(right), undefined, {
             numeric: true,
             sensitivity: 'base',
-        })), [buildingCapacityById, buildingId, buildingSummary.entrance_summaries]);
+        })), [buildingId, buildingIdOptions]);
 
     useEffect(() => {
-        if (!buildingIdOptions.length) {
-            if (selectedCapacityBuildingId) {
-                setSelectedCapacityBuildingId('');
-            }
+        if (selectedCapacityBuildingId.trim()) {
             return;
         }
 
-        if (selectedCapacityBuildingId && buildingIdOptions.includes(selectedCapacityBuildingId)) {
-            return;
-        }
+        const normalizedBuildingId = buildingId.trim();
+        const preferredBuildingId = normalizedBuildingId || buildingIdOptions[0] || '';
 
-        const preferredBuildingId = buildingId && buildingIdOptions.includes(buildingId)
-            ? buildingId
-            : buildingIdOptions[0];
-        setSelectedCapacityBuildingId(preferredBuildingId);
+        if (preferredBuildingId !== selectedCapacityBuildingId) {
+            setSelectedCapacityBuildingId(preferredBuildingId);
+        }
     }, [buildingId, buildingIdOptions, selectedCapacityBuildingId]);
 
     useEffect(() => {
-        if (!selectedCapacityBuildingId) {
+        const normalizedSelectedCapacityBuildingId = selectedCapacityBuildingId.trim();
+
+        if (!normalizedSelectedCapacityBuildingId) {
             setBuildingMaxCapacity('');
             return;
         }
 
-        const nextCapacity = buildingCapacityById?.[selectedCapacityBuildingId];
+        const nextCapacity = buildingCapacityById?.[normalizedSelectedCapacityBuildingId];
         setBuildingMaxCapacity(nextCapacity ? String(nextCapacity) : '');
     }, [buildingCapacityById, selectedCapacityBuildingId]);
+
+    const normalizedNewBuildingId = newBuildingId.trim();
+    const duplicateNewBuildingId = useMemo(() => {
+        if (!normalizedNewBuildingId) {
+            return false;
+        }
+
+        return buildingIdOptions.some((option) => (
+            String(option).trim().toLowerCase() === normalizedNewBuildingId.toLowerCase()
+        ));
+    }, [buildingIdOptions, normalizedNewBuildingId]);
+
+    const handleAddBuildingId = useCallback(async () => {
+        if (!normalizedNewBuildingId) {
+            return;
+        }
+
+        setAddingBuildingId(true);
+        setSaveMessage('');
+
+        try {
+            const nextRegisteredBuildingIds = Array.from(new Set([
+                ...registeredBuildingIds.map((value) => String(value || '').trim()).filter(Boolean),
+                normalizedNewBuildingId,
+            ]));
+
+            const res = await fetch(`${apiUrl}/api/building-counting-config`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    building_ids: nextRegisteredBuildingIds,
+                }),
+            });
+
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.detail || 'Failed to add building ID');
+            }
+
+            setSelectedCapacityBuildingId(normalizedNewBuildingId);
+            if (!buildingId.trim()) {
+                setBuildingId(normalizedNewBuildingId);
+            }
+            setNewBuildingId('');
+            setSaveMessage(`Building ID '${normalizedNewBuildingId}' added successfully`);
+            setAddingBuildingId(false);
+            setTimeout(() => window.location.reload(), SUCCESS_REFRESH_DELAY_MS);
+            return;
+        } catch (err) {
+            setSaveMessage(`Error: ${err.message}`);
+            setTimeout(() => setSaveMessage(''), 3000);
+        }
+        setAddingBuildingId(false);
+    }, [apiUrl, buildingId, normalizedNewBuildingId, registeredBuildingIds]);
 
     useEffect(() => {
         let isMounted = true;
@@ -623,6 +692,12 @@ const PeopleCounting = () => {
         try {
             const parsedPrimaryInEventIdleTimeoutSec = Number.parseFloat(primaryInEventIdleTimeoutSec);
             const parsedPrimaryOutEventIdleTimeoutSec = Number.parseFloat(primaryOutEventIdleTimeoutSec);
+            const normalizedSelectedCapacityBuildingId = selectedCapacityBuildingId.trim();
+            const normalizedRegisteredBuildingIds = Array.from(new Set(
+                registeredBuildingIds
+                    .map((value) => String(value || '').trim())
+                    .filter(Boolean),
+            ));
 
             if (!Number.isFinite(parsedPrimaryInEventIdleTimeoutSec) || parsedPrimaryInEventIdleTimeoutSec < 0) {
                 throw new Error('Primary IN idle timeout must be 0 or greater.');
@@ -676,10 +751,11 @@ const PeopleCounting = () => {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     enabled: buildingEnabled,
+                    building_ids: normalizedRegisteredBuildingIds,
                     manual_offset: parseInt(buildingManualOffset || '0', 10) || 0,
-                    ...(selectedCapacityBuildingId
+                    ...(normalizedSelectedCapacityBuildingId
                         ? {
-                            building_id: selectedCapacityBuildingId,
+                            building_id: normalizedSelectedCapacityBuildingId,
                             max_capacity: buildingMaxCapacity ? parseInt(buildingMaxCapacity, 10) || 0 : 0,
                         }
                         : {}),
@@ -693,6 +769,7 @@ const PeopleCounting = () => {
 
             const savedBuildingConfig = await buildingRes.json();
             setBuildingEnabled(savedBuildingConfig.enabled ?? true);
+            setRegisteredBuildingIds(Array.isArray(savedBuildingConfig.building_ids) ? savedBuildingConfig.building_ids : []);
             setBuildingCapacityById(savedBuildingConfig.capacity_by_building_id ?? {});
             setBuildingManualOffset(String(savedBuildingConfig.manual_offset ?? 0));
 
@@ -788,11 +865,67 @@ const PeopleCounting = () => {
         });
     };
 
+    const openBuildingIdDeleteConfirmation = (targetBuildingId) => {
+        const targetBuilding = selectedBuildingRegistryRow && selectedBuildingRegistryRow.buildingId === targetBuildingId
+            ? selectedBuildingRegistryRow
+            : null;
+        setConfirmDialog({
+            kind: 'delete_building_id',
+            buildingId: targetBuildingId,
+            activeCameraCount: targetBuilding?.activeCameraCount ?? 0,
+        });
+    };
+
     const closeConfirmationDialog = () => {
-        if (resettingBuilding || resettingCamera) {
+        if (resettingBuilding || resettingCamera || Boolean(deletingBuildingId)) {
             return;
         }
         setConfirmDialog(null);
+    };
+
+    const handleDeleteBuildingId = async (targetBuildingId) => {
+        const normalizedTargetBuildingId = String(targetBuildingId || '').trim();
+        if (!normalizedTargetBuildingId) {
+            return;
+        }
+
+        setDeletingBuildingId(normalizedTargetBuildingId);
+        setSaveMessage('');
+
+        try {
+            const deleteRes = await fetch(`${apiUrl}/api/building-counting-config/${encodeURIComponent(normalizedTargetBuildingId)}`, {
+                method: 'DELETE',
+            });
+
+            if (!deleteRes.ok) {
+                const err = await deleteRes.json().catch(() => ({}));
+                throw new Error(err.detail || 'Failed to delete building ID');
+            }
+
+            const savedBuildingConfig = await deleteRes.json();
+            setBuildingEnabled(savedBuildingConfig.enabled ?? true);
+            setRegisteredBuildingIds(Array.isArray(savedBuildingConfig.building_ids) ? savedBuildingConfig.building_ids : []);
+            setBuildingCapacityById(savedBuildingConfig.capacity_by_building_id ?? {});
+            setBuildingManualOffset(String(savedBuildingConfig.manual_offset ?? 0));
+            setSelectedCapacityBuildingId((current) => (
+                current === normalizedTargetBuildingId ? '' : current
+            ));
+
+            const summaryRes = await fetch(`${apiUrl}/api/building-occupancy-summary`);
+            if (summaryRes.ok) {
+                setBuildingSummary(await summaryRes.json());
+            }
+
+            setSaveMessage(`Building ID '${normalizedTargetBuildingId}' deleted successfully`);
+            setDeletingBuildingId('');
+            setTimeout(() => window.location.reload(), SUCCESS_REFRESH_DELAY_MS);
+            return;
+        } catch (err) {
+            setSaveMessage(`Error: ${err.message}`);
+        }
+
+        setDeletingBuildingId('');
+        setTimeout(() => setSaveMessage(''), 3000);
     };
 
     const handleConfirmDialogConfirm = async () => {
@@ -827,6 +960,12 @@ const PeopleCounting = () => {
 
         if (confirmDialog.kind === 'delete_area') {
             setFrameExcludeAreas((prevAreas) => prevAreas.filter((area) => area.id !== confirmDialog.areaId));
+            setConfirmDialog(null);
+            return;
+        }
+
+        if (confirmDialog.kind === 'delete_building_id') {
+            await handleDeleteBuildingId(confirmDialog.buildingId);
             setConfirmDialog(null);
         }
     };
@@ -970,6 +1109,21 @@ const PeopleCounting = () => {
     const selectedBuildingCapacitySummary = selectedCapacityBuildingId
         ? (buildingGroupSummaries[selectedCapacityBuildingId] || null)
         : null;
+    const selectedBuildingRegistryRow = useMemo(() => {
+        if (!selectedCapacityBuildingId) {
+            return null;
+        }
+
+        const summary = buildingGroupSummaries[selectedCapacityBuildingId] || {};
+        const activeCameraCountForBuilding = Array.isArray(summary.camera_ids) ? summary.camera_ids.length : 0;
+        return {
+            buildingId: selectedCapacityBuildingId,
+            capacity: buildingCapacityById?.[selectedCapacityBuildingId] ?? null,
+            occupancy: summary.occupancy ?? 0,
+            activeCameraCount: activeCameraCountForBuilding,
+            canDelete: activeCameraCountForBuilding === 0,
+        };
+    }, [buildingCapacityById, buildingGroupSummaries, selectedCapacityBuildingId]);
     const buildingUtilizationSubtitle = buildingSummary.max_capacity && Number(buildingSummary.max_capacity) > 0
         ? `Utilization rate ${Math.round(((buildingSummary.occupancy ?? 0) / Number(buildingSummary.max_capacity)) * 100)}%`
         : null;
@@ -1596,7 +1750,26 @@ const PeopleCounting = () => {
                 {participateInBuildingCount && (
                     <div className="space-y-2">
                         <label className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Building ID</label>
-                        <input type="text" className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm" value={buildingId} onChange={(e) => setBuildingId(e.target.value)} placeholder="building_1" />
+                        <select
+                            className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm"
+                            value={buildingId}
+                            onChange={(e) => setBuildingId(e.target.value)}
+                            disabled={!cameraBuildingIdOptions.length}
+                        >
+                            <option value="">
+                                {cameraBuildingIdOptions.length > 0
+                                    ? 'Select a building ID'
+                                    : 'Create a building ID in the Building tab first'}
+                            </option>
+                            {cameraBuildingIdOptions.map((option) => (
+                                <option key={option} value={option}>{option}</option>
+                            ))}
+                        </select>
+                        <p className="text-xs text-muted-foreground">
+                            {cameraBuildingIdOptions.length > 0
+                                ? 'Camera grouping now uses the building IDs created in the Building tab.'
+                                : 'No building IDs exist yet. Create one in the Building tab before assigning this camera.'}
+                        </p>
                     </div>
                 )}
             </SectionShell>
@@ -1715,60 +1888,130 @@ const PeopleCounting = () => {
                     </div>
                     <Toggle checked={buildingEnabled} onClick={() => setBuildingEnabled(!buildingEnabled)} />
                 </div>
-                <div className="grid gap-3 sm:grid-cols-2">
-                    <div className="space-y-2">
-                        <label className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Building ID</label>
-                        <select
-                            className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm"
-                            value={selectedCapacityBuildingId}
-                            onChange={(e) => setSelectedCapacityBuildingId(e.target.value)}
-                            disabled={!buildingIdOptions.length}
-                        >
-                            {buildingIdOptions.length > 0 ? (
-                                buildingIdOptions.map((option) => (
+                {buildingEnabled && (
+                    <>
+                        <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
+                            <div className="space-y-2">
+                                <label className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">New Building ID</label>
+                                <input
+                                    type="text"
+                                    className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm"
+                                    value={newBuildingId}
+                                    onChange={(e) => setNewBuildingId(e.target.value)}
+                                    placeholder="building_1"
+                                />
+                                {duplicateNewBuildingId && (
+                                    <p className="text-xs text-amber-600">
+                                        This building ID already exists. Select it below in `Manage Building ID`.
+                                    </p>
+                                )}
+                            </div>
+                            <div className="flex items-end">
+                                <Button
+                                    type="button"
+                                    variant="outline"
+                                    className="w-full sm:w-auto"
+                                    onClick={handleAddBuildingId}
+                                    disabled={!normalizedNewBuildingId || duplicateNewBuildingId || addingBuildingId}
+                                >
+                                    {addingBuildingId ? 'Adding...' : 'Add Building ID'}
+                                </Button>
+                            </div>
+                        </div>
+                        <div className="space-y-2">
+                            <label className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Manage Building ID</label>
+                            <select
+                                className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm"
+                                value={selectedCapacityBuildingId}
+                                onChange={(e) => setSelectedCapacityBuildingId(e.target.value)}
+                                disabled={!buildingIdOptions.length}
+                            >
+                                <option value="">
+                                    {buildingIdOptions.length > 0 ? 'Select a building ID' : 'Add a building ID first'}
+                                </option>
+                                {buildingIdOptions.map((option) => (
                                     <option key={option} value={option}>{option}</option>
-                                ))
-                            ) : (
-                                <option value="">No building IDs yet</option>
-                            )}
-                        </select>
-                    </div>
-                    <div className="space-y-2">
-                        <label className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Building Capacity</label>
-                        <input
-                            type="number"
-                            min="1"
-                            placeholder={selectedCapacityBuildingId ? 'e.g. 200' : 'Select a building ID first'}
-                            className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm"
-                            value={buildingMaxCapacity}
-                            onChange={(e) => setBuildingMaxCapacity(e.target.value)}
-                            disabled={!selectedCapacityBuildingId}
-                        />
-                    </div>
-                </div>
-                <div className="space-y-2">
-                    <label className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Manual Offset</label>
-                    <input type="number" className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm" value={buildingManualOffset} onChange={(e) => setBuildingManualOffset(e.target.value)} />
-                </div>
-                <div className="grid gap-3 sm:grid-cols-3">
-                    <StatTile label="Building In" value={buildingSummary.raw_in ?? 0} icon={ArrowDownToLine} tone="green" />
-                    <StatTile label="Building Out" value={buildingSummary.raw_out ?? 0} icon={ArrowUpFromLine} tone="red" />
-                    <StatTile label="Building Now" value={buildingSummary.occupancy ?? 0} icon={Building2} tone={buildingCapacityExceeded ? 'amber' : 'default'} subtitle={buildingUtilizationSubtitle} />
-                </div>
-                <div className="rounded-2xl border border-border/70 bg-background px-4 py-3 text-sm text-muted-foreground">
-                    Active cameras: {buildingSummary.active_camera_count ?? 0} | Raw occupancy: {buildingSummary.raw_occupancy ?? 0} | Manual offset: {buildingSummary.manual_offset ?? 0}
-                </div>
-                {buildingCapacityExceeded && (
-                    <div className="rounded-2xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-500">
-                        {exceededBuildingIds.length > 0
-                            ? `Capacity exceeded for: ${exceededBuildingIds.join(', ')}.`
-                            : 'Building capacity exceeded.'}
-                    </div>
+                                ))}
+                            </select>
+                            <p className="text-xs text-muted-foreground">
+                                {buildingIdOptions.length > 0
+                                    ? 'Choose one building ID to manage its settings and remove it if needed.'
+                                    : 'No building IDs exist yet. Add the first one above.'}
+                            </p>
+                        </div>
+                        {selectedCapacityBuildingId.trim() && (
+                            <>
+                                <div className="grid gap-3 sm:grid-cols-2">
+                                    <div className="space-y-2">
+                                        <label className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Building Capacity</label>
+                                        <input
+                                            type="number"
+                                            min="1"
+                                            placeholder="e.g. 200"
+                                            className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm"
+                                            value={buildingMaxCapacity}
+                                            onChange={(e) => setBuildingMaxCapacity(e.target.value)}
+                                        />
+                                    </div>
+                                    <div className="space-y-2">
+                                        <label className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Manual Offset</label>
+                                        <input
+                                            type="number"
+                                            className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm"
+                                            value={buildingManualOffset}
+                                            onChange={(e) => setBuildingManualOffset(e.target.value)}
+                                        />
+                                    </div>
+                                </div>
+                                <div className="grid gap-3 sm:grid-cols-3">
+                                    <StatTile label="Building In" value={buildingSummary.raw_in ?? 0} icon={ArrowDownToLine} tone="green" />
+                                    <StatTile label="Building Out" value={buildingSummary.raw_out ?? 0} icon={ArrowUpFromLine} tone="red" />
+                                    <StatTile label="Building Now" value={buildingSummary.occupancy ?? 0} icon={Building2} tone={buildingCapacityExceeded ? 'amber' : 'default'} subtitle={buildingUtilizationSubtitle} />
+                                </div>
+                                <div className="rounded-2xl border border-border/70 bg-background px-4 py-3 text-sm text-muted-foreground">
+                                    Active cameras: {buildingSummary.active_camera_count ?? 0} | Raw occupancy: {buildingSummary.raw_occupancy ?? 0} | Manual offset: {buildingSummary.manual_offset ?? 0}
+                                </div>
+                                {buildingCapacityExceeded && (
+                                    <div className="rounded-2xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-500">
+                                        {exceededBuildingIds.length > 0
+                                            ? `Capacity exceeded for: ${exceededBuildingIds.join(', ')}.`
+                                            : 'Building capacity exceeded.'}
+                                    </div>
+                                )}
+                                {selectedBuildingRegistryRow && (
+                                    <div className="flex flex-col gap-3 rounded-2xl border border-border/70 bg-background px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+                                        <div className="min-w-0 flex-1">
+                                            <div className="text-sm font-medium">{selectedBuildingRegistryRow.buildingId}</div>
+                                            <div className="mt-1 text-xs text-muted-foreground">
+                                                Capacity: {selectedBuildingRegistryRow.capacity ?? 'Not set'} | Occupancy: {selectedBuildingRegistryRow.occupancy ?? 0} | Active cameras: {selectedBuildingRegistryRow.activeCameraCount}
+                                            </div>
+                                            {!selectedBuildingRegistryRow.canDelete && (
+                                                <div className="mt-2 text-xs text-amber-600">
+                                                    Remove this building ID from all active cameras before deleting it.
+                                                </div>
+                                            )}
+                                        </div>
+                                        <Button
+                                            type="button"
+                                            variant="outline"
+                                            size="sm"
+                                            className="border-red-200 text-red-600 hover:border-red-300 hover:bg-red-50 hover:text-red-700"
+                                            onClick={() => openBuildingIdDeleteConfirmation(selectedBuildingRegistryRow.buildingId)}
+                                            disabled={!selectedBuildingRegistryRow.canDelete || deletingBuildingId === selectedBuildingRegistryRow.buildingId}
+                                        >
+                                            <Trash2 className="mr-2 h-3.5 w-3.5" />
+                                            {deletingBuildingId === selectedBuildingRegistryRow.buildingId ? 'Deleting...' : 'Delete Building ID'}
+                                        </Button>
+                                    </div>
+                                )}
+                                <Button variant="outline" size="sm" className="w-full" onClick={() => openResetConfirmation('building')} disabled={resettingBuilding}>
+                                    <RotateCcw className="mr-2 h-3.5 w-3.5" />
+                                    {resettingBuilding ? 'Resetting Building Totals...' : 'Reset Building Totals'}
+                                </Button>
+                            </>
+                        )}
+                    </>
                 )}
-                <Button variant="outline" size="sm" className="w-full" onClick={() => openResetConfirmation('building')} disabled={resettingBuilding}>
-                    <RotateCcw className="mr-2 h-3.5 w-3.5" />
-                    {resettingBuilding ? 'Resetting Building Totals...' : 'Reset Building Totals'}
-                </Button>
             </SectionShell>
 
             {Object.keys(buildingGroupSummaries).length > 0 && (
@@ -2038,7 +2281,9 @@ const PeopleCounting = () => {
                     ? 'Reset Counting Form?'
                     : confirmDialog.kind === 'delete_line'
                         ? `Delete ${confirmDialog.name}?`
-                        : 'Delete Active Zone?';
+                        : confirmDialog.kind === 'delete_area'
+                            ? 'Delete Active Zone?'
+                            : `Delete Building ID ${confirmDialog.buildingId}?`;
 
     const confirmDialogDescription = !confirmDialog
         ? ''
@@ -2047,10 +2292,14 @@ const PeopleCounting = () => {
             : confirmDialog.kind === 'reset_camera'
                 ? 'This will clear the totals for the selected camera. Continue?'
                 : confirmDialog.kind === 'reset_form'
-                    ? 'This will clear all unsaved lines, active zones, and form changes for the selected camera.'
-                    : confirmDialog.kind === 'delete_line'
-                        ? 'This line will be removed from the current setup immediately.'
-                        : 'This active zone will be removed from the current setup immediately.';
+                ? 'This will clear all unsaved lines, active zones, and form changes for the selected camera.'
+                : confirmDialog.kind === 'delete_line'
+                    ? 'This line will be removed from the current setup immediately.'
+                    : confirmDialog.kind === 'delete_area'
+                        ? 'This active zone will be removed from the current setup immediately.'
+                        : confirmDialog.activeCameraCount > 0
+                            ? `This building ID still has ${confirmDialog.activeCameraCount} active camera${confirmDialog.activeCameraCount === 1 ? '' : 's'} and cannot be deleted right now.`
+                            : 'This will remove the building ID, its saved capacity, and its live building totals.';
 
     const confirmDialogLabel = !confirmDialog
         ? 'Confirm'
@@ -2058,13 +2307,17 @@ const PeopleCounting = () => {
             ? 'Delete Line'
             : confirmDialog.kind === 'delete_area'
                 ? 'Delete Zone'
-                : 'Confirm Reset';
+                : confirmDialog.kind === 'delete_building_id'
+                    ? 'Delete Building ID'
+                    : 'Confirm Reset';
 
     const confirmDialogLoading = confirmDialog?.kind === 'reset_building'
         ? resettingBuilding
         : confirmDialog?.kind === 'reset_camera'
             ? resettingCamera
-            : false;
+            : confirmDialog?.kind === 'delete_building_id'
+                ? Boolean(deletingBuildingId)
+                : false;
 
     useEffect(() => {
         if (!sidebarCollapsed) {
