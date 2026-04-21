@@ -6,11 +6,15 @@ set "NGINX_DIR="
 set "BACKEND_FOUND=0"
 
 echo.
-echo ==> Stopping Nginx
+echo [Stop] Stopping Nginx
 
 if defined NGINX_ROOT (
     set "NGINX_DIR=%NGINX_ROOT%"
 ) else (
+    for /d %%D in ("%PROJECT_ROOT%nginx-*") do (
+        set "NGINX_DIR=%%~fD"
+        goto :nginx_dir_found
+    )
     for /d %%D in ("%PROJECT_ROOT%..\nginx-*") do (
         set "NGINX_DIR=%%~fD"
         goto :nginx_dir_found
@@ -35,7 +39,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo ==> Stopping backend on port %BACKEND_PORT%
+echo [Stop] Stopping backend on port %BACKEND_PORT%
 
 for /f "tokens=5" %%P in ('netstat -ano ^| findstr /R /C:":%BACKEND_PORT% .*LISTENING"') do (
     set "BACKEND_FOUND=1"
@@ -48,5 +52,5 @@ if "%BACKEND_FOUND%"=="0" (
 )
 
 echo.
-echo ==> Done
+echo [Stop] Done
 echo Nginx and backend stop routine completed.

@@ -12,7 +12,7 @@ import {
     ChevronDown, ChevronRight,
 } from 'lucide-react';
 import { cn } from '../lib/utils';
-import { getApiBaseUrl } from '../apiConfig';
+import { getApiBaseUrl, getAuthHeaders } from '../apiConfig';
 
 const HAS_TZ_SUFFIX = /(Z|[+-]\d{2}:\d{2})$/i;
 const DETECTION_EVENT_PAGE_SIZE = 500;
@@ -131,10 +131,7 @@ const sumBuildingCameraSummaries = (cameraSummaries = {}) => {
     const entries = Object.values(cameraSummaries || {});
     const totalIn = entries.reduce((sum, camera) => sum + Number(camera?.total_in ?? 0), 0);
     const totalOut = entries.reduce((sum, camera) => sum + Number(camera?.total_out ?? 0), 0);
-    const occupancy = entries.reduce(
-        (sum, camera) => sum + Number(camera?.occupancy ?? Math.max(0, Number(camera?.total_in ?? 0) - Number(camera?.total_out ?? 0))),
-        0,
-    );
+    const occupancy = Math.max(0, totalIn - totalOut);
     return {
         totalIn,
         totalOut,
@@ -525,7 +522,7 @@ const summarizeLatestSnapshots = (rows, { startMs = null, endMs = null } = {}) =
         (sum, row) => sum + Number(row.foot_traffic_total ?? (Number(row.foot_traffic_left ?? 0) + Number(row.foot_traffic_right ?? 0))),
         0,
     );
-    const estimatedOccupancy = snapshots.reduce((sum, row) => sum + Number(row.current_occupancy ?? 0), 0);
+    const estimatedOccupancy = Math.max(0, totalIn - totalOut);
 
     return {
         snapshots,
@@ -765,10 +762,10 @@ const normalizeSnapshotRows = (rows) => rows
 const aggregateCountingFlow = (rows, { startMs = null, endMs = null, bucket = '1d' } = {}) => {
     const groupedRows = new Map();
     const bucketMap = new Map();
+    const latestByCamera = new Map();
     let totalIn = 0;
     let totalOut = 0;
     let peakOccupancy = 0;
-    let latestSnapshot = null;
     let resetCount = 0;
 
     normalizeSnapshotRows(rows).forEach((row) => {
@@ -811,9 +808,7 @@ const aggregateCountingFlow = (rows, { startMs = null, endMs = null, bucket = '1
             totalIn += deltaIn;
             totalOut += deltaOut;
             peakOccupancy = Math.max(peakOccupancy, Number(row.current_occupancy ?? 0));
-            if (!latestSnapshot || row.tsMs > latestSnapshot.tsMs) {
-                latestSnapshot = row;
-            }
+            latestByCamera.set(row.camera_id, row);
 
             const bucketStartMs = getBucketStartMs(row.tsMs, bucket);
             const bucketEntry = bucketMap.get(bucketStartMs) || {
@@ -842,6 +837,9 @@ const aggregateCountingFlow = (rows, { startMs = null, endMs = null, bucket = '1
         if (!best || point.totalTraffic > best.totalTraffic) return point;
         return best;
     }, null);
+    const latestSnapshots = Array.from(latestByCamera.values());
+    const endingTotalIn = latestSnapshots.reduce((sum, row) => sum + Number(row?.total_in ?? 0), 0);
+    const endingTotalOut = latestSnapshots.reduce((sum, row) => sum + Number(row?.total_out ?? 0), 0);
 
     return {
         series,
@@ -849,7 +847,7 @@ const aggregateCountingFlow = (rows, { startMs = null, endMs = null, bucket = '1
         totalOut,
         totalTraffic: totalIn + totalOut,
         peakOccupancy,
-        estimatedOccupancy: Number(latestSnapshot?.current_occupancy ?? 0),
+        estimatedOccupancy: Math.max(0, endingTotalIn - endingTotalOut),
         peakPeriodLabel: peakPeriod?.fullLabel || '-',
         resetCount,
     };
@@ -1544,11 +1542,72 @@ const findNearestIndexByTimestamp = (rows, targetTs) => {
 
 // --- Detail Modal ---
 const DetailModal = ({ record, onClose, apiUrl }) => {
+    const [snapshotObjectUrl, setSnapshotObjectUrl] = useState(null);
+    const [snapshotLoadFailed, setSnapshotLoadFailed] = useState(false);
+
+    useEffect(() => {
+        let isMounted = true;
+        let nextObjectUrl = null;
+
+        const loadSnapshot = async () => {
+            if (!record || record._isSnapshot) {
+                if (isMounted) {
+                    setSnapshotObjectUrl(null);
+                    setSnapshotLoadFailed(false);
+                }
+                return;
+            }
+
+            const snapshotId = record.details?.snapshot_path ? record.id : null;
+            if (!snapshotId) {
+                if (isMounted) {
+                    setSnapshotObjectUrl(null);
+                    setSnapshotLoadFailed(false);
+                }
+                return;
+            }
+
+            try {
+                const response = await fetch(`${apiUrl}/api/snapshots/${snapshotId}`, {
+                    headers: getAuthHeaders(),
+                });
+                if (!response.ok) {
+                    throw new Error(`Snapshot request failed with status ${response.status}`);
+                }
+
+                const blob = await response.blob();
+                nextObjectUrl = URL.createObjectURL(blob);
+
+                if (isMounted) {
+                    setSnapshotObjectUrl(nextObjectUrl);
+                    setSnapshotLoadFailed(false);
+                }
+            } catch (error) {
+                console.error('Failed to load snapshot:', error);
+                if (isMounted) {
+                    setSnapshotObjectUrl(null);
+                    setSnapshotLoadFailed(true);
+                }
+            }
+        };
+
+        setSnapshotObjectUrl(null);
+        setSnapshotLoadFailed(false);
+        loadSnapshot();
+
+        return () => {
+            isMounted = false;
+            if (nextObjectUrl) {
+                URL.revokeObjectURL(nextObjectUrl);
+            }
+        };
+    }, [apiUrl, record]);
+
     if (!record) return null;
 
     const snapshotId = record.details?.snapshot_path ? record.id : null;
-    const snapshotUrl = snapshotId ? `${apiUrl}/api/snapshots/${snapshotId}` : null;
     const isSnapshot = record._isSnapshot;
+    const hasSnapshot = Boolean(snapshotId && snapshotObjectUrl && !snapshotLoadFailed);
 
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
@@ -1560,11 +1619,18 @@ const DetailModal = ({ record, onClose, apiUrl }) => {
                 <CardContent className="space-y-4 pt-4">
                     {!isSnapshot && (
                         <div className="aspect-video w-full bg-black/5 rounded-lg flex items-center justify-center border relative overflow-hidden">
-                            {snapshotUrl ? (
-                                <img src={snapshotUrl} alt="Evidence" className="object-contain w-full h-full"
-                                    onError={(e) => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'flex'; }} />
+                            {hasSnapshot ? (
+                                <img
+                                    src={snapshotObjectUrl}
+                                    alt="Evidence"
+                                    className="object-contain w-full h-full"
+                                    onError={() => {
+                                        setSnapshotObjectUrl(null);
+                                        setSnapshotLoadFailed(true);
+                                    }}
+                                />
                             ) : null}
-                            <span className="text-muted-foreground absolute" style={{ display: snapshotUrl ? 'none' : 'flex' }}>
+                            <span className="text-muted-foreground absolute" style={{ display: hasSnapshot ? 'none' : 'flex' }}>
                                 No Snapshot Available
                             </span>
                         </div>
@@ -2930,7 +2996,10 @@ const BuildingOccupancyPanel = ({
         : Number(rangeTotalsSummary.totalTraffic ?? 0);
     const displayedBuildingOccupancy = selectedBuildingId === 'all'
         ? (useLatestBuildingSnapshotTotals
-            ? Number(latestBuildingSnapshotSummary.estimatedOccupancy ?? 0)
+            ? Math.max(
+                0,
+                Number(latestBuildingSnapshotSummary.totalIn ?? 0) - Number(latestBuildingSnapshotSummary.totalOut ?? 0),
+            )
             : Number(scopedBuildingSummary.occupancy ?? 0))
         : Number(latestScopedHistoryRow?.occupancy ?? scopedBuildingSummary.occupancy ?? 0);
 

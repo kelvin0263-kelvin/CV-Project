@@ -1,4 +1,5 @@
 const AUTH_CHANGE_EVENT = 'app-auth-change';
+const FETCH_INTERCEPTOR_FLAG = '__appAuthFetchInstalled';
 
 const normalizeBaseUrl = (value) => String(value || '').trim().replace(/\/+$/, '');
 
@@ -26,7 +27,12 @@ export const getWSUrl = (endpoint) => {
     const baseUrl = configuredWsBase || getApiBaseUrl();
     const protocol = baseUrl.startsWith('https') ? 'wss' : 'ws';
     const host = baseUrl.replace(/^https?:\/\//, '');
-    return `${protocol}://${host}${endpoint}`;
+    const wsUrl = new URL(`${protocol}://${host}${endpoint}`);
+    const token = getStoredToken();
+    if (token && !wsUrl.searchParams.has('token')) {
+        wsUrl.searchParams.set('token', token);
+    }
+    return wsUrl.toString();
 };
 
 const emitAuthChange = () => {
@@ -101,6 +107,92 @@ export const clearAuthSession = () => {
     window.localStorage.removeItem('user');
     window.localStorage.removeItem('isAuthenticated');
     emitAuthChange();
+};
+
+const resolveRequestUrl = (input) => {
+    if (typeof window === 'undefined') {
+        return null;
+    }
+
+    try {
+        const rawValue = input instanceof Request ? input.url : String(input ?? '');
+        return new URL(rawValue, window.location.origin);
+    } catch {
+        return null;
+    }
+};
+
+const isApiRequest = (url) => {
+    if (!url) {
+        return false;
+    }
+
+    const apiBaseUrl = getApiBaseUrl();
+    const apiOrigin = (() => {
+        try {
+            return new URL(apiBaseUrl, window.location.origin).origin;
+        } catch {
+            return window.location.origin;
+        }
+    })();
+
+    return url.pathname.startsWith('/api/') && url.origin === apiOrigin;
+};
+
+const isPublicApiRequest = (url) => {
+    if (!url) {
+        return false;
+    }
+
+    return url.pathname === '/api/auth/login' || url.pathname === '/api/health';
+};
+
+const withAuthorizationHeader = (headers, token) => {
+    const nextHeaders = new Headers(headers || undefined);
+    if (token && !nextHeaders.has('Authorization')) {
+        nextHeaders.set('Authorization', `Bearer ${token}`);
+    }
+    return nextHeaders;
+};
+
+export const installAuthFetchInterceptor = () => {
+    if (typeof window === 'undefined' || window[FETCH_INTERCEPTOR_FLAG]) {
+        return;
+    }
+
+    const originalFetch = window.fetch.bind(window);
+
+    window.fetch = async (input, init = undefined) => {
+        const requestUrl = resolveRequestUrl(input);
+        const shouldAttachAuth = isApiRequest(requestUrl) && !isPublicApiRequest(requestUrl);
+        let nextInput = input;
+        let nextInit = init;
+
+        if (shouldAttachAuth) {
+            const token = getStoredToken();
+            const headers = withAuthorizationHeader(
+                input instanceof Request ? input.headers : init?.headers,
+                token,
+            );
+
+            if (input instanceof Request) {
+                nextInput = new Request(input, { headers });
+            } else {
+                nextInit = {
+                    ...(init || {}),
+                    headers,
+                };
+            }
+        }
+
+        const response = await originalFetch(nextInput, nextInit);
+        if (shouldAttachAuth && response.status === 401) {
+            clearAuthSession();
+        }
+        return response;
+    };
+
+    window[FETCH_INTERCEPTOR_FLAG] = true;
 };
 
 export const getAuthHeaders = (extraHeaders = {}) => {

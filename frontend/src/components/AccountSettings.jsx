@@ -59,6 +59,7 @@ const AccountSettings = () => {
     const [users, setUsers] = useState([]);
     const [usersLoading, setUsersLoading] = useState(false);
     const [userSaveError, setUserSaveError] = useState('');
+    const [userSuccessMessage, setUserSuccessMessage] = useState('');
     const [isUserModalOpen, setIsUserModalOpen] = useState(false);
     const [editingUser, setEditingUser] = useState(null);
     const [userForm, setUserForm] = useState(emptyUserForm);
@@ -254,6 +255,7 @@ const AccountSettings = () => {
         setEditingUser(null);
         setUserForm(emptyUserForm);
         setUserSaveError('');
+        setUserSuccessMessage('');
         setIsUserModalOpen(true);
     };
 
@@ -266,10 +268,13 @@ const AccountSettings = () => {
             password: '',
         });
         setUserSaveError('');
+        setUserSuccessMessage('');
         setIsUserModalOpen(true);
     };
 
     const handleDeleteUser = async (user) => {
+        setUserSaveError('');
+        setUserSuccessMessage('');
         if (isDefaultAdmin(user)) {
             setUserSaveError('Default admin user cannot be deleted.');
             return;
@@ -295,6 +300,7 @@ const AccountSettings = () => {
             }
 
             await fetchUsers();
+            setUserSuccessMessage('User deleted successfully.');
         } catch {
             setUserSaveError('Failed to delete user.');
         }
@@ -303,6 +309,7 @@ const AccountSettings = () => {
     const handleSaveUser = async (event) => {
         event.preventDefault();
         setUserSaveError('');
+        setUserSuccessMessage('');
 
         if (!editingUser && !userForm.password.trim()) {
             setUserSaveError('Password is required for new users.');
@@ -340,6 +347,7 @@ const AccountSettings = () => {
             setIsUserModalOpen(false);
             setUserForm(emptyUserForm);
             await fetchUsers();
+            setUserSuccessMessage(isEditing ? 'User updated successfully.' : 'User added successfully.');
         } catch {
             setUserSaveError('Network error.');
         }
@@ -573,6 +581,9 @@ const AccountSettings = () => {
 
                         {userSaveError && (
                             <p className="text-sm text-destructive">{userSaveError}</p>
+                        )}
+                        {userSuccessMessage && (
+                            <p className="text-sm text-green-600">{userSuccessMessage}</p>
                         )}
                     </CardContent>
                 </Card>

@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 
 const STREAM_RENDER_INTERVAL_MS = 100;
+const OVERLAY_FONT_FAMILY = '"Segoe UI", Inter, sans-serif';
 const DEFAULT_STREAM_AUTO_RECONNECT_INTERVAL_MS = (() => {
     const rawMinutes = (
         typeof import.meta !== 'undefined'
@@ -26,6 +27,9 @@ const StreamPlayer = ({
     onMediaLayout,
     onStreamState,
     showCountingAnchors = false,
+    hideOverlays = false,
+    showDressCodeDetails = false,
+    showFallAlerts = false,
     overlayMode = 'auto',
     autoReconnectIntervalMs = DEFAULT_STREAM_AUTO_RECONNECT_INTERVAL_MS,
 }) => {
@@ -168,9 +172,37 @@ const StreamPlayer = ({
         const isFallDetected = Boolean(det.fall_detected);
         const isFallPose = Boolean(det.fall_pose);
         const confidence = Math.round((det.confidence || 0) * 100);
+        const shouldRenderFallAlerts = normalizedMode === 'fall' || showFallAlerts;
+        const shouldRenderDressCodeDetails = (
+            normalizedMode === 'dress-code'
+            || normalizedMode === 'dresscode'
+            || showDressCodeDetails
+        );
         const clothingLabel = det.label
             ? `${det.label.replace(/_/g, ' ')} ${confidence}%`
             : 'Person';
+        const classifications = Array.isArray(det.classifications) ? det.classifications : [];
+        const lowerBodyClassification = classifications.find((item) => item?.region === 'lower_body');
+        const footwearClassification = classifications.find((item) => item?.region === 'footwear');
+        const hasDressCodeDetails = Boolean(
+            lowerBodyClassification
+            || footwearClassification
+            || (det.label != null && det.confidence != null)
+        );
+
+        const formatClassificationLabel = (classification, fallbackLabel = null, fallbackConfidence = null) => {
+            const rawLabel = classification?.label ?? fallbackLabel;
+            if (!rawLabel) {
+                return null;
+            }
+
+            const rawConfidence = classification?.confidence ?? fallbackConfidence;
+            const formattedLabel = String(rawLabel).replace(/_/g, ' ');
+            const formattedConfidence = Number.isFinite(Number(rawConfidence))
+                ? ` ${Math.round(Number(rawConfidence) * 100)}%`
+                : '';
+            return `${formattedLabel}${formattedConfidence}`;
+        };
 
         if (normalizedMode === 'counting') {
             return {
@@ -184,7 +216,7 @@ const StreamPlayer = ({
             };
         }
 
-        if (normalizedMode === 'fall') {
+        if (shouldRenderFallAlerts) {
             if (isFallDetected) {
                 return {
                     color: '#ef4444',
@@ -220,12 +252,30 @@ const StreamPlayer = ({
             };
         }
 
-        if (normalizedMode === 'dress-code' || normalizedMode === 'dresscode') {
+        if (shouldRenderDressCodeDetails) {
             return {
                 color: isViolation ? '#ef4444' : '#2563eb',
                 lineWidth: isViolation ? 3 : 2,
                 dash: [],
-                label: clothingLabel,
+                labelLines: [
+                    formatClassificationLabel(lowerBodyClassification, det.label, det.confidence) || clothingLabel,
+                    formatClassificationLabel(footwearClassification),
+                ].filter(Boolean),
+                labelTextColor: '#ffffff',
+                labelBgColor: isViolation ? '#b91c1c' : '#1d4ed8',
+                showTrackId: true,
+            };
+        }
+
+        if (hasDressCodeDetails && !shouldRenderFallAlerts && !isFallDetected && !isFallPose) {
+            return {
+                color: isViolation ? '#ef4444' : '#2563eb',
+                lineWidth: isViolation ? 3 : 2,
+                dash: [],
+                labelLines: [
+                    formatClassificationLabel(lowerBodyClassification, det.label, det.confidence) || clothingLabel,
+                    formatClassificationLabel(footwearClassification),
+                ].filter(Boolean),
                 labelTextColor: '#ffffff',
                 labelBgColor: isViolation ? '#b91c1c' : '#1d4ed8',
                 showTrackId: true,
@@ -244,7 +294,7 @@ const StreamPlayer = ({
             labelBgColor: isViolation || isFallDetected ? '#dc2626' : isFallPose ? '#f59e0b' : '#16a34a',
             showTrackId: true,
         };
-    }, [overlayMode]);
+    }, [overlayMode, showDressCodeDetails, showFallAlerts]);
 
     // --- Draw detections on canvas overlay ---
     const drawDetections = useCallback((detections) => {
@@ -261,65 +311,101 @@ const StreamPlayer = ({
 
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-        if (!detections || detections.length === 0) return;
+        if (hideOverlays || !detections || detections.length === 0) return;
 
         // Compute actual visible image area (accounting for object-contain letterboxing)
         const area = getImageDisplayArea();
         if (!area) return;
         const { displayW, displayH, offsetX, offsetY, mediaWidth, mediaHeight } = area;
+        const normalizedMode = String(overlayMode || 'auto').toLowerCase();
 
         // Keep the overlay locked to the exact visible media area inside object-contain.
         const scaleX = displayW / mediaWidth;
         const scaleY = displayH / mediaHeight;
 
-        detections.forEach((det) => {
-            if (!det.person_bbox) return;
+        const drawScaledBoundingBox = (bbox, style) => {
+            if (!Array.isArray(bbox) || bbox.length < 4) {
+                return null;
+            }
 
-            const [x1, y1, x2, y2] = det.person_bbox;
+            const [x1, y1, x2, y2] = bbox;
             const sx1 = x1 * scaleX + offsetX;
             const sy1 = y1 * scaleY + offsetY;
             const sw = (x2 - x1) * scaleX;
             const sh = (y2 - y1) * scaleY;
-            const visual = getOverlayVisual(det);
 
-            // Draw person bounding box
-            ctx.setLineDash(Array.isArray(visual.dash) ? visual.dash : []);
-            ctx.strokeStyle = visual.color;
-            ctx.lineWidth = visual.lineWidth || 2;
+            ctx.setLineDash(Array.isArray(style?.dash) ? style.dash : []);
+            ctx.strokeStyle = style?.color || '#22c55e';
+            ctx.lineWidth = style?.lineWidth || 2;
             ctx.strokeRect(sx1, sy1, sw, sh);
 
-            // Draw label background + text
-            const label = visual.label;
-            if (label) {
-                ctx.font = `bold ${Math.max(10, 12 * scaleX)}px sans-serif`;
-                const textMetrics = ctx.measureText(label);
-                const textHeight = 14 * scaleY;
-                const padding = 4 * scaleX;
+            const labelLines = Array.isArray(style?.labelLines) && style.labelLines.length
+                ? style.labelLines
+                : (style?.label ? [style.label] : []);
+            if (labelLines.length) {
+                const primaryFontSize = Math.max(8, 8.5 * scaleX);
+                const secondaryFontSize = Math.max(8, 8.5 * scaleX);
+                const paddingX = Math.max(2, 3 * scaleX);
+                const paddingY = Math.max(1.5, 2 * scaleY);
+                const lineGap = Math.max(1, 1.5 * scaleY);
+                const lineHeights = labelLines.map((_, index) => (
+                    index === 0 ? Math.max(9, 10 * scaleY) : Math.max(9, 10 * scaleY)
+                ));
+                const lineWidths = labelLines.map((line, index) => {
+                    ctx.font = `600 ${index === 0 ? primaryFontSize : secondaryFontSize}px ${OVERLAY_FONT_FAMILY}`;
+                    return ctx.measureText(line).width;
+                });
+                const textBlockHeight = lineHeights.reduce((sum, value) => sum + value, 0) + lineGap * Math.max(0, labelLines.length - 1);
+                const labelY = Math.max(0, sy1 - textBlockHeight - paddingY * 2);
 
-                // Background
-                ctx.fillStyle = visual.labelBgColor || visual.color;
+                ctx.fillStyle = style?.labelBgColor || style?.color || '#22c55e';
                 ctx.fillRect(
                     sx1,
-                    sy1 - textHeight - padding * 2,
-                    textMetrics.width + padding * 2,
-                    textHeight + padding * 2
+                    labelY,
+                    Math.max(...lineWidths) + paddingX * 2,
+                    textBlockHeight + paddingY * 2,
                 );
+                ctx.fillStyle = style?.labelTextColor || '#ffffff';
+                let currentTextY = labelY + paddingY;
+                labelLines.forEach((line, index) => {
+                    const fontSize = index === 0 ? primaryFontSize : secondaryFontSize;
+                    const lineHeight = lineHeights[index];
+                    ctx.font = `600 ${fontSize}px ${OVERLAY_FONT_FAMILY}`;
+                    currentTextY += lineHeight;
+                    ctx.fillText(line, sx1 + paddingX, currentTextY);
+                    currentTextY += lineGap;
+                });
+            }
 
-                // Text
-                ctx.fillStyle = visual.labelTextColor || '#ffffff';
-                ctx.fillText(label, sx1 + padding, sy1 - padding);
+            return { sx1, sy1, sw, sh };
+        };
+
+        const orderedDetections = showFallAlerts || normalizedMode === 'fall'
+            ? [
+                ...detections.filter((det) => !det?.fall_detected),
+                ...detections.filter((det) => det?.fall_detected),
+            ]
+            : detections;
+
+        orderedDetections.forEach((det) => {
+            if (!det.person_bbox) return;
+
+            const visual = getOverlayVisual(det);
+            const personBox = drawScaledBoundingBox(det.person_bbox, visual);
+            if (!personBox) {
+                return;
             }
 
             // Draw track ID if available
             ctx.setLineDash([]);
             if (visual.showTrackId && det.track_id !== null && det.track_id !== undefined) {
                 const idLabel = `ID: ${det.track_id}`;
-                ctx.font = `${Math.max(9, 10 * scaleX)}px sans-serif`;
+                ctx.font = `600 ${Math.max(9, 10 * scaleX)}px ${OVERLAY_FONT_FAMILY}`;
                 ctx.fillStyle = 'rgba(0,0,0,0.6)';
                 const idMetrics = ctx.measureText(idLabel);
-                ctx.fillRect(sx1, sy1, idMetrics.width + 6, 14 * scaleY);
+                ctx.fillRect(personBox.sx1, personBox.sy1, idMetrics.width + 6, 14 * scaleY);
                 ctx.fillStyle = '#ffffff';
-                ctx.fillText(idLabel, sx1 + 3, sy1 + 11 * scaleY);
+                ctx.fillText(idLabel, personBox.sx1 + 3, personBox.sy1 + 11 * scaleY);
             }
 
             const anchorPoint = Array.isArray(det.display_anchor) && det.display_anchor.length >= 2
@@ -339,7 +425,7 @@ const StreamPlayer = ({
                 ctx.stroke();
             }
         });
-    }, [getImageDisplayArea, getOverlayVisual, showCountingAnchors]);
+    }, [getImageDisplayArea, getOverlayVisual, hideOverlays, overlayMode, showCountingAnchors, showFallAlerts]);
 
     const applyPayload = useCallback((data) => {
         const hasImage = Boolean(data.imageBlob);

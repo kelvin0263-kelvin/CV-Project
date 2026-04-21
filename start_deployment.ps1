@@ -103,13 +103,19 @@ function Resolve-NginxRoot {
         return $env:NGINX_ROOT
     }
 
-    $workspaceParent = Split-Path -Parent $projectRoot
-    $candidate = Get-ChildItem -Path $workspaceParent -Directory -Filter "nginx-*" -ErrorAction SilentlyContinue |
-        Sort-Object Name -Descending |
-        Select-Object -First 1
+    $searchRoots = @(
+        $projectRoot
+        (Split-Path -Parent $projectRoot)
+    ) | Select-Object -Unique
 
-    if ($candidate) {
-        return $candidate.FullName
+    foreach ($searchRoot in $searchRoots) {
+        $candidate = Get-ChildItem -Path $searchRoot -Directory -Filter "nginx-*" -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+
+        if ($candidate) {
+            return $candidate.FullName
+        }
     }
 
     return $null
@@ -149,15 +155,39 @@ function Test-BackendDepsNeedInstall {
         throw "requirements.txt was not found at '$backendRequirements'."
     }
 
-    if (-not (Test-Path $backendVenvPython)) {
-        throw "Backend virtual environment Python was not found at '$backendVenvPython'."
-    }
-
     if (-not (Test-Path $backendDepsStamp)) {
         return $true
     }
 
     return (Get-Item $backendRequirements).LastWriteTimeUtc -gt (Get-Item $backendDepsStamp).LastWriteTimeUtc
+}
+
+function Ensure-BackendVenv {
+    param([string]$BootstrapPython)
+
+    if (Test-Path $backendVenvPython) {
+        Write-Host "Backend virtual environment already exists." -ForegroundColor Green
+        return
+    }
+
+    if (-not $BootstrapPython) {
+        throw "Python is not available. Install Python and add it to PATH so the backend virtual environment can be created."
+    }
+
+    Write-Host "Creating backend virtual environment..." -ForegroundColor Yellow
+    Push-Location $backendDir
+    try {
+        & $BootstrapPython -m venv venv
+    }
+    finally {
+        Pop-Location
+    }
+
+    if (-not (Test-Path $backendVenvPython)) {
+        throw "Backend virtual environment creation did not produce '$backendVenvPython'."
+    }
+
+    Write-Host "Backend virtual environment created." -ForegroundColor Green
 }
 
 function Test-FrontendDepsNeedInstall {
@@ -183,16 +213,16 @@ function Test-FrontendDepsNeedInstall {
 
 Write-Step "Checking required tools"
 
-$pythonExe = $null
+$bootstrapPython = $null
 if (Test-Path $backendVenvPython) {
-    $pythonExe = $backendVenvPython
+    $bootstrapPython = $backendVenvPython
 }
 else {
-    $pythonExe = Find-CommandPath @("python", "py")
+    $bootstrapPython = Find-CommandPath @("python", "py")
 }
 
-if (-not $pythonExe) {
-    throw "Python is not available. Create backend\\venv or install Python and add it to PATH."
+if (-not $bootstrapPython) {
+    throw "Python is not available. Install Python and add it to PATH."
 }
 
 $nodeExe = Find-CommandPath @("node")
@@ -212,7 +242,7 @@ if (-not $ffmpegExe) {
 
 $nginxRoot = Resolve-NginxRoot
 if (-not $nginxRoot) {
-    throw "Could not find an nginx folder beside the project. Set NGINX_ROOT or place nginx under the workspace parent."
+    throw "Could not find an nginx folder in the project root or its parent. Set NGINX_ROOT or place nginx under one of those locations."
 }
 
 $nginxExe = Join-Path $nginxRoot "nginx.exe"
@@ -225,7 +255,7 @@ if (-not (Test-Path $nginxConf)) {
     throw "nginx.conf was not found at '$nginxConf'."
 }
 
-Write-Host "Python : $pythonExe"
+Write-Host "Python : $bootstrapPython"
 Write-Host "Node   : $nodeExe"
 Write-Host "npm    : $npmExe"
 Write-Host "FFmpeg : $ffmpegExe"
@@ -233,6 +263,10 @@ Write-Host "Nginx  : $nginxExe"
 
 Write-Step "Checking PostgreSQL service"
 Ensure-PostgresServiceStarted -ServiceName $postgresServiceName
+
+Write-Step "Checking backend virtual environment"
+Ensure-BackendVenv -BootstrapPython $bootstrapPython
+$pythonExe = $backendVenvPython
 
 Write-Step "Checking backend dependencies"
 Push-Location $backendDir

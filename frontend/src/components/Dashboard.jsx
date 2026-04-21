@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from './ui/button';
-import { Circle, LayoutGrid, Maximize2, Minimize2, Users } from 'lucide-react';
+import { Checkbox } from './ui/checkbox';
+import { ChevronDown, Circle, LayoutGrid, Maximize2, Minimize2, Users } from 'lucide-react';
 import StreamPlayer from './StreamPlayer';
 import { getApiBaseUrl, getWSUrl } from '../apiConfig';
 
@@ -17,6 +18,14 @@ const DISPLAY_MODE_OPTIONS = [
 
 const DASHBOARD_PREFERENCES_KEY = 'dashboard_preferences_v2';
 const SUPPORTED_LAYOUTS = [1, 4, 9];
+const CONTROLS_IDLE_TIMEOUT_MS = 1800;
+const DEFAULT_OVERLAY_PREFERENCES = {
+    auto: true,
+    hideOverlays: false,
+    showDressCodeDetails: false,
+    showFallAlerts: false,
+    showCountingAnchors: false,
+};
 
 const createEmptyPage = (layoutSize) => Array(layoutSize).fill(null);
 
@@ -73,6 +82,62 @@ const normalizeSlotAssignments = (rawAssignments, minPageCounts = {}) => (
     }, createEmptySlotAssignments())
 );
 
+const normalizeOverlayPreferences = (rawPreferences) => {
+    const nextPreferences = {
+        auto: Boolean(rawPreferences?.auto ?? DEFAULT_OVERLAY_PREFERENCES.auto),
+        hideOverlays: Boolean(rawPreferences?.hideOverlays),
+        showDressCodeDetails: Boolean(rawPreferences?.showDressCodeDetails),
+        showFallAlerts: Boolean(rawPreferences?.showFallAlerts),
+        showCountingAnchors: Boolean(rawPreferences?.showCountingAnchors),
+    };
+
+    if (nextPreferences.auto) {
+        return {
+            ...DEFAULT_OVERLAY_PREFERENCES,
+            auto: true,
+        };
+    }
+
+    if (nextPreferences.hideOverlays) {
+        return {
+            ...DEFAULT_OVERLAY_PREFERENCES,
+            auto: false,
+            hideOverlays: true,
+        };
+    }
+
+    if (
+        !nextPreferences.showDressCodeDetails
+        && !nextPreferences.showFallAlerts
+        && !nextPreferences.showCountingAnchors
+    ) {
+        return { ...DEFAULT_OVERLAY_PREFERENCES };
+    }
+
+    return {
+        ...DEFAULT_OVERLAY_PREFERENCES,
+        ...nextPreferences,
+        auto: false,
+        hideOverlays: false,
+    };
+};
+
+const getOverlayPreferencesSummary = (overlayPreferences) => {
+    if (overlayPreferences.hideOverlays) {
+        return 'Hide Overlays';
+    }
+    if (overlayPreferences.auto) {
+        return 'Auto';
+    }
+
+    const enabledLabels = [];
+    if (overlayPreferences.showDressCodeDetails) enabledLabels.push('Dress Code');
+    if (overlayPreferences.showFallAlerts) enabledLabels.push('Fall Alerts');
+    if (overlayPreferences.showCountingAnchors) enabledLabels.push('Counting Anchor');
+
+    return enabledLabels.length ? enabledLabels.join(', ') : 'Auto';
+};
+
 const readStoredDashboardPreferences = () => {
     const defaults = {
         layout: 9,
@@ -80,6 +145,7 @@ const readStoredDashboardPreferences = () => {
         sourceFilter: 'all',
         cameraFilter: 'all',
         slotAssignments: createEmptySlotAssignments(),
+        overlayPreferences: DEFAULT_OVERLAY_PREFERENCES,
     };
 
     if (typeof window === 'undefined') {
@@ -101,6 +167,7 @@ const readStoredDashboardPreferences = () => {
                 ? parsed.cameraFilter
                 : 'all',
             slotAssignments: normalizeSlotAssignments(parsed?.slotAssignments),
+            overlayPreferences: normalizeOverlayPreferences(parsed?.overlayPreferences),
         };
     } catch (error) {
         console.error('Failed to read stored dashboard preferences:', error);
@@ -116,14 +183,10 @@ const inferOverlayMode = (analysisTags = []) => {
     const hasCounting = normalizedTags.has('people counting');
     const hasFall = normalizedTags.has('fall detection');
     const hasDressCode = normalizedTags.has('dress code');
-    const activeModes = [hasCounting, hasFall, hasDressCode].filter(Boolean).length;
 
-    if (activeModes !== 1) {
-        return 'auto';
-    }
-    if (hasCounting) return 'counting';
-    if (hasFall) return 'fall';
     if (hasDressCode) return 'dress-code';
+    if (hasFall) return 'fall';
+    if (hasCounting) return 'counting';
     return 'auto';
 };
 
@@ -219,6 +282,7 @@ const SlotCameraSelector = ({
 const CameraFeedCard = ({
     camera,
     apiUrl,
+    overlayPreferences,
     slotIndex,
     currentPage,
     topLabelOffsetClass = 'top-1.5',
@@ -232,7 +296,21 @@ const CameraFeedCard = ({
     const [runtimePreviewImage, setRuntimePreviewImage] = useState('');
     const [showSourceLabelHint, setShowSourceLabelHint] = useState(true);
     const wsUrl = getWSUrl(`/ws/${camera.id}`);
-    const overlayMode = inferOverlayMode(camera.analysis_tags);
+    const inferredOverlayMode = inferOverlayMode(camera.analysis_tags);
+    const overlayMode = overlayPreferences.auto
+        ? inferredOverlayMode
+        : overlayPreferences.showDressCodeDetails
+            ? 'dress-code'
+            : overlayPreferences.showFallAlerts
+                ? 'fall'
+                : overlayPreferences.showCountingAnchors
+                    ? 'counting'
+                    : 'auto';
+    const shouldShowCountingAnchors = overlayPreferences.hideOverlays
+        ? false
+        : overlayPreferences.auto
+            ? inferredOverlayMode === 'counting'
+            : overlayPreferences.showCountingAnchors;
     const footTrafficLabels = getFootTrafficSummaryLabels(countingData?.lines);
     const sourceAccent = getSourceAccentClasses(camera);
     const hasCountingData = countingData && (
@@ -297,7 +375,10 @@ const CameraFeedCard = ({
                     onStats={setStats}
                     onCountingData={setCountingData}
                     overlayMode={overlayMode}
-                    showCountingAnchors={overlayMode === 'counting'}
+                    showCountingAnchors={shouldShowCountingAnchors}
+                    hideOverlays={overlayPreferences.hideOverlays}
+                    showDressCodeDetails={!overlayPreferences.hideOverlays && (overlayPreferences.auto ? false : overlayPreferences.showDressCodeDetails)}
+                    showFallAlerts={!overlayPreferences.hideOverlays && (overlayPreferences.auto ? false : overlayPreferences.showFallAlerts)}
                 />
             ) : runtimePreviewImage ? (
                 <img src={runtimePreviewImage} className="h-full w-full bg-black object-contain" alt={camera.name} />
@@ -399,8 +480,36 @@ const Dashboard = () => {
     const [cameraFilter, setCameraFilter] = useState(initialPreferences.cameraFilter);
     const [displayMode, setDisplayMode] = useState(initialPreferences.displayMode);
     const [slotAssignments, setSlotAssignments] = useState(initialPreferences.slotAssignments);
+    const [overlayPreferences, setOverlayPreferences] = useState(initialPreferences.overlayPreferences);
+    const [overlayMenuOpen, setOverlayMenuOpen] = useState(false);
+    const [controlsVisible, setControlsVisible] = useState(true);
     const [assignmentNotice, setAssignmentNotice] = useState('');
     const containerRef = useRef(null);
+    const overlayMenuRef = useRef(null);
+    const controlsHideTimeoutRef = useRef(null);
+
+    const clearControlsHideTimeout = useCallback(() => {
+        if (controlsHideTimeoutRef.current) {
+            window.clearTimeout(controlsHideTimeoutRef.current);
+            controlsHideTimeoutRef.current = null;
+        }
+    }, []);
+
+    const scheduleControlsHide = useCallback(() => {
+        clearControlsHideTimeout();
+        if (overlayMenuOpen) {
+            return;
+        }
+
+        controlsHideTimeoutRef.current = window.setTimeout(() => {
+            setControlsVisible(false);
+        }, CONTROLS_IDLE_TIMEOUT_MS);
+    }, [clearControlsHideTimeout, overlayMenuOpen]);
+
+    const revealControls = useCallback(() => {
+        setControlsVisible(true);
+        scheduleControlsHide();
+    }, [scheduleControlsHide]);
 
     const fetchCameras = useCallback(async () => {
         try {
@@ -457,6 +566,34 @@ const Dashboard = () => {
         };
     }, []);
 
+    useEffect(() => {
+        if (!overlayMenuOpen) {
+            return undefined;
+        }
+
+        const handlePointerDown = (event) => {
+            if (overlayMenuRef.current && !overlayMenuRef.current.contains(event.target)) {
+                setOverlayMenuOpen(false);
+            }
+        };
+
+        window.addEventListener('mousedown', handlePointerDown);
+        return () => {
+            window.removeEventListener('mousedown', handlePointerDown);
+        };
+    }, [overlayMenuOpen]);
+
+    useEffect(() => {
+        if (overlayMenuOpen) {
+            clearControlsHideTimeout();
+            setControlsVisible(true);
+            return undefined;
+        }
+
+        scheduleControlsHide();
+        return clearControlsHideTimeout;
+    }, [clearControlsHideTimeout, overlayMenuOpen, scheduleControlsHide]);
+
     const cameraMap = useMemo(
         () => new Map(cameras.map((camera) => [camera.id, camera])),
         [cameras],
@@ -501,8 +638,9 @@ const Dashboard = () => {
             sourceFilter,
             cameraFilter,
             slotAssignments: sanitizedSlotAssignments,
+            overlayPreferences,
         }));
-    }, [cameraFilter, displayMode, layout, sanitizedSlotAssignments, sourceFilter]);
+    }, [cameraFilter, displayMode, layout, overlayPreferences, sanitizedSlotAssignments, sourceFilter]);
 
     const filteredBySource = useMemo(
         () => cameras.filter((camera) => matchesSourceFilter(camera, sourceFilter)),
@@ -626,6 +764,38 @@ const Dashboard = () => {
         setPage(0);
     };
 
+    const handleOverlayPreferenceChange = (preferenceKey, checked) => {
+        setOverlayPreferences((currentPreferences) => {
+            const nextPreferences = {
+                ...currentPreferences,
+                [preferenceKey]: checked,
+            };
+
+            if (preferenceKey === 'auto' && checked) {
+                return normalizeOverlayPreferences({ auto: true });
+            }
+
+            if (preferenceKey === 'hideOverlays' && checked) {
+                return normalizeOverlayPreferences({ hideOverlays: true, auto: false });
+            }
+
+            if (preferenceKey !== 'auto' && preferenceKey !== 'hideOverlays' && checked) {
+                nextPreferences.auto = false;
+                nextPreferences.hideOverlays = false;
+            }
+
+            if (preferenceKey === 'auto' && !checked) {
+                nextPreferences.auto = false;
+            }
+
+            if (preferenceKey === 'hideOverlays' && !checked) {
+                nextPreferences.hideOverlays = false;
+            }
+
+            return normalizeOverlayPreferences(nextPreferences);
+        });
+    };
+
     const handleNextPage = () => {
         setPage((currentValue) => (currentValue + 1) % totalPages);
     };
@@ -635,13 +805,22 @@ const Dashboard = () => {
     };
 
     const currentCameraOptions = displayMode === 'custom' ? customModeCameraOptions : autoModeCameraOptions;
+    const overlayPreferencesSummary = useMemo(
+        () => getOverlayPreferencesSummary(overlayPreferences),
+        [overlayPreferences],
+    );
+    const controlsVisibilityClass = controlsVisible || overlayMenuOpen
+        ? 'opacity-100'
+        : 'pointer-events-none opacity-0';
 
     return (
         <div
             ref={containerRef}
             className="relative group flex h-[calc(100vh-5.5rem)] min-h-0 w-full flex-col overflow-hidden bg-background lg:h-[calc(100vh-6.75rem)]"
+            onMouseMove={revealControls}
+            onMouseEnter={revealControls}
         >
-            <div className="absolute left-4 top-4 z-50 flex flex-wrap gap-2 rounded-lg bg-black/50 p-2 opacity-0 transition-opacity backdrop-blur-md group-hover:opacity-100 hover:opacity-100">
+            <div className={`absolute left-4 top-4 z-50 flex flex-wrap gap-2 rounded-lg bg-black/50 p-2 transition-opacity duration-200 backdrop-blur-md ${controlsVisibilityClass}`}>
                 <div className="mr-2 flex gap-1 border-r border-white/20 pr-2">
                     <Button size="icon" variant={layout === 1 ? 'secondary' : 'ghost'} className="h-8 w-8 text-white" onClick={() => handleLayoutChange(1)}>
                         <div className="h-4 w-4 rounded-sm border-2 border-current" />
@@ -691,6 +870,68 @@ const Dashboard = () => {
                     </select>
                 </div>
 
+                <div ref={overlayMenuRef} className="relative mr-2 border-r border-white/20 pr-2 text-xs text-white">
+                    <button
+                        type="button"
+                        onClick={() => setOverlayMenuOpen((current) => !current)}
+                        className="flex h-8 items-center gap-2 rounded-md border border-white/20 bg-black/30 px-3 text-xs text-white transition hover:bg-black/45"
+                    >
+                        <span>Overlays</span>
+                        <span className="max-w-44 truncate text-white/70">{overlayPreferencesSummary}</span>
+                        <ChevronDown className={`h-3.5 w-3.5 transition-transform ${overlayMenuOpen ? 'rotate-180' : ''}`} />
+                    </button>
+
+                    {overlayMenuOpen && (
+                        <div className="absolute left-0 top-10 z-50 min-w-72 rounded-lg border border-white/15 bg-black/85 p-3 shadow-xl backdrop-blur-md">
+                            <div className="mb-2 text-[11px] font-medium uppercase tracking-[0.18em] text-white/60">
+                                Overlay Options
+                            </div>
+                            <div className="grid gap-2">
+                                <label className="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-white/5">
+                                    <Checkbox
+                                        checked={overlayPreferences.auto}
+                                        onCheckedChange={(checked) => handleOverlayPreferenceChange('auto', checked)}
+                                        className="border-white/50 bg-black/20"
+                                    />
+                                    <span>Auto</span>
+                                </label>
+                                <label className="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-white/5">
+                                    <Checkbox
+                                        checked={overlayPreferences.hideOverlays}
+                                        onCheckedChange={(checked) => handleOverlayPreferenceChange('hideOverlays', checked)}
+                                        className="border-white/50 bg-black/20"
+                                    />
+                                    <span>Hide Overlays</span>
+                                </label>
+                                <label className="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-white/5">
+                                    <Checkbox
+                                        checked={overlayPreferences.showDressCodeDetails}
+                                        onCheckedChange={(checked) => handleOverlayPreferenceChange('showDressCodeDetails', checked)}
+                                        className="border-white/50 bg-black/20"
+                                    />
+                                    <span>Show Dress Code Details</span>
+                                </label>
+                                <label className="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-white/5">
+                                    <Checkbox
+                                        checked={overlayPreferences.showFallAlerts}
+                                        onCheckedChange={(checked) => handleOverlayPreferenceChange('showFallAlerts', checked)}
+                                        className="border-white/50 bg-black/20"
+                                    />
+                                    <span>Show Fall Alerts</span>
+                                </label>
+                                <label className="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-white/5">
+                                    <Checkbox
+                                        checked={overlayPreferences.showCountingAnchors}
+                                        onCheckedChange={(checked) => handleOverlayPreferenceChange('showCountingAnchors', checked)}
+                                        className="border-white/50 bg-black/20"
+                                    />
+                                    <span>Show Counting Anchor</span>
+                                </label>
+                            </div>
+                        </div>
+                    )}
+                </div>
+
                 {totalPages > 1 && (
                     <div className="flex items-center gap-2 text-xs text-white">
                         <Button size="icon" variant="ghost" className="h-8 w-8 text-white" onClick={handlePrevPage}>&lt;</Button>
@@ -700,7 +941,7 @@ const Dashboard = () => {
                 )}
             </div>
 
-            <div className="absolute right-4 top-4 z-50 opacity-0 transition-opacity group-hover:opacity-100 hover:opacity-100">
+            <div className={`absolute right-4 top-4 z-50 transition-opacity duration-200 ${controlsVisibilityClass}`}>
                 <Button size="icon" variant="secondary" className="bg-black/50 text-white hover:bg-black/70 backdrop-blur-md" onClick={toggleFullscreen}>
                     {isFullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
                 </Button>
@@ -719,6 +960,7 @@ const Dashboard = () => {
                             key={`${layout}-${currentPage}-${index}-${camera.id}`}
                             camera={camera}
                             apiUrl={apiUrl}
+                            overlayPreferences={overlayPreferences}
                             slotIndex={index}
                             currentPage={currentPage}
                             topLabelOffsetClass={index === 0 ? 'top-16' : 'top-1.5'}

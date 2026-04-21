@@ -5,10 +5,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import sqlalchemy as sa
 
 from app.core.database import engine, AsyncSessionLocal
-from app.models.base import Base
 from app.routers import camera_router
 from app.routers import policy_router
 from app.routers import detection_router
@@ -22,6 +20,7 @@ from app.services.video_processor import stop_all_producer_threads
 SUPPRESSED_ACCESS_LOG_PATHS = {
     "/api/building-occupancy-summary",
     "/api/detection-events",
+    "/api/cameras",
 }
 
 
@@ -42,157 +41,10 @@ def configure_uvicorn_access_log_filter() -> None:
     access_logger.addFilter(UvicornAccessPathFilter())
 
 
-def should_bootstrap_schema() -> bool:
-    return os.getenv("ENABLE_DEV_SCHEMA_BOOTSTRAP", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """App lifespan hooks. Prefer Alembic migrations for schema management."""
+    """App lifespan hooks. Schema changes are managed via Alembic."""
     configure_uvicorn_access_log_filter()
-
-    if should_bootstrap_schema():
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-            await conn.execute(
-                sa.text(
-                    "ALTER TABLE stream_configs "
-                    "ADD COLUMN IF NOT EXISTS runtime_key VARCHAR(1500)"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "UPDATE stream_configs "
-                    "SET runtime_key = source_path "
-                    "WHERE runtime_key IS NULL OR runtime_key = ''"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "ALTER TABLE stream_configs "
-                    "ALTER COLUMN runtime_key SET NOT NULL"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "CREATE INDEX IF NOT EXISTS ix_stream_configs_runtime_key "
-                    "ON stream_configs (runtime_key)"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "ALTER TABLE stream_configs "
-                    "ADD COLUMN IF NOT EXISTS detection_roi JSON"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "ALTER TABLE people_counting_configs "
-                    "ADD COLUMN IF NOT EXISTS cross_camera_enabled BOOLEAN NOT NULL DEFAULT FALSE"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "ALTER TABLE people_counting_configs "
-                    "ADD COLUMN IF NOT EXISTS cross_camera_pair_id VARCHAR(100)"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "ALTER TABLE people_counting_configs "
-                    "ADD COLUMN IF NOT EXISTS cross_camera_role VARCHAR(20) NOT NULL DEFAULT 'none'"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "ALTER TABLE people_counting_configs "
-                    "ADD COLUMN IF NOT EXISTS verification_camera_id VARCHAR"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "ALTER TABLE people_counting_configs "
-                    "ADD COLUMN IF NOT EXISTS primary_in_event_idle_timeout_sec DOUBLE PRECISION NOT NULL DEFAULT 7.0"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "ALTER TABLE people_counting_configs "
-                    "ADD COLUMN IF NOT EXISTS primary_out_event_idle_timeout_sec DOUBLE PRECISION NOT NULL DEFAULT 7.0"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "ALTER TABLE people_counting_configs "
-                    "DROP COLUMN IF EXISTS verification_inward_threshold"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "ALTER TABLE people_counting_snapshots "
-                    "ADD COLUMN IF NOT EXISTS foot_traffic_left INTEGER NOT NULL DEFAULT 0"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "ALTER TABLE people_counting_snapshots "
-                    "ADD COLUMN IF NOT EXISTS foot_traffic_right INTEGER NOT NULL DEFAULT 0"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "ALTER TABLE people_counting_snapshots "
-                    "ADD COLUMN IF NOT EXISTS foot_traffic_total INTEGER NOT NULL DEFAULT 0"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "ALTER TABLE dresscode_policies "
-                    "ADD COLUMN IF NOT EXISTS pants_confidence_threshold DOUBLE PRECISION"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "ALTER TABLE dresscode_policies "
-                    "ADD COLUMN IF NOT EXISTS slipper_confidence_threshold DOUBLE PRECISION"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "UPDATE dresscode_policies "
-                    "SET pants_confidence_threshold = COALESCE(pants_confidence_threshold, confidence_threshold, 0.8), "
-                    "slipper_confidence_threshold = COALESCE(slipper_confidence_threshold, confidence_threshold, 0.8)"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "ALTER TABLE dresscode_policies "
-                    "ALTER COLUMN pants_confidence_threshold SET DEFAULT 0.8"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "ALTER TABLE dresscode_policies "
-                    "ALTER COLUMN slipper_confidence_threshold SET DEFAULT 0.8"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "ALTER TABLE dresscode_policies "
-                    "ALTER COLUMN pants_confidence_threshold SET NOT NULL"
-                )
-            )
-            await conn.execute(
-                sa.text(
-                    "ALTER TABLE dresscode_policies "
-                    "ALTER COLUMN slipper_confidence_threshold SET NOT NULL"
-                )
-            )
 
     # Ensure the default admin account exists when the database is reachable.
     try:

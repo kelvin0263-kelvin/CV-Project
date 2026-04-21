@@ -16,11 +16,10 @@ from sqlalchemy import select
 from app.core.database import get_db, AsyncSessionLocal
 from app.models.fall_detection_config import FallDetectionConfig
 from app.models.stream_config import StreamConfig
-from app.models.user import User
 from app.routers.auth_router import get_current_user
 from pydantic import BaseModel
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 
 # ---------------------------------------------------------------------------
 # In-memory config cache (read by video_processor)
@@ -123,7 +122,6 @@ class FallDetectionConfigRead(BaseModel):
 async def get_config(
     camera_id: str,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
 ):
     try:
         result = await db.execute(
@@ -154,7 +152,6 @@ async def upsert_config(
     camera_id: str,
     update: FallDetectionConfigUpdate,
     db: AsyncSession = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
 ):
     try:
         result = await db.execute(

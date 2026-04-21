@@ -23,19 +23,15 @@ const inferOverlayMode = (analysisTags = []) => {
     const hasCounting = normalizedTags.has('people counting');
     const hasFall = normalizedTags.has('fall detection');
     const hasDressCode = normalizedTags.has('dress code');
-    const activeModes = [hasCounting, hasFall, hasDressCode].filter(Boolean).length;
 
-    if (activeModes !== 1) {
-        return 'auto';
-    }
-    if (hasCounting) {
-        return 'counting';
+    if (hasDressCode) {
+        return 'dress-code';
     }
     if (hasFall) {
         return 'fall';
     }
-    if (hasDressCode) {
-        return 'dress-code';
+    if (hasCounting) {
+        return 'counting';
     }
     return 'auto';
 };

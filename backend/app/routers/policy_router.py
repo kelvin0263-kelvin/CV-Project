@@ -13,10 +13,11 @@ from app.core.database import get_db
 from app.models.camera_model import Camera
 from app.models.dresscode_policy import DressCodePolicy
 from app.models.stream_config import StreamConfig
+from app.routers.auth_router import get_current_user
 from app.schemas.dresscode_policy import DressCodePolicyRead, DressCodePolicyUpdate
 from app.services.video_processor import update_policy
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 DEFAULT_DRESSCODE_CONFIDENCE_THRESHOLD = 0.8
 
 

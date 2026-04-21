@@ -47,9 +47,13 @@ from app.services.upload_sync import (
     pop_sync_group_members,
     register_pending_upload,
 )
+from app.routers.auth_router import get_current_user
 from app.routers.policy_router import sync_policy_runtime_from_db
 from app.routers.counting_router import reset_uploaded_runtime_counting_state, sync_counting_runtime_from_db
+from app.services import auth_service
 from DefishVideoCV import FisheyeMultiView
+
+protected_route_dependencies = [Depends(get_current_user)]
 
 router = APIRouter()
 
@@ -1000,6 +1004,18 @@ def _extract_preview_frame_with_ffmpeg(
 # --- WebSocket Endpoint ---
 @router.websocket("/ws/{camera_id}")
 async def websocket_endpoint(websocket: WebSocket, camera_id: str):
+    token = str(websocket.query_params.get("token") or "").strip()
+    if not token:
+        await websocket.close(code=1008)
+        return
+
+    async with AsyncSessionLocal() as auth_session:
+        try:
+            await auth_service.get_user_by_token(token, auth_session)
+        except HTTPException:
+            await websocket.close(code=1008)
+            return
+
     await websocket.accept()
     print(f"[WS] Connection accepted for {camera_id}")
 
@@ -1081,7 +1097,7 @@ async def websocket_endpoint(websocket: WebSocket, camera_id: str):
 
 # --- HTTP API Endpoints ---
 
-@router.get("/api/cameras", response_model=List[CameraRead])
+@router.get("/api/cameras", response_model=List[CameraRead], dependencies=protected_route_dependencies)
 async def get_cameras(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(Camera, StreamConfig).outerjoin(StreamConfig, StreamConfig.camera_id == Camera.id)
@@ -1099,7 +1115,7 @@ async def get_cameras(db: AsyncSession = Depends(get_db)):
     ]
 
 
-@router.post("/api/cameras", response_model=CameraRead)
+@router.post("/api/cameras", response_model=CameraRead, dependencies=protected_route_dependencies)
 async def add_camera(camera: CameraCreate, db: AsyncSession = Depends(get_db)):
     source_path = (camera.source_path or "").strip() or None
     if camera.type.upper().startswith(("RTSP", "NETWORK")) and not source_path:
@@ -1145,7 +1161,7 @@ async def add_camera(camera: CameraCreate, db: AsyncSession = Depends(get_db)):
     return _build_camera_read(db_camera, stream_config)
 
 
-@router.put("/api/cameras/{camera_id}", response_model=CameraRead)
+@router.put("/api/cameras/{camera_id}", response_model=CameraRead, dependencies=protected_route_dependencies)
 async def update_camera(camera_id: str, camera: CameraCreate, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Camera).where(Camera.id == camera_id))
     db_camera = result.scalar_one_or_none()
@@ -1228,8 +1244,8 @@ async def update_camera(camera_id: str, camera: CameraCreate, db: AsyncSession =
     return _build_camera_read(db_camera, stream_config)
 
 
-@router.post("/api/cameras/stream-source")
-@router.post("/api/cameras/rtsp-source")
+@router.post("/api/cameras/stream-source", dependencies=protected_route_dependencies)
+@router.post("/api/cameras/rtsp-source", dependencies=protected_route_dependencies)
 async def create_stream_source(payload: StreamSourceCreateRequest, db: AsyncSession = Depends(get_db)):
     source_path = payload.source_path.strip()
     if not source_path:
@@ -1302,7 +1318,7 @@ async def create_stream_source(payload: StreamSourceCreateRequest, db: AsyncSess
     }
 
 
-@router.post("/api/cameras/test-stream")
+@router.post("/api/cameras/test-stream", dependencies=protected_route_dependencies)
 async def test_stream_connection(payload: StreamConnectionTestRequest):
     source_path = payload.source_path.strip()
     if not source_path:
@@ -1325,12 +1341,12 @@ async def test_stream_connection(payload: StreamConnectionTestRequest):
         }
 
 
-@router.post("/api/cameras/test-rtsp")
+@router.post("/api/cameras/test-rtsp", dependencies=protected_route_dependencies)
 async def test_rtsp_connection(payload: StreamConnectionTestRequest):
     return await test_stream_connection(payload)
 
 
-@router.post("/api/cameras/upload-preview")
+@router.post("/api/cameras/upload-preview", dependencies=protected_route_dependencies)
 async def preview_uploaded_video(
     file: UploadFile = File(...),
     enable_fisheye: bool = Form(False),
@@ -1382,7 +1398,7 @@ async def preview_uploaded_video(
                 pass
 
 
-@router.delete("/api/cameras/{camera_id}")
+@router.delete("/api/cameras/{camera_id}", dependencies=protected_route_dependencies)
 async def delete_camera(camera_id: str, db: AsyncSession = Depends(get_db)):
     # Capture runtime key(s) first so we can stop producer if this was the last camera in a group.
     stream_result = await db.execute(
@@ -1411,14 +1427,14 @@ async def delete_camera(camera_id: str, db: AsyncSession = Depends(get_db)):
     return {"status": "deleted"}
 
 
-@router.get("/api/upload-sync-groups")
+@router.get("/api/upload-sync-groups", dependencies=protected_route_dependencies)
 async def get_upload_sync_groups():
     return {
         "groups": list_sync_groups(),
     }
 
 
-@router.post("/api/upload-sync-groups/{group_id}/start")
+@router.post("/api/upload-sync-groups/{group_id}/start", dependencies=protected_route_dependencies)
 async def start_upload_sync_group(group_id: str, db: AsyncSession = Depends(get_db)):
     try:
         normalized_group_id, members = pop_sync_group_members(group_id)
@@ -1470,7 +1486,7 @@ async def start_upload_sync_group(group_id: str, db: AsyncSession = Depends(get_
     }
 
 
-@router.get("/api/upload-videos")
+@router.get("/api/upload-videos", dependencies=protected_route_dependencies)
 async def list_uploaded_videos(db: AsyncSession = Depends(get_db)):
     rows = await _get_uploaded_runtime_rows(db)
     runtime_groups: dict[str, list[tuple[Camera, StreamConfig]]] = {}
@@ -1489,7 +1505,7 @@ async def list_uploaded_videos(db: AsyncSession = Depends(get_db)):
     return {"items": items}
 
 
-@router.put("/api/upload-videos")
+@router.put("/api/upload-videos", dependencies=protected_route_dependencies)
 async def update_uploaded_video(
     payload: UploadVideoUpdateRequest,
     db: AsyncSession = Depends(get_db),
@@ -1561,7 +1577,7 @@ async def update_uploaded_video(
     }
 
 
-@router.post("/api/upload-videos/start")
+@router.post("/api/upload-videos/start", dependencies=protected_route_dependencies)
 async def start_uploaded_videos(
     payload: UploadRuntimeActionRequest,
     db: AsyncSession = Depends(get_db),
@@ -1609,7 +1625,7 @@ async def start_uploaded_videos(
     }
 
 
-@router.post("/api/upload-videos/stop")
+@router.post("/api/upload-videos/stop", dependencies=protected_route_dependencies)
 async def stop_uploaded_videos(
     payload: UploadRuntimeActionRequest,
     db: AsyncSession = Depends(get_db),
@@ -1643,7 +1659,7 @@ async def stop_uploaded_videos(
     }
 
 
-@router.post("/api/upload-videos/delete")
+@router.post("/api/upload-videos/delete", dependencies=protected_route_dependencies)
 async def delete_uploaded_videos(
     payload: UploadRuntimeActionRequest,
     db: AsyncSession = Depends(get_db),
@@ -1709,7 +1725,7 @@ async def delete_uploaded_videos(
     }
 
 
-@router.post("/api/upload-videos/preview")
+@router.post("/api/upload-videos/preview", dependencies=protected_route_dependencies)
 async def preview_uploaded_runtime(
     payload: UploadPreviewRequest,
     db: AsyncSession = Depends(get_db),
@@ -1740,7 +1756,7 @@ async def preview_uploaded_runtime(
     return result
 
 
-@router.post("/api/upload_and_process")
+@router.post("/api/upload_and_process", dependencies=protected_route_dependencies)
 async def upload_video(
     file: UploadFile = File(...),
     enable_fisheye: bool = Form(False),

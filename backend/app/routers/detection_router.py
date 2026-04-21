@@ -21,10 +21,11 @@ from sqlalchemy import select, desc, func
 from app.core.database import get_db, AsyncSessionLocal
 from app.models.camera_model import Camera
 from app.models.detection_event import DetectionEvent
+from app.routers.auth_router import get_current_user
 from app.schemas.detection_event import DetectionEventRead
 from app.services.video_processor import drain_violation_queue
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 
 # Snapshot directory (same as video_processor.py)
 BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

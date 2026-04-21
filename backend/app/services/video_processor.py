@@ -79,7 +79,7 @@ UPLOAD_FILENAME_PREFIX_PATTERN = re.compile(r"^(?P<prefix>[0-9a-fA-F]{8})_(?P<re
 UPLOAD_START_TIME_PATTERN = re.compile(r"^(?P<timestamp>\d{14})(?:_|$)")
 
 POSE_MODEL_ENGINE_PATH = os.path.join(BACKEND_ROOT, "yolov8m-pose.engine")
-POSE_MODEL_PT_PATH = "yolov8m-pose.pt"
+POSE_MODEL_PT_PATH = os.path.join(BACKEND_ROOT, "yolov8m-pose.pt")
 # POSE_MODEL_ENGINE_PATH = ""
 
 TRACKER_CONFIG_PATH = os.path.join(BACKEND_ROOT, "botsort_custom.yaml")
@@ -141,8 +141,20 @@ FFMPEG_BIN = "ffmpeg"
 # Model loading decide wehter .pt or .engine 
 # if exist .engine，else fallback to .pt
 # ---------------------------------------------------------------------------
+def _resolve_backend_env_path(env_var_name: str) -> str | None:
+    explicit_path = os.getenv(env_var_name, "").strip()
+    if not explicit_path:
+        return None
+    if os.path.isabs(explicit_path):
+        return explicit_path
+    return os.path.join(BACKEND_ROOT, explicit_path)
+
+
 def _resolve_pose_model_path() -> str:
-    if os.path.exists(POSE_MODEL_ENGINE_PATH): 
+    explicit_path = _resolve_backend_env_path("POSE_MODEL_PATH")
+    if explicit_path:
+        return explicit_path
+    if os.path.exists(POSE_MODEL_ENGINE_PATH):
         return POSE_MODEL_ENGINE_PATH
     return POSE_MODEL_PT_PATH
 

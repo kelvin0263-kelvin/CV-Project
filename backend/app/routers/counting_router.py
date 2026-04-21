@@ -26,6 +26,7 @@ from app.models.building_counting_snapshot import BuildingCountingSnapshot
 from app.models.people_counting_config import PeopleCountingConfig
 from app.models.people_counting_snapshot import PeopleCountingSnapshot
 from app.models.stream_config import StreamConfig
+from app.routers.auth_router import get_current_user
 from app.schemas.people_counting import (
     BuildingCountingConfigRead,
     BuildingCountingSnapshotRead,
@@ -49,7 +50,7 @@ from app.services.cross_camera_verifier import (
     sync_cross_camera_runtime,
 )
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 BUILDING_SNAPSHOT_HEARTBEAT_SEC = 300.0
 
 
@@ -350,6 +351,59 @@ def _build_restored_live_count(camera_id: str, snapshot: PeopleCountingSnapshot)
         }
     )
     return restored
+
+
+def _build_building_restore_snapshot_from_camera_snapshots(
+    latest_snapshots: dict[str, PeopleCountingSnapshot],
+) -> tuple[dict | None, datetime | None]:
+    raw_in = 0
+    raw_out = 0
+    latest_effective_at: datetime | None = None
+    entrance_summaries: dict[str, dict] = {}
+
+    for camera_id, snapshot in latest_snapshots.items():
+        config = get_counting_config(camera_id) or {}
+        if not config.get("enabled", True) or not config.get("participate_in_building_count", False):
+            continue
+
+        building_id = _normalize_building_id(config.get("building_id"))
+        if not building_id:
+            continue
+
+        total_in = max(0, int(snapshot.total_in or 0))
+        total_out = max(0, int(snapshot.total_out or 0))
+        raw_in += total_in
+        raw_out += total_out
+
+        entrance_summary = entrance_summaries.setdefault(
+            building_id,
+            {
+                "total_in": 0,
+                "total_out": 0,
+                "camera_summaries": {},
+            },
+        )
+        entrance_summary["total_in"] += total_in
+        entrance_summary["total_out"] += total_out
+        entrance_summary["camera_summaries"][camera_id] = {
+            "total_in": total_in,
+            "total_out": total_out,
+        }
+
+        effective_at = _effective_snapshot_datetime(snapshot.timestamp, snapshot.processed_at)
+        if effective_at is not None and (
+            latest_effective_at is None or effective_at > latest_effective_at
+        ):
+            latest_effective_at = effective_at
+
+    if not entrance_summaries:
+        return None, latest_effective_at
+
+    return {
+        "raw_in": raw_in,
+        "raw_out": raw_out,
+        "entrance_summaries": entrance_summaries,
+    }, latest_effective_at
 
 
 async def _load_latest_snapshot_by_camera(
@@ -1211,8 +1265,36 @@ async def load_counting_configs_from_db():
     try:
         async with AsyncSessionLocal() as session:
             await sync_counting_runtime_from_db(session)
+            latest_rtsp_snapshots = await _load_latest_snapshot_by_camera(
+                session,
+                sorted(_rtsp_counting_camera_ids),
+            )
             latest_building_snapshot = await _load_latest_building_snapshot(session)
-            if latest_building_snapshot is not None:
+            camera_restore_snapshot, camera_restore_at = (
+                _build_building_restore_snapshot_from_camera_snapshots(latest_rtsp_snapshots)
+            )
+            building_restore_at = (
+                _effective_snapshot_datetime(
+                    latest_building_snapshot.timestamp,
+                    latest_building_snapshot.processed_at,
+                )
+                if latest_building_snapshot is not None
+                else None
+            )
+
+            # Prefer the freshest persisted source so a stale building snapshot
+            # cannot override newer per-camera totals after restart.
+            if camera_restore_snapshot is not None and (
+                latest_building_snapshot is None
+                or building_restore_at is None
+                or (camera_restore_at is not None and camera_restore_at > building_restore_at)
+            ):
+                restore_building_runtime(camera_restore_snapshot)
+                print(
+                    "[Startup] Restored building summary from camera snapshots "
+                    f"timestamp={camera_restore_at}"
+                )
+            elif latest_building_snapshot is not None:
                 restore_building_runtime(
                     {
                         "raw_in": latest_building_snapshot.raw_in,
