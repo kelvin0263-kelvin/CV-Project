@@ -20,6 +20,7 @@ except ImportError:
     sys.exit(1)
 
 MIN_SLIPPER_CROP_SIZE = 96
+DEFAULT_VIEW_CONFIG = {"angle_z": 90, "angle_up": 35, "zoom": 80}
 
 def ensure_dir(path):
     if not os.path.exists(path):
@@ -69,7 +70,59 @@ def is_min_size(image, min_size):
     """Return True when image height and width both meet min_size."""
     return image is not None and image.size > 0 and image.shape[0] >= min_size and image.shape[1] >= min_size
 
-def process_video(video_path, output_base_dir, tracker_cfg="bytetrack.yaml", defish=True):
+
+def build_view_configs(angle_z=None, angle_up=None, zoom=None):
+    """Build a single-view fisheye config list for preview/processing."""
+    config = DEFAULT_VIEW_CONFIG.copy()
+    if angle_z is not None:
+        config["angle_z"] = int(angle_z)
+    if angle_up is not None:
+        config["angle_up"] = int(angle_up)
+    if zoom is not None:
+        config["zoom"] = int(zoom)
+    return [config]
+
+
+def read_preview_frame(video_path, frame_ratio=0.15):
+    """Read one representative frame for UI preview."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Cannot open video for preview: {video_path}")
+
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames > 0:
+            preview_index = max(0, min(total_frames - 1, int(total_frames * frame_ratio)))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, preview_index)
+
+        ret, frame = cap.read()
+        if not ret:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = cap.read()
+
+        if not ret or frame is None:
+            raise RuntimeError(f"Could not read a preview frame from: {video_path}")
+        return frame
+    finally:
+        cap.release()
+
+
+def generate_defish_preview(video_path, view_configs=None):
+    """Return the original overlay preview and the first defished view."""
+    preview_configs = view_configs if view_configs is not None else build_view_configs()
+    frame = read_preview_frame(video_path)
+    processor = FisheyeMultiView(
+        frame.shape[:2],
+        preview_configs,
+        show_original=True,
+        use_cuda=False,
+        downscale_size=None,
+    )
+    processed_frames, _, _ = processor.process_frame(frame.copy(), overlay=True, view_id=None)
+    return processed_frames.get("original"), processed_frames.get("partition_0")
+
+
+def process_video(video_path, output_base_dir, tracker_cfg="bytetrack.yaml", defish=True, view_configs=None):
     # Sampling / tracking controls
     frame_stride = 3          # process every Nth frame to cut volume (~25fps -> ~8fps)
     track_save_gap = 10       # save once every N processed frames per track
@@ -114,18 +167,14 @@ def process_video(video_path, output_base_dir, tracker_cfg="bytetrack.yaml", def
 
     processor = None
     if defish:
-        # Configure Defisher for 135 degrees
-        # Based on previous code: {'angle_z': 135, 'angle_up': 35, 'zoom': 80}
-        view_configs = [
-            {'angle_z': 135, 'angle_up': 35, 'zoom': 80}
-        ]
-        
+        current_view_configs = view_configs if view_configs is not None else build_view_configs()
+
         # Initialize Processor
         # Note: FisheyeMultiView expects (height, width)
         # Use CUDA if available, but keep full resolution (no downscale) for training data
         processor = FisheyeMultiView(
             (height, width),
-            view_configs,
+            current_view_configs,
             show_original=False,
             use_cuda=cuda_available,
             downscale_size=None  # Keep full resolution for training data
@@ -156,13 +205,13 @@ def process_video(video_path, output_base_dir, tracker_cfg="bytetrack.yaml", def
             print(f"Processing frame {frame_idx}/{total_frames}...", end='\r')
 
         if defish and processor is not None:
-            # 1. Defish -> Get 135 degree view
+            # 1. Defish -> Get configured planar view
             # process_frame returns: processed_frames (dict), originals (dict), list_views
             # The key for the first view will likely be 'partition_0' since we only passed 1 config
             try:
                 processed_frames, _, _ = processor.process_frame(frame, overlay=False, view_id=None)
                 
-                # Extract the 135-degree view
+                # Extract the selected view
                 # Since we only passed one config, it should be the first one. 
                 # FisheyeMultiView usually names keys as 'partition_{index}'
                 target_view = processed_frames.get('partition_0')
@@ -307,7 +356,34 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable fisheye remapping (use raw frames)"
     )
+    parser.add_argument(
+        "--angle-z",
+        type=int,
+        default=DEFAULT_VIEW_CONFIG["angle_z"],
+        help="Horizontal defish angle in degrees"
+    )
+    parser.add_argument(
+        "--angle-up",
+        type=int,
+        default=DEFAULT_VIEW_CONFIG["angle_up"],
+        help="Vertical defish tilt in degrees"
+    )
+    parser.add_argument(
+        "--zoom",
+        type=int,
+        default=DEFAULT_VIEW_CONFIG["zoom"],
+        help="Output view field-of-view in degrees"
+    )
     
     args = parser.parse_args()
     
-    process_video(args.video_path, args.output, args.tracker, defish=not args.no_defish)
+    process_video(
+        args.video_path,
+        args.output,
+        args.tracker,
+        defish=not args.no_defish,
+        view_configs=build_view_configs(args.angle_z, args.angle_up, args.zoom),
+    )
+# view_configs = [
+#     {'angle_z': 90, 'angle_up': 35, 'zoom': 80}
+# ]

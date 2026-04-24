@@ -62,7 +62,6 @@ class BuildingCountingConfigRead(BaseModel):
     max_capacity: Optional[int] = None
     building_ids: list[str] = Field(default_factory=list)
     capacity_by_building_id: dict[str, int] = Field(default_factory=dict)
-    manual_offset: int
 
     model_config = {"from_attributes": True}
 
@@ -74,7 +73,6 @@ class BuildingCountingConfigUpdate(BaseModel):
     building_ids: Optional[list[str]] = None
     max_capacity: Optional[int] = None
     capacity_by_building_id: Optional[dict[str, Optional[int]]] = None
-    manual_offset: Optional[int] = None
 
 
 class BuildingOccupancySummaryRead(BaseModel):
@@ -86,7 +84,6 @@ class BuildingOccupancySummaryRead(BaseModel):
     default_max_capacity: Optional[int] = None
     building_ids: list[str] = Field(default_factory=list)
     capacity_by_building_id: dict[str, int] = Field(default_factory=dict)
-    manual_offset: int
     raw_in: int
     raw_out: int
     raw_occupancy: int
@@ -106,7 +103,6 @@ class BuildingCountingSnapshotRead(BaseModel):
     raw_occupancy: int
     max_capacity: Optional[int] = None
     capacity_exceeded: bool
-    manual_offset: int
     occupancy: int
     active_camera_count: int
     entrance_summaries: dict[str, Any]

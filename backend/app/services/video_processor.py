@@ -2112,6 +2112,7 @@ def video_producer(
     # recent_rtsp_failure_times: deque[float] = deque()
     # last_good_frame_signature: np.ndarray | None = None
     track_state = {}       # Per-track dress-code and fall-detection state.
+    last_seen_policy_version = get_policy_version()
     cached_detections = [] # Reused between detection frames
     cached_people_count = 0
 
@@ -2599,6 +2600,12 @@ def video_producer(
             print(f"[Producer] Stop requested for runtime_key={runtime_key}, source={source_path}")
             break
 
+        current_policy_version = get_policy_version()
+        if current_policy_version != last_seen_policy_version:
+            _clear_dresscode_track_state(track_state)
+            cached_detections = []
+            last_seen_policy_version = current_policy_version
+
         # only use by video file to ensure 2 video run together 
         if sync_timeline_active and fps > 0:
             target_frame_index = max(0, int((time.perf_counter() - sync_started_at) * fps))
@@ -2865,14 +2872,17 @@ _current_policy = {
     "camera_id_map": {},       # "runtime_key||view_key" -> camera_id
 }
 _policy_lock = threading.Lock()
+_policy_version = 0
 
 # External Entry Point (Called by policy_router when policy changes.)
 # To safely update the current global policy configuration used by the system
 def update_policy(policy: dict):
 
     global _current_policy
+    global _policy_version
     with _policy_lock:
         _current_policy = policy
+        _policy_version += 1
     print(
         f"[Policy] Updated: enabled_cameras={policy.get('enabled_camera_ids')}, "
         f"pants_enabled={policy.get('enable_pants_detection', True)}, "
@@ -2884,6 +2894,11 @@ def update_policy(policy: dict):
 def get_policy() -> dict:
     with _policy_lock:
         return dict(_current_policy)
+
+
+def get_policy_version() -> int:
+    with _policy_lock:
+        return int(_policy_version)
 
 # To safely convert a policy threshold value to a float, using a fallback value if conversion fails.
 def _coerce_policy_threshold(value, fallback: float) -> float:
@@ -2924,6 +2939,31 @@ def _get_classifier_flags() -> tuple[bool, bool]:
         bool(policy.get("enable_pants_detection", True)),
         bool(policy.get("enable_slipper_detection", False)),
     )
+
+
+def _clear_dresscode_track_state(track_state: dict) -> None:
+    dresscode_keys = (
+        "label",
+        "confidence",
+        "lower_bbox",
+        "slipper_bbox",
+        "classifications",
+        "last_classified_at_monotonic",
+        "matched_violations",
+        "saved_violation_labels",
+        "violation_candidate_label",
+        "violation_candidate_count",
+        "violation_candidate_started_at_monotonic",
+        "confirmed_violation",
+        "confirmed_matched_violations",
+        "last_matched_violations",
+        "violation_region_states",
+    )
+    for entry in list(track_state.values()):
+        if not isinstance(entry, dict):
+            continue
+        for key in dresscode_keys:
+            entry.pop(key, None)
 
 # To determine whether a cached classification result is still recent and valid enough to be reused.
 def _should_reuse_cached_classification(cached: dict, *, now_monotonic: float) -> bool:
@@ -3211,7 +3251,7 @@ def _apply_policy_and_save(
             det["matched_violations"] = confirmed_matches
             det["violation"] = True
 
-            # Dedup: only save once per label for a track
+            # Dedup: save one event per confirmed violation label for a track.
             if track_id is not None and camera_id is not None:
                 ts = track_state.get(track_id, {})
                 saved_labels = ts.get("saved_violation_labels")
@@ -3219,39 +3259,46 @@ def _apply_policy_and_save(
                     saved_labels = []
                     ts["saved_violation_labels"] = saved_labels
 
-                if label not in saved_labels:
-                    # Save snapshot evidence
-                    snapshot_id = str(uuid.uuid4())
+                unsaved_matches = [
+                    dict(item)
+                    for item in (confirmed_matches or [])
+                    if item.get("label") and item.get("label") not in saved_labels
+                ]
+                if unsaved_matches:
                     person_crop = crop_full_person(frame, det["person_bbox"])
-                    snapshot_path = None
-                    if person_crop is not None:
-                        snapshot_path = os.path.join(SNAPSHOT_DIR, f"{snapshot_id}.jpg")
-                        cv2.imwrite(snapshot_path, person_crop)
+                    for matched in unsaved_matches:
+                        matched_label = matched.get("label")
+                        matched_confidence = matched.get("confidence")
+                        snapshot_id = str(uuid.uuid4())
+                        snapshot_path = None
+                        if person_crop is not None:
+                            snapshot_path = os.path.join(SNAPSHOT_DIR, f"{snapshot_id}.jpg")
+                            cv2.imwrite(snapshot_path, person_crop)
 
-                    # Queue violation event for async DB write
-                    queue_violation_event({
-                        "id": snapshot_id,
-                        "camera_id": camera_id,
-                        "timestamp": event_timestamp,
-                        "processed_at": processed_at,
-                        "source_path": source_path,
-                        "track_id": track_id,
-                        "event_type": "Dress Code Violation",
-                        "label": label,
-                        "confidence": conf,
-                        "classifications": det.get("classifications") or [],
-                        "matched_violations": det.get("matched_violations") or [],
-                        "lower_bbox": det.get("lower_bbox"),
-                        "slipper_bbox": det.get("slipper_bbox"),
-                        "person_bbox": det["person_bbox"],
-                        "snapshot_path": snapshot_path,
-                    })
+                        # Queue violation event for async DB write
+                        queue_violation_event({
+                            "id": snapshot_id,
+                            "camera_id": camera_id,
+                            "timestamp": event_timestamp,
+                            "processed_at": processed_at,
+                            "source_path": source_path,
+                            "track_id": track_id,
+                            "event_type": "Dress Code Violation",
+                            "label": matched_label,
+                            "confidence": matched_confidence,
+                            "classifications": det.get("classifications") or [],
+                            "matched_violations": det.get("matched_violations") or [],
+                            "lower_bbox": det.get("lower_bbox"),
+                            "slipper_bbox": det.get("slipper_bbox"),
+                            "person_bbox": det["person_bbox"],
+                            "snapshot_path": snapshot_path,
+                        })
 
-                    # Mark this label as saved for the track
-                    if track_id in track_state:
-                        track_state[track_id].setdefault("saved_violation_labels", [])
-                        if label not in track_state[track_id]["saved_violation_labels"]:
-                            track_state[track_id]["saved_violation_labels"].append(label)
+                        # Mark this label as saved for the track
+                        if track_id in track_state:
+                            track_state[track_id].setdefault("saved_violation_labels", [])
+                            if matched_label not in track_state[track_id]["saved_violation_labels"]:
+                                track_state[track_id]["saved_violation_labels"].append(matched_label)
         else:
             det["violation"] = False
 

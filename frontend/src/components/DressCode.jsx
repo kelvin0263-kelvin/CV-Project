@@ -117,6 +117,7 @@ const buildDetectionItems = (detections) => {
     const items = [];
 
     (Array.isArray(detections) ? detections : []).forEach((det) => {
+        const matchedViolations = Array.isArray(det?.matched_violations) ? det.matched_violations : [];
         const classifications = Array.isArray(det?.classifications) && det.classifications.length
             ? det.classifications
             : (
@@ -132,7 +133,10 @@ const buildDetectionItems = (detections) => {
                 label: classification?.label,
                 region: classification?.region || 'person',
                 confidence: classification?.confidence,
-                violation: Boolean(det?.violation) && classification?.label === det?.label,
+                violation: matchedViolations.some((matched) => (
+                    matched?.label === classification?.label
+                    && matched?.region === (classification?.region || 'person')
+                )),
             });
         });
     });

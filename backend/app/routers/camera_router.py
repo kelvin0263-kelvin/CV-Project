@@ -124,6 +124,24 @@ FISHEYE_VIEW_CONFIGS = [
 ]
 
 FISHEYE_UPLOAD_NAME_PATTERN = re.compile(r"^(?P<prefix>.+?)\s-\sView\s\d+\s*\([^)]*\)$")
+RTSP_URL_PATTERN = re.compile(r"^rtsps?://\S+$", re.IGNORECASE)
+
+
+def _normalize_required_text(value: str | None, field_name: str) -> str:
+    normalized = (value or "").strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail=f"{field_name} is required.")
+    return normalized
+
+
+def _normalize_rtsp_source_path(value: str | None) -> str:
+    source_path = _normalize_required_text(value, "Stream URL")
+    if not RTSP_URL_PATTERN.match(source_path):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid RTSP URL. Use the format rtsp://... or rtsps://...",
+        )
+    return source_path
 
 
 def _serialize_datetime(value: datetime | None) -> str | None:
@@ -1117,15 +1135,21 @@ async def get_cameras(db: AsyncSession = Depends(get_db)):
 
 @router.post("/api/cameras", response_model=CameraRead, dependencies=protected_route_dependencies)
 async def add_camera(camera: CameraCreate, db: AsyncSession = Depends(get_db)):
+    is_stream_camera = camera.type.upper().startswith(("RTSP", "NETWORK"))
     source_path = (camera.source_path or "").strip() or None
-    if camera.type.upper().startswith(("RTSP", "NETWORK")) and not source_path:
+    if is_stream_camera and not source_path:
         raise HTTPException(status_code=400, detail="Stream camera requires a source_path.")
+    if is_stream_camera and source_path:
+        source_path = _normalize_rtsp_source_path(source_path)
+        normalized_location = _normalize_required_text(camera.location, "Location")
+    else:
+        normalized_location = (camera.location or "").strip()
 
     camera_id = camera.id or str(uuid.uuid4())
     db_camera = Camera(
         id=camera_id,
         name=camera.name,
-        location=camera.location,
+        location=normalized_location,
         type=camera.type,
         status=camera.status,
         mode=camera.mode,
@@ -1169,6 +1193,7 @@ async def update_camera(camera_id: str, camera: CameraCreate, db: AsyncSession =
         raise HTTPException(status_code=404, detail="Camera not found")
 
     stream_config = await _get_stream_config(db, camera_id)
+    is_stream_camera = camera.type.upper().startswith(("RTSP", "NETWORK"))
     old_source_path = stream_config.source_path if stream_config is not None else None
     old_runtime_key = _get_runtime_key(stream_config) if stream_config is not None else None
     old_view_index = stream_config.view_index if stream_config is not None else None
@@ -1179,11 +1204,17 @@ async def update_camera(camera_id: str, camera: CameraCreate, db: AsyncSession =
         if source_path and source_path != old_source_path:
             raise HTTPException(status_code=400, detail="Stream source_path cannot be changed after creation.")
         source_path = old_source_path
-    if camera.type.upper().startswith(("RTSP", "NETWORK")) and not source_path:
+    if is_stream_camera and not source_path:
         raise HTTPException(status_code=400, detail="Stream camera requires a source_path.")
+    if is_stream_camera and source_path and stream_config is None:
+        source_path = _normalize_rtsp_source_path(source_path)
+    if source_path:
+        normalized_location = _normalize_required_text(camera.location, "Location")
+    else:
+        normalized_location = (camera.location or "").strip()
 
     db_camera.name = camera.name
-    db_camera.location = camera.location
+    db_camera.location = normalized_location
     db_camera.type = camera.type
     db_camera.status = camera.status
     db_camera.mode = camera.mode
@@ -1247,9 +1278,8 @@ async def update_camera(camera_id: str, camera: CameraCreate, db: AsyncSession =
 @router.post("/api/cameras/stream-source", dependencies=protected_route_dependencies)
 @router.post("/api/cameras/rtsp-source", dependencies=protected_route_dependencies)
 async def create_stream_source(payload: StreamSourceCreateRequest, db: AsyncSession = Depends(get_db)):
-    source_path = payload.source_path.strip()
-    if not source_path:
-        raise HTTPException(status_code=400, detail="Stream source_path is required.")
+    source_path = _normalize_rtsp_source_path(payload.source_path)
+    normalized_location = _normalize_required_text(payload.location, "Location")
 
     status = "Online" if payload.enabled else "Disabled"
     new_cameras: list[CameraRead] = []
@@ -1272,7 +1302,7 @@ async def create_stream_source(payload: StreamSourceCreateRequest, db: AsyncSess
             camera, stream_config = await _create_camera_with_stream(
                 db,
                 name=f"{payload.name} - View {idx + 1} ({angles[idx]}°)",
-                location=payload.location,
+                location=normalized_location,
                 camera_type=_infer_stream_camera_type(source_path, is_fisheye=True),
                 status=status,
                 mode=payload.mode,
@@ -1293,7 +1323,7 @@ async def create_stream_source(payload: StreamSourceCreateRequest, db: AsyncSess
         camera, stream_config = await _create_camera_with_stream(
             db,
             name=payload.name,
-            location=payload.location,
+            location=normalized_location,
             camera_type=_infer_stream_camera_type(source_path, is_fisheye=False),
             status=status,
             mode=payload.mode,
@@ -1320,9 +1350,7 @@ async def create_stream_source(payload: StreamSourceCreateRequest, db: AsyncSess
 
 @router.post("/api/cameras/test-stream", dependencies=protected_route_dependencies)
 async def test_stream_connection(payload: StreamConnectionTestRequest):
-    source_path = payload.source_path.strip()
-    if not source_path:
-        raise HTTPException(status_code=400, detail="source_path is required.")
+    source_path = _normalize_rtsp_source_path(payload.source_path)
 
     loop = asyncio.get_running_loop()
     try:
@@ -1523,6 +1551,8 @@ async def update_uploaded_video(
         raise HTTPException(status_code=400, detail="name is required.")
 
     normalized_location = (payload.location or "").strip()
+    if not normalized_location:
+        raise HTTPException(status_code=400, detail="location is required.")
     first_stream = rows[0][1]
     is_fisheye = bool(first_stream.is_fisheye)
     uploaded_video_start_time_override = _coerce_uploaded_video_start_time_override(
@@ -1760,7 +1790,7 @@ async def preview_uploaded_runtime(
 async def upload_video(
     file: UploadFile = File(...),
     enable_fisheye: bool = Form(False),
-    camera_name_prefix: str = Form("Camera"),
+    camera_name_prefix: str = Form(""),
     location: str = Form(""),
     uploaded_video_start_time: str = Form(""),
     selected_views: str = Form(""),  # Comma separated indices, e.g. "0,2,4"
@@ -1770,6 +1800,14 @@ async def upload_video(
     db: AsyncSession = Depends(get_db),
 ):
     try:
+        normalized_camera_name_prefix = (camera_name_prefix or "").strip()
+        if not normalized_camera_name_prefix:
+            raise HTTPException(status_code=400, detail="camera_name_prefix is required.")
+
+        normalized_location = (location or "").strip()
+        if not normalized_location:
+            raise HTTPException(status_code=400, detail="location is required.")
+
         file_id = str(uuid.uuid4())[:8]
         filename = f"{file_id}_{file.filename}"
         input_path = os.path.join(UPLOAD_DIR, filename)
@@ -1814,7 +1852,6 @@ async def upload_video(
             saved_uploaded_video_start_time = _parse_uploaded_video_start_time(input_path)
         upload_resolution = upload_metadata.get("resolution") or "640x360"
         upload_fps = int(round(float(upload_metadata.get("fps") or 30)))
-        normalized_location = (location or "").strip() or "Uploaded Video"
         pending_count = 0
 
         # Helper to create camera + stream_config in DB
@@ -1823,7 +1860,7 @@ async def upload_video(
 
             db_camera = Camera(
                 id=cam_id,
-                name=f"{camera_name_prefix} - {suffix}" if suffix else camera_name_prefix,
+                name=f"{normalized_camera_name_prefix} - {suffix}" if suffix else normalized_camera_name_prefix,
                 location=normalized_location,
                 type="Fisheye" if enable_fisheye else "File",
                 status="Ready",

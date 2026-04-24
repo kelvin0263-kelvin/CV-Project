@@ -31,7 +31,6 @@ const EMPTY_BUILDING_SUMMARY = {
     default_max_capacity: null,
     building_ids: [],
     capacity_by_building_id: {},
-    manual_offset: 0,
     raw_in: 0,
     raw_out: 0,
     raw_occupancy: 0,
@@ -264,7 +263,6 @@ const PeopleCounting = () => {
     const [selectedCapacityBuildingId, setSelectedCapacityBuildingId] = useState('');
     const [buildingCapacityById, setBuildingCapacityById] = useState({});
     const [buildingMaxCapacity, setBuildingMaxCapacity] = useState('');
-    const [buildingManualOffset, setBuildingManualOffset] = useState('0');
     const [buildingSummary, setBuildingSummary] = useState(EMPTY_BUILDING_SUMMARY);
     const [addingBuildingId, setAddingBuildingId] = useState(false);
     const [resettingBuilding, setResettingBuilding] = useState(false);
@@ -518,7 +516,6 @@ const PeopleCounting = () => {
                 setBuildingEnabled(data.enabled ?? true);
                 setRegisteredBuildingIds(Array.isArray(data.building_ids) ? data.building_ids : []);
                 setBuildingCapacityById(data.capacity_by_building_id ?? {});
-                setBuildingManualOffset(String(data.manual_offset ?? 0));
             } catch (err) {
                 console.error('Failed to fetch building counting config:', err);
             }
@@ -752,7 +749,6 @@ const PeopleCounting = () => {
                 body: JSON.stringify({
                     enabled: buildingEnabled,
                     building_ids: normalizedRegisteredBuildingIds,
-                    manual_offset: parseInt(buildingManualOffset || '0', 10) || 0,
                     ...(normalizedSelectedCapacityBuildingId
                         ? {
                             building_id: normalizedSelectedCapacityBuildingId,
@@ -771,7 +767,6 @@ const PeopleCounting = () => {
             setBuildingEnabled(savedBuildingConfig.enabled ?? true);
             setRegisteredBuildingIds(Array.isArray(savedBuildingConfig.building_ids) ? savedBuildingConfig.building_ids : []);
             setBuildingCapacityById(savedBuildingConfig.capacity_by_building_id ?? {});
-            setBuildingManualOffset(String(savedBuildingConfig.manual_offset ?? 0));
 
             const summaryRes = await fetch(`${apiUrl}/api/building-occupancy-summary`);
             if (summaryRes.ok) {
@@ -906,7 +901,6 @@ const PeopleCounting = () => {
             setBuildingEnabled(savedBuildingConfig.enabled ?? true);
             setRegisteredBuildingIds(Array.isArray(savedBuildingConfig.building_ids) ? savedBuildingConfig.building_ids : []);
             setBuildingCapacityById(savedBuildingConfig.capacity_by_building_id ?? {});
-            setBuildingManualOffset(String(savedBuildingConfig.manual_offset ?? 0));
             setSelectedCapacityBuildingId((current) => (
                 current === normalizedTargetBuildingId ? '' : current
             ));
@@ -1876,7 +1870,7 @@ const PeopleCounting = () => {
         <div className="space-y-4">
             <SectionShell
                 title="Building Occupancy"
-                description="Configure grouped occupancy, capacity alerts, and manual offsets for cameras that share the same building ID."
+                description="Configure grouped occupancy and capacity alerts for cameras that share the same building ID."
                 collapsible
                 collapsed={collapsedBuildingSections.occupancy}
                 onToggle={() => toggleBuildingSection('occupancy')}
@@ -1941,27 +1935,16 @@ const PeopleCounting = () => {
                         </div>
                         {selectedCapacityBuildingId.trim() && (
                             <>
-                                <div className="grid gap-3 sm:grid-cols-2">
-                                    <div className="space-y-2">
-                                        <label className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Building Capacity</label>
-                                        <input
-                                            type="number"
-                                            min="1"
-                                            placeholder="e.g. 200"
-                                            className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm"
-                                            value={buildingMaxCapacity}
-                                            onChange={(e) => setBuildingMaxCapacity(e.target.value)}
-                                        />
-                                    </div>
-                                    <div className="space-y-2">
-                                        <label className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Manual Offset</label>
-                                        <input
-                                            type="number"
-                                            className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm"
-                                            value={buildingManualOffset}
-                                            onChange={(e) => setBuildingManualOffset(e.target.value)}
-                                        />
-                                    </div>
+                                <div className="space-y-2">
+                                    <label className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Building Capacity</label>
+                                    <input
+                                        type="number"
+                                        min="1"
+                                        placeholder="e.g. 200"
+                                        className="flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm"
+                                        value={buildingMaxCapacity}
+                                        onChange={(e) => setBuildingMaxCapacity(e.target.value)}
+                                    />
                                 </div>
                                 <div className="grid gap-3 sm:grid-cols-3">
                                     <StatTile label="Building In" value={buildingSummary.raw_in ?? 0} icon={ArrowDownToLine} tone="green" />
@@ -1969,7 +1952,7 @@ const PeopleCounting = () => {
                                     <StatTile label="Building Now" value={buildingSummary.occupancy ?? 0} icon={Building2} tone={buildingCapacityExceeded ? 'amber' : 'default'} subtitle={buildingUtilizationSubtitle} />
                                 </div>
                                 <div className="rounded-2xl border border-border/70 bg-background px-4 py-3 text-sm text-muted-foreground">
-                                    Active cameras: {buildingSummary.active_camera_count ?? 0} | Raw occupancy: {buildingSummary.raw_occupancy ?? 0} | Manual offset: {buildingSummary.manual_offset ?? 0}
+                                    Active cameras: {buildingSummary.active_camera_count ?? 0} | Occupancy: {buildingSummary.raw_occupancy ?? 0}
                                 </div>
                                 {buildingCapacityExceeded && (
                                     <div className="rounded-2xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-500">

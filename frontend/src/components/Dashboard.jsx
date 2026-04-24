@@ -820,7 +820,7 @@ const Dashboard = () => {
             onMouseMove={revealControls}
             onMouseEnter={revealControls}
         >
-            <div className={`absolute left-4 top-4 z-50 flex flex-wrap gap-2 rounded-lg bg-black/50 p-2 transition-opacity duration-200 backdrop-blur-md ${controlsVisibilityClass}`}>
+            <div className={`absolute left-4 top-8 z-50 flex flex-wrap gap-2 rounded-lg bg-black/50 p-2 transition-opacity duration-200 backdrop-blur-md ${controlsVisibilityClass}`}>
                 <div className="mr-2 flex gap-1 border-r border-white/20 pr-2">
                     <Button size="icon" variant={layout === 1 ? 'secondary' : 'ghost'} className="h-8 w-8 text-white" onClick={() => handleLayoutChange(1)}>
                         <div className="h-4 w-4 rounded-sm border-2 border-current" />
@@ -963,7 +963,7 @@ const Dashboard = () => {
                             overlayPreferences={overlayPreferences}
                             slotIndex={index}
                             currentPage={currentPage}
-                            topLabelOffsetClass={index === 0 ? 'top-16' : 'top-1.5'}
+                            topLabelOffsetClass="top-1.5"
                             showSlotSelector={displayMode === 'custom'}
                             cameraOptions={currentCameraOptions}
                             assignedCameraLocations={assignedCameraLocations}

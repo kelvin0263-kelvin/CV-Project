@@ -56,7 +56,11 @@ backend/best.engine
 backend/best.onnx
 backend/slipper-cls-best.engine
 backend/slipper-cls-best.onnx
-
+backend/opencv_contrib_python-4.8.0+c4a576a-cp36-abi3-win_amd64.whl
+backend/wheelhouse
 scripts/dataset_output
 scripts/prediction_runs
 scripts/training_runs
+
+*.log
+nginx-1.30.0/logs/

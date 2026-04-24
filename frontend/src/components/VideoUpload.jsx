@@ -22,6 +22,7 @@ import { Label } from './ui/label';
 import { cn } from '../lib/utils';
 
 const DEFAULT_FISHEYE_VIEW = 0;
+const SUCCESS_REFRESH_DELAY_MS = 1200;
 const FISHEYE_VIEW_SUFFIX_PATTERN = /\s-\sView\s\d+\s*\([^)]*\)$/;
 const FISHEYE_VIEW_OPTIONS = Array.from({ length: 8 }, (_, index) => ({
     index,
@@ -160,6 +161,7 @@ const formatVideoFps = (fps) => {
 const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection = null, onActiveSectionChange = null }) => {
     const apiUrl = getApiBaseUrl();
     const previewContainerRef = useRef(null);
+    const refreshTimeoutRef = useRef(null);
     const [internalActiveSection, setInternalActiveSection] = useState('sources');
     const activeSection = controlledActiveSection ?? internalActiveSection;
     const setActiveSection = onActiveSectionChange ?? setInternalActiveSection;
@@ -246,6 +248,12 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
             cancelled = true;
         };
     }, [apiUrl, refreshTick]);
+
+    useEffect(() => () => {
+        if (refreshTimeoutRef.current) {
+            window.clearTimeout(refreshTimeoutRef.current);
+        }
+    }, []);
 
     useEffect(() => {
         if (!selectedFile) {
@@ -418,6 +426,15 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
         setRefreshTick((value) => value + 1);
     };
 
+    const schedulePageRefresh = () => {
+        if (refreshTimeoutRef.current) {
+            window.clearTimeout(refreshTimeoutRef.current);
+        }
+        refreshTimeoutRef.current = window.setTimeout(() => {
+            window.location.reload();
+        }, SUCCESS_REFRESH_DELAY_MS);
+    };
+
     const requestActionConfirmation = (action, runtimeKeysOverride = null) => {
         const runtimeKeys = Array.isArray(runtimeKeysOverride)
             ? runtimeKeysOverride
@@ -535,6 +552,11 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
             setMessage({ type: 'error', text: 'Please enter a source name.' });
             return;
         }
+        const location = editForm.location.trim();
+        if (!location) {
+            setMessage({ type: 'error', text: 'Please enter a location.' });
+            return;
+        }
 
         setIsSavingEdit(true);
         setMessage(null);
@@ -545,7 +567,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                 body: JSON.stringify({
                     runtime_key: activeItem.runtime_key,
                     name,
-                    location: editForm.location.trim(),
+                    location,
                     detection_roi: editForm.detectionRoi?.points?.length >= 3 ? editForm.detectionRoi : null,
                     is_fisheye: editForm.isFisheye,
                     view_index: editForm.isFisheye ? editForm.selectedView : -1,
@@ -583,13 +605,25 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
             return;
         }
 
+        const normalizedCameraNamePrefix = cameraNamePrefix.trim();
+        if (!normalizedCameraNamePrefix) {
+            setMessage({ type: 'error', text: 'Please enter a camera name.' });
+            return;
+        }
+
+        const normalizedUploadLocation = uploadLocation.trim();
+        if (!normalizedUploadLocation) {
+            setMessage({ type: 'error', text: 'Please enter a location.' });
+            return;
+        }
+
         setIsUploading(true);
         setMessage(null);
 
         const formData = new FormData();
         formData.append('file', selectedFile);
-        formData.append('camera_name_prefix', cameraNamePrefix.trim() || 'Uploaded Camera');
-        formData.append('location', uploadLocation.trim());
+        formData.append('camera_name_prefix', normalizedCameraNamePrefix);
+        formData.append('location', normalizedUploadLocation);
         formData.append('uploaded_video_start_time', uploadVideoStartTime.trim());
         formData.append('enable_fisheye', String(enableFisheye));
         if (enableFisheye) {
@@ -636,6 +670,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                 setSelectedRuntimeKeys(new Set([createdRuntimeKey]));
             }
             setActiveSection('sources');
+            schedulePageRefresh();
         } catch (error) {
             setMessage({
                 type: 'error',
@@ -682,6 +717,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                 setSelectedRuntimeKeys(new Set());
                 setActiveRuntimeKey('');
                 setRuntimePreviewImage('');
+                schedulePageRefresh();
             }
             refreshUploads();
         } catch (error) {
@@ -781,6 +817,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                                     onChange={(event) => setCameraNamePrefix(event.target.value)}
                                     className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                                     placeholder="e.g. Warehouse Test Video"
+                                    required
                                 />
                             </div>
                             <div className="space-y-2">
@@ -792,6 +829,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                                     onChange={(event) => setUploadLocation(event.target.value)}
                                     className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                                     placeholder="e.g. Building A"
+                                    required
                                 />
                             </div>
                         </div>
@@ -1141,6 +1179,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                                                                     onChange={handleEditFieldChange('name')}
                                                                     className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                                                                     placeholder="e.g. Warehouse Test Video"
+                                                                    required
                                                                 />
                                                             </div>
                                                             <div className="space-y-2">
@@ -1152,6 +1191,7 @@ const VideoUpload = ({ embedded = false, activeSection: controlledActiveSection 
                                                                     onChange={handleEditFieldChange('location')}
                                                                     className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                                                                     placeholder="e.g. Building A"
+                                                                    required
                                                                 />
                                                             </div>
                                                         </div>

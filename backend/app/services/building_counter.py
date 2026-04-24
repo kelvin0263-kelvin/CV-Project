@@ -11,7 +11,6 @@ _building_config = {
     "max_capacity": None,
     "building_ids": [],
     "capacity_by_building_id": {},
-    "manual_offset": 0,
 }
 _sensor_configs: dict[str, dict] = {}
 _entrance_rollups: dict[str, dict] = defaultdict(dict)
@@ -38,7 +37,6 @@ def sync_building_runtime(building_config: dict, sensor_configs: dict[str, dict]
             "capacity_by_building_id": _normalize_capacity_map(
                 building_config.get("capacity_by_building_id")
             ),
-            "manual_offset": int(building_config.get("manual_offset", 0) or 0),
         }
         _sensor_configs = {
             camera_id: {
@@ -95,14 +93,12 @@ def restore_building_runtime(snapshot: dict | None):
         _sync_capacity_alert_state_locked(mark_current_exceeded_as_fired=True)
 
 
-def reset_building_runtime(manual_offset: int | None = None):
-    """Clear all aggregated counters, optionally replacing the manual offset."""
+def reset_building_runtime():
+    """Clear all aggregated building counters."""
     global _raw_in, _raw_out, _entrance_rollups, _camera_rollups
     global _capacity_exceeded_since_by_building_id, _capacity_alert_fired_by_building_id
 
     with _runtime_lock:
-        if manual_offset is not None:
-            _building_config["manual_offset"] = int(manual_offset)
         _raw_in = 0
         _raw_out = 0
         _entrance_rollups = defaultdict(dict)
@@ -273,9 +269,8 @@ def get_building_summary() -> dict:
     """Return the current live building occupancy summary."""
     with _runtime_lock:
         monitoring_enabled = bool(_building_config.get("enabled", True))
-        manual_offset = int(_building_config["manual_offset"] or 0)
         raw_occupancy = max(0, _raw_in - _raw_out)
-        occupancy = max(0, raw_occupancy + manual_offset)
+        occupancy = raw_occupancy
 
         entrance_ids = _get_entrance_ids_locked()
         exceeded_building_ids: list[str] = []
@@ -329,7 +324,6 @@ def get_building_summary() -> dict:
             "default_max_capacity": _normalize_max_capacity(_building_config.get("max_capacity")),
             "building_ids": list(_building_config.get("building_ids") or []),
             "capacity_by_building_id": dict(_building_config.get("capacity_by_building_id") or {}),
-            "manual_offset": manual_offset,
             "raw_in": _raw_in,
             "raw_out": _raw_out,
             "raw_occupancy": raw_occupancy,

@@ -101,7 +101,7 @@ async def violation_persistence_loop():
     doesn't block the rest of the batch.
     """
     while True:
-        await asyncio.sleep(2)  # Check every 2 seconds
+        await asyncio.sleep(0.5)  # Check every 2 seconds
 
         events = drain_violation_queue()
 

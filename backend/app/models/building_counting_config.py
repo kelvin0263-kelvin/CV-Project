@@ -13,12 +13,10 @@ class BuildingCountingConfig(Base):
     max_capacity = Column(Integer, nullable=True)
     building_ids = Column(JSON, nullable=False, default=list)
     capacity_by_building_id = Column(JSON, nullable=False, default=dict)
-    manual_offset = Column(Integer, nullable=False, default=0)
 
     def __repr__(self) -> str:
         return (
             f"<BuildingCountingConfig(id={self.id!r}, enabled={self.enabled!r}, "
             f"max_capacity={self.max_capacity!r}, building_ids={self.building_ids!r}, "
-            f"capacity_by_building_id={self.capacity_by_building_id!r}, "
-            f"manual_offset={self.manual_offset!r})>"
+            f"capacity_by_building_id={self.capacity_by_building_id!r})>"
         )

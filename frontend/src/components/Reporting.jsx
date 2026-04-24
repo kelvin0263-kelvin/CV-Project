@@ -104,7 +104,6 @@ const EMPTY_BUILDING_SUMMARY = {
     exceeded_building_ids: [],
     default_max_capacity: null,
     capacity_by_building_id: {},
-    manual_offset: 0,
     raw_in: 0,
     raw_out: 0,
     raw_occupancy: 0,
@@ -212,7 +211,6 @@ const filterBuildingAggregateForScope = (
 
     return {
         ...snapshotLike,
-        manual_offset: 0,
         raw_in: rawIn,
         raw_out: rawOut,
         raw_occupancy: rawOccupancy,
@@ -1762,22 +1760,19 @@ const escapeExportHtml = (value) => String(value ?? '')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
 
-const FlowTrendPanel = ({ snapshots, cameraLabel }) => {
-    const [timeRange, setTimeRange] = useState('24h');
-    const [customStart, setCustomStart] = useState(() => createDefaultCustomRange().start);
-    const [customEnd, setCustomEnd] = useState(() => createDefaultCustomRange().end);
+const FlowTrendPanel = ({ snapshots, cameraLabel, startMs, endMs }) => {
     const [selectedBucket, setSelectedBucket] = useState('auto');
     const [showOccupancy, setShowOccupancy] = useState(false);
 
     const rangeBounds = useMemo(
-        () => getHistoryRangeBounds(timeRange, customStart, customEnd),
-        [timeRange, customStart, customEnd],
+        () => ({ valid: startMs == null || endMs == null || startMs <= endMs, startMs, endMs }),
+        [endMs, startMs],
     );
     const effectiveBucket = useMemo(() => (
         selectedBucket === 'auto'
-            ? getAdaptiveFlowBucket(timeRange, rangeBounds.startMs, rangeBounds.endMs)
+            ? getAdaptiveFlowBucket('custom', rangeBounds.startMs, rangeBounds.endMs)
             : selectedBucket
-    ), [selectedBucket, timeRange, rangeBounds.startMs, rangeBounds.endMs]);
+    ), [selectedBucket, rangeBounds.startMs, rangeBounds.endMs]);
 
     const flowSummary = useMemo(() => {
         if (!rangeBounds.valid) {
@@ -1816,20 +1811,6 @@ const FlowTrendPanel = ({ snapshots, cameraLabel }) => {
                         </p>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-xs font-medium text-muted-foreground">Range</span>
-                        <select
-                            className="h-8 rounded-md border border-input bg-background px-2 text-xs"
-                            value={timeRange}
-                            onChange={(e) => setTimeRange(e.target.value)}
-                        >
-                            <option value="1h">Last 1 hour</option>
-                            <option value="6h">Last 6 hours</option>
-                            <option value="24h">Last 24 hours</option>
-                            <option value="7d">Last 7 days</option>
-                            <option value="30d">Last 30 days</option>
-                            <option value="all">All data</option>
-                            <option value="custom">Custom range</option>
-                        </select>
                         <span className="text-xs font-medium text-muted-foreground">Grouping</span>
                         <select
                             className="h-8 rounded-md border border-input bg-background px-2 text-xs"
@@ -1848,32 +1829,14 @@ const FlowTrendPanel = ({ snapshots, cameraLabel }) => {
                     </div>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                    Range controls how much history is shown. Grouping controls whether the trend is combined into 15-minute, hourly, or daily points.
+                    This chart follows the global report date filter. Grouping controls whether the trend is combined into 15-minute, hourly, or daily points.
                 </p>
 
-                {timeRange === 'custom' && (
-                    <div className="flex flex-wrap items-center gap-2">
-                        <input
-                            type="datetime-local"
-                            value={customStart}
-                            onChange={(e) => setCustomStart(e.target.value)}
-                            className="h-8 rounded-md border border-input bg-background px-2 text-xs"
-                        />
-                        <span className="text-xs text-muted-foreground">to</span>
-                        <input
-                            type="datetime-local"
-                            value={customEnd}
-                            onChange={(e) => setCustomEnd(e.target.value)}
-                            className="h-8 rounded-md border border-input bg-background px-2 text-xs"
-                        />
-                    </div>
-                )}
-
-                {flowSummary.resetCount > 0 && (
+                {/* {flowSummary.resetCount > 0 && (
                     <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700">
                         {flowSummary.resetCount} counter reset{flowSummary.resetCount !== 1 ? 's were' : ' was'} detected in this trend range. Flow totals are rebuilt from changes between saved snapshots, so occupancy should be treated as an estimate.
                     </div>
-                )}
+                )} */}
             </CardHeader>
             <CardContent className="flex-1 min-h-[300px]">
                 {flowSummary.series.length > 0 ? (
@@ -1932,7 +1895,7 @@ const FlowTrendPanel = ({ snapshots, cameraLabel }) => {
                     </ResponsiveContainer>
                 ) : (
                     <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
-                        {rangeBounds.valid ? 'No people-counting flow data available for the selected trend range' : 'Choose a valid custom date/time range to view flow'}
+                        {rangeBounds.valid ? 'No people-counting flow data available for the selected report range' : 'Choose a valid global date/time range to view flow'}
                     </div>
                 )}
             </CardContent>
@@ -2658,7 +2621,6 @@ const BuildingOccupancyPanel = ({
             max_capacity: maxCapacity,
             capacity_exceeded: Boolean(entrance.capacity_exceeded),
             exceeded_building_ids: entrance.capacity_exceeded ? [selectedBuildingId] : [],
-            manual_offset: 0,
             raw_in: Number(entrance.total_in ?? 0),
             raw_out: Number(entrance.total_out ?? 0),
             raw_occupancy: occupancy,
@@ -2688,7 +2650,6 @@ const BuildingOccupancyPanel = ({
                 raw_occupancy: occupancy,
                 max_capacity: entrance.max_capacity ?? null,
                 capacity_exceeded: Boolean(entrance.capacity_exceeded),
-                manual_offset: 0,
                 occupancy,
                 active_camera_count: Array.isArray(entrance.camera_ids) ? entrance.camera_ids.length : 0,
                 entrance_summaries: {
@@ -3115,8 +3076,7 @@ const BuildingOccupancyPanel = ({
                     <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
                         <span>Building counting: {scopedBuildingSummary.enabled ? 'Enabled' : 'Disabled'}</span>
                         <span>Active cameras: {scopedBuildingSummary.active_camera_count ?? 0}</span>
-                        <span>Raw occupancy: {scopedBuildingSummary.raw_occupancy ?? 0}</span>
-                        <span>Manual offset: {selectedBuildingId === 'all' ? (scopedBuildingSummary.manual_offset ?? 0) : 'N/A'}</span>
+                        <span>Occupancy: {scopedBuildingSummary.raw_occupancy ?? 0}</span>
                     </div>
 
                     {scopedBuildingSummary.capacity_exceeded && (
@@ -3817,10 +3777,9 @@ const Reporting = () => {
     const [rowsPerPage, setRowsPerPage] = useState(20);
     const [detectionLogSort, setDetectionLogSort] = useState({ field: 'timestamp', direction: 'desc' });
     const [refreshToken, setRefreshToken] = useState(0);
-    const effectiveDateRange = useMemo(
-        () => getQuickRangeDateBounds(selectedQuickRange, startDate, endDate),
-        [selectedQuickRange, startDate, endDate],
-    );
+    // Resolve non-custom quick ranges against the current time on each render so
+    // "Today" and rolling ranges keep including newly arrived events.
+    const effectiveDateRange = getQuickRangeDateBounds(selectedQuickRange, startDate, endDate);
     const effectiveStartDate = effectiveDateRange.startDate;
     const effectiveEndDate = effectiveDateRange.endDate;
     const shouldPreferSnapshotTotalsForAppliedRange = useMemo(() => (
@@ -4787,7 +4746,12 @@ const Reporting = () => {
                                     </div>
                                 </div>
 
-                                <FlowTrendPanel snapshots={selectedCountingSnapshots} cameraLabel={selectedCameraLabel} />
+                                <FlowTrendPanel
+                                    snapshots={selectedCountingSnapshots}
+                                    cameraLabel={selectedCameraLabel}
+                                    startMs={reportingDateBounds.startMs}
+                                    endMs={reportingDateBounds.endMs}
+                                />
                             </>
                         )}
 

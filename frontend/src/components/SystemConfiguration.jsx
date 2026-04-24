@@ -14,6 +14,8 @@ import { getApiBaseUrl, getWSUrl } from '../apiConfig';
 
 const CAMERA_ANALYSIS_TAGS_UPDATED_EVENT = 'camera-analysis-tags-updated';
 const DEFAULT_FISHEYE_VIEW = 0;
+const SUCCESS_REFRESH_DELAY_MS = 1200;
+const RTSP_URL_PATTERN = /^rtsps?:\/\/\S+$/i;
 
 const inferOverlayMode = (analysisTags = []) => {
     const normalizedTags = new Set(
@@ -56,11 +58,14 @@ const parseResolutionString = (resolution) => {
     return { width: 640, height: 360 };
 };
 
+const isValidRtspUrl = (value = '') => RTSP_URL_PATTERN.test(String(value || '').trim());
+
 const SYSTEM_SURFACE_CARD_CLASS = 'border-slate-200/80 bg-white/95 shadow-sm';
 
 const SystemConfiguration = () => {
     const apiUrl = getApiBaseUrl();
     const previewContainerRef = useRef(null);
+    const refreshTimeoutRef = useRef(null);
     const submitInFlightRef = useRef(false);
     const [searchParams, setSearchParams] = useSearchParams();
     const [cameras, setCameras] = useState([]);
@@ -126,6 +131,12 @@ const SystemConfiguration = () => {
         return () => {
             window.removeEventListener(CAMERA_ANALYSIS_TAGS_UPDATED_EVENT, handleCameraTagsUpdated);
         };
+    }, []);
+
+    useEffect(() => () => {
+        if (refreshTimeoutRef.current) {
+            window.clearTimeout(refreshTimeoutRef.current);
+        }
     }, []);
 
     const fetchCameras = async () => {
@@ -237,6 +248,42 @@ const SystemConfiguration = () => {
         setSearchParams({}, { replace: true });
     };
 
+    const schedulePageRefresh = () => {
+        if (refreshTimeoutRef.current) {
+            window.clearTimeout(refreshTimeoutRef.current);
+        }
+        refreshTimeoutRef.current = window.setTimeout(() => {
+            window.location.reload();
+        }, SUCCESS_REFRESH_DELAY_MS);
+    };
+
+    const validateStreamInputs = ({ forConnectionTest = false } = {}) => {
+        const normalizedStreamUrl = String(formData.streamUrl || '').trim();
+        if (!normalizedStreamUrl) {
+            setTestResult({ type: 'error', message: 'Please enter a stream URL.' });
+            return null;
+        }
+        if (!isValidRtspUrl(normalizedStreamUrl)) {
+            setTestResult({
+                type: 'error',
+                message: 'Invalid RTSP URL. Use the format rtsp://... or rtsps://...',
+            });
+            return null;
+        }
+
+        if (forConnectionTest) {
+            return { normalizedStreamUrl };
+        }
+
+        const normalizedLocation = String(formData.location || '').trim();
+        if (!normalizedLocation) {
+            setStatusMessage({ type: 'error', text: 'Location is required.' });
+            return null;
+        }
+
+        return { normalizedStreamUrl, normalizedLocation };
+    };
+
     const handleInputChange = (e) => {
         const { name, value, type, checked } = e.target;
         setFormData(prev => ({ ...prev, [name]: type === 'checkbox' ? checked : value }));
@@ -318,6 +365,7 @@ const SystemConfiguration = () => {
         }
         submitInFlightRef.current = true;
         setIsSaving(true);
+        setStatusMessage(null);
 
         try {
             if (showUpload) {
@@ -384,14 +432,20 @@ const SystemConfiguration = () => {
             }
 
             // Standard Add/Edit
+            const validatedStreamInputs = validateStreamInputs();
+            if (!validatedStreamInputs) {
+                return;
+            }
+
+            const { normalizedStreamUrl, normalizedLocation } = validatedStreamInputs;
             const payload = {
                 id: selectedCamera ? selectedCamera.id : Date.now().toString(),
-                name: formData.name,
-                location: formData.location,
-                type: inferSourceType(formData.streamUrl, enableFisheye),
+                name: formData.name.trim(),
+                location: normalizedLocation,
+                type: inferSourceType(normalizedStreamUrl, enableFisheye),
                 status: formData.enabled ? 'Online' : 'Disabled',
                 mode: selectedCamera?.mode || 'Unassigned',
-                source_path: formData.streamUrl.trim(),
+                source_path: normalizedStreamUrl,
                 resolution: formData.resolution,
                 fps: parseInt(formData.frameRate, 10) || 30,
                 enabled: formData.enabled,
@@ -401,18 +455,13 @@ const SystemConfiguration = () => {
                 detection_roi: sourceRoi?.points?.length >= 3 ? sourceRoi : null,
             };
 
-            if (!payload.source_path) {
-                alert("Please enter a stream URL.");
-                return;
-            }
-
             if (enableFisheye && !isEditMode) {
                 const res = await fetch(`${apiUrl}/api/cameras/stream-source`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        name: formData.name,
-                        location: formData.location,
+                        name: formData.name.trim(),
+                        location: normalizedLocation,
                         source_path: payload.source_path,
                         mode: payload.mode,
                         resolution: formData.resolution,
@@ -433,9 +482,11 @@ const SystemConfiguration = () => {
                 setStatusMessage({ type: 'success', text: 'Stream camera added successfully.' });
                 setActiveManagementTab('streams');
                 setActiveStreamTab('added');
+                schedulePageRefresh();
                 return;
             }
 
+            let shouldRefreshPage = false;
             if (isEditMode) {
                 const res = await fetch(`${apiUrl}/api/cameras/${selectedCamera.id}`, {
                     method: 'PUT',
@@ -458,14 +509,22 @@ const SystemConfiguration = () => {
                     throw new Error(err.detail || 'Failed to save camera');
                 }
                 setStatusMessage({ type: 'success', text: 'Stream camera added successfully.' });
+                shouldRefreshPage = true;
             }
             await fetchCameras();
             resetForm();
             setActiveManagementTab('streams');
             setActiveStreamTab('added');
+            if (shouldRefreshPage) {
+                schedulePageRefresh();
+            }
         } catch (error) {
             console.error("Save error:", error);
-            alert("Failed to save camera");
+            const message = error?.message || 'Failed to save camera.';
+            setStatusMessage({ type: 'error', text: message });
+            if (/rtsp|stream url/i.test(message)) {
+                setTestResult({ type: 'error', message });
+            }
         } finally {
             submitInFlightRef.current = false;
             setIsSaving(false);
@@ -499,6 +558,7 @@ const SystemConfiguration = () => {
             setStatusMessage({ type: 'success', text: 'Stream camera removed successfully.' });
             setActiveManagementTab('streams');
             setActiveStreamTab('added');
+            schedulePageRefresh();
         } catch (error) {
             setStatusMessage({
                 type: 'error',
@@ -510,10 +570,11 @@ const SystemConfiguration = () => {
     };
 
     const handleTestConnection = async () => {
-        if (!formData.streamUrl) {
-            setTestResult({ type: 'error', message: 'Please enter a stream URL.' });
+        const validatedStreamInputs = validateStreamInputs({ forConnectionTest: true });
+        if (!validatedStreamInputs) {
             return;
         }
+        const { normalizedStreamUrl } = validatedStreamInputs;
 
         setIsTestingConnection(true);
         try {
@@ -523,7 +584,7 @@ const SystemConfiguration = () => {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    source_path: formData.streamUrl.trim(),
+                    source_path: normalizedStreamUrl,
                     enable_fisheye: enableFisheye,
                     selected_view: Array.from(selectedViews)[0] ?? DEFAULT_FISHEYE_VIEW,
                 }),
@@ -817,6 +878,7 @@ const SystemConfiguration = () => {
                                                 onChange={handleInputChange}
                                                 className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                                                 placeholder="e.g. Building A"
+                                                required
                                             />
                                         </div>
                                     </div>
@@ -986,6 +1048,7 @@ const SystemConfiguration = () => {
                                                     placeholder="rtsp://camera/stream"
                                                     disabled={isEditMode}
                                                     readOnly={isEditMode}
+                                                    required
                                                 />
                                                 <Button type="button" variant="secondary" onClick={handleTestConnection} disabled={isTestingConnection || isSaving}>
                                                     {isTestingConnection ? 'Testing...' : 'Test'}

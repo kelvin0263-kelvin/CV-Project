@@ -533,7 +533,6 @@ def _building_snapshot_signature_from_summary(summary: dict) -> tuple:
         bool(summary.get("enabled", True)),
         summary.get("max_capacity"),
         bool(summary.get("capacity_exceeded", False)),
-        int(summary.get("manual_offset", 0) or 0),
         int(summary.get("raw_in", 0) or 0),
         int(summary.get("raw_out", 0) or 0),
         int(summary.get("raw_occupancy", 0) or 0),
@@ -571,7 +570,6 @@ def _build_building_snapshot(
         "raw_occupancy": int(summary.get("raw_occupancy", 0) or 0),
         "max_capacity": summary.get("max_capacity"),
         "capacity_exceeded": bool(summary.get("capacity_exceeded", False)),
-        "manual_offset": int(summary.get("manual_offset", 0) or 0),
         "occupancy": int(summary.get("occupancy", 0) or 0),
         "active_camera_count": int(summary.get("active_camera_count", 0) or 0),
         "entrance_summaries": summary.get("entrance_summaries") or {},
@@ -658,7 +656,6 @@ async def _is_duplicate_building_snapshot(session: AsyncSession, snapshot: dict)
                     "enabled": latest_row.enabled,
                     "max_capacity": latest_row.max_capacity,
                     "capacity_exceeded": latest_row.capacity_exceeded,
-                    "manual_offset": latest_row.manual_offset,
                     "raw_in": latest_row.raw_in,
                     "raw_out": latest_row.raw_out,
                     "raw_occupancy": latest_row.raw_occupancy,
@@ -920,7 +917,6 @@ async def counting_snapshot_persistence_loop():
                         raw_occupancy=int(snap.get("raw_occupancy", 0) or 0),
                         max_capacity=snap.get("max_capacity"),
                         capacity_exceeded=bool(snap.get("capacity_exceeded", False)),
-                        manual_offset=int(snap.get("manual_offset", 0) or 0),
                         occupancy=int(snap.get("occupancy", 0) or 0),
                         active_camera_count=int(snap.get("active_camera_count", 0) or 0),
                         entrance_summaries=snap.get("entrance_summaries") or {},
@@ -985,7 +981,6 @@ async def _get_or_create_building_config(session: AsyncSession) -> BuildingCount
             max_capacity=None,
             building_ids=[],
             capacity_by_building_id={},
-            manual_offset=0,
         )
         session.add(row)
         await session.flush()
@@ -1251,7 +1246,6 @@ async def sync_counting_runtime_from_db(session: AsyncSession):
             "max_capacity": building_config.max_capacity,
             "building_ids": registered_building_ids,
             "capacity_by_building_id": normalized_capacity_map,
-            "manual_offset": building_config.manual_offset,
         },
         building_sensor_configs,
     )
@@ -1592,8 +1586,6 @@ async def update_building_config(
         assigned_building_ids,
     )
     row.capacity_by_building_id = normalized_capacity_map
-    if update.manual_offset is not None:
-        row.manual_offset = int(update.manual_offset)
 
     await db.flush()
     await db.refresh(row)
@@ -1685,8 +1677,7 @@ async def get_building_occupancy_summary():
 
 
 @router.post("/api/building-occupancy-summary/reset", response_model=BuildingOccupancySummaryRead)
-async def reset_building_occupancy_summary(db: AsyncSession = Depends(get_db)):
-    row = await _get_or_create_building_config(db)
-    reset_building_runtime(manual_offset=row.manual_offset)
+async def reset_building_occupancy_summary():
+    reset_building_runtime()
     request_building_snapshot_if_needed()
     return get_building_summary()

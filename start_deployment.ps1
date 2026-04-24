@@ -8,6 +8,11 @@ $frontendDistDir = Join-Path $frontendDir "dist"
 $backendVenvPython = Join-Path $backendDir "venv\Scripts\python.exe"
 $backendRequirements = Join-Path $backendDir "requirements.txt"
 $backendDepsStamp = Join-Path $backendDir ".deps_installed.stamp"
+$backendOpenCvWheelPattern = "opencv_contrib_python-*.whl"
+$backendWheelhouseDir = Join-Path $backendDir "wheelhouse"
+$torchVersion = "2.5.1"
+$torchVisionVersion = "0.20.1"
+$torchAudioVersion = "2.5.1"
 $frontendPackageJson = Join-Path $frontendDir "package.json"
 $frontendPackageLock = Join-Path $frontendDir "package-lock.json"
 $frontendNodeModules = Join-Path $frontendDir "node_modules"
@@ -150,6 +155,36 @@ function Get-ItemWriteTimeOrMin {
     return [datetime]::MinValue
 }
 
+function Resolve-BackendOpenCvWheel {
+    $wheel = Get-ChildItem -Path $backendDir -File -Filter $backendOpenCvWheelPattern -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTimeUtc -Descending |
+        Select-Object -First 1
+
+    return $wheel
+}
+
+function Test-BackendWheelhouseHasTorchPackages {
+    if (-not (Test-Path $backendWheelhouseDir)) {
+        return $false
+    }
+
+    $requiredPatterns = @(
+        "torch-$torchVersion*whl"
+        "torchvision-$torchVisionVersion*whl"
+        "torchaudio-$torchAudioVersion*whl"
+    )
+
+    foreach ($pattern in $requiredPatterns) {
+        $match = Get-ChildItem -Path $backendWheelhouseDir -File -Filter $pattern -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if (-not $match) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
 function Test-BackendDepsNeedInstall {
     if (-not (Test-Path $backendRequirements)) {
         throw "requirements.txt was not found at '$backendRequirements'."
@@ -159,7 +194,17 @@ function Test-BackendDepsNeedInstall {
         return $true
     }
 
-    return (Get-Item $backendRequirements).LastWriteTimeUtc -gt (Get-Item $backendDepsStamp).LastWriteTimeUtc
+    $depsStampWriteTime = (Get-Item $backendDepsStamp).LastWriteTimeUtc
+    if ((Get-Item $backendRequirements).LastWriteTimeUtc -gt $depsStampWriteTime) {
+        return $true
+    }
+
+    $opencvWheel = Resolve-BackendOpenCvWheel
+    if ($opencvWheel -and $opencvWheel.LastWriteTimeUtc -gt $depsStampWriteTime) {
+        return $true
+    }
+
+    return $false
 }
 
 function Ensure-BackendVenv {
@@ -267,13 +312,34 @@ Ensure-PostgresServiceStarted -ServiceName $postgresServiceName
 Write-Step "Checking backend virtual environment"
 Ensure-BackendVenv -BootstrapPython $bootstrapPython
 $pythonExe = $backendVenvPython
+$backendOpenCvWheel = Resolve-BackendOpenCvWheel
 
 Write-Step "Checking backend dependencies"
 Push-Location $backendDir
 try {
     if (Test-BackendDepsNeedInstall) {
+        if (-not $backendOpenCvWheel) {
+            throw "No OpenCV wheel matching '$backendOpenCvWheelPattern' was found in '$backendDir'. Place the wheel file there before starting deployment."
+        }
+
+        Write-Host "Installing OpenCV wheel: $($backendOpenCvWheel.Name)" -ForegroundColor Yellow
+        & $pythonExe -m pip install $backendOpenCvWheel.FullName
+
+        Write-Host "Reinstalling SciPy 1.11.4" -ForegroundColor Yellow
+        & $pythonExe -m pip install "scipy==1.11.4" --force-reinstall --no-cache-dir
+
+        if (Test-BackendWheelhouseHasTorchPackages) {
+            Write-Host "Installing PyTorch CUDA 12.1 packages from local wheelhouse: $backendWheelhouseDir" -ForegroundColor Yellow
+            & $pythonExe -m pip install --no-index --find-links $backendWheelhouseDir "torch==$torchVersion" "torchvision==$torchVisionVersion" "torchaudio==$torchAudioVersion"
+        }
+        else {
+            Write-Host "Local wheelhouse missing one or more PyTorch wheels. Falling back to PyTorch website." -ForegroundColor Yellow
+            & $pythonExe -m pip install "torch==$torchVersion" "torchvision==$torchVisionVersion" "torchaudio==$torchAudioVersion" --index-url https://download.pytorch.org/whl/cu121
+        }
+
         Write-Host "Installing Python packages from requirements.txt" -ForegroundColor Yellow
         & $pythonExe -m pip install -r requirements.txt
+
         Set-Content -Path $backendDepsStamp -Value (Get-Date).ToString("o") -NoNewline
     }
     else {

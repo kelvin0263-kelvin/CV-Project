@@ -204,6 +204,12 @@ const StreamPlayer = ({
             return `${formattedLabel}${formattedConfidence}`;
         };
 
+        const primaryDressCodeLine = lowerBodyClassification
+            ? formatClassificationLabel(lowerBodyClassification)
+            : (!footwearClassification
+                ? (formatClassificationLabel(null, det.label, det.confidence) || clothingLabel)
+                : null);
+
         if (normalizedMode === 'counting') {
             return {
                 color: '#06b6d4',
@@ -258,7 +264,7 @@ const StreamPlayer = ({
                 lineWidth: isViolation ? 3 : 2,
                 dash: [],
                 labelLines: [
-                    formatClassificationLabel(lowerBodyClassification, det.label, det.confidence) || clothingLabel,
+                    primaryDressCodeLine,
                     formatClassificationLabel(footwearClassification),
                 ].filter(Boolean),
                 labelTextColor: '#ffffff',
@@ -273,7 +279,7 @@ const StreamPlayer = ({
                 lineWidth: isViolation ? 3 : 2,
                 dash: [],
                 labelLines: [
-                    formatClassificationLabel(lowerBodyClassification, det.label, det.confidence) || clothingLabel,
+                    primaryDressCodeLine,
                     formatClassificationLabel(footwearClassification),
                 ].filter(Boolean),
                 labelTextColor: '#ffffff',

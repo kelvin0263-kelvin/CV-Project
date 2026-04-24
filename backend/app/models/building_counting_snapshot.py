@@ -17,7 +17,6 @@ class BuildingCountingSnapshot(Base):
     raw_occupancy = Column(Integer, nullable=False, default=0)
     max_capacity = Column(Integer, nullable=True)
     capacity_exceeded = Column(Boolean, nullable=False, default=False)
-    manual_offset = Column(Integer, nullable=False, default=0)
     occupancy = Column(Integer, nullable=False, default=0)
     active_camera_count = Column(Integer, nullable=False, default=0)
     entrance_summaries = Column(JSON, nullable=False, default=dict)
