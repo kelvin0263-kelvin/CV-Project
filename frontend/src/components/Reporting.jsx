@@ -833,6 +833,252 @@ const normalizeSnapshotRows = (rows) => rows
     })
     .filter(Boolean);
 
+const isNonZeroCountingSnapshot = (row) => (
+    Number(row?.total_in ?? 0) !== 0 || Number(row?.total_out ?? 0) !== 0
+);
+
+const getLatestSnapshotAtOrBefore = (rows, targetTime) => {
+    if (!Array.isArray(rows) || rows.length === 0 || targetTime == null) return null;
+
+    let latest = null;
+    rows.forEach((row) => {
+        if (row.tsMs > targetTime) return;
+        if (!latest || row.tsMs >= latest.tsMs) {
+            latest = row;
+        }
+    });
+    return latest;
+};
+
+const pickLatestValidSnapshotInBucket = (rows) => {
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+
+    const latestSnapshot = rows[rows.length - 1];
+    if (isNonZeroCountingSnapshot(latestSnapshot)) {
+        return latestSnapshot;
+    }
+
+    for (let index = rows.length - 2; index >= 0; index -= 1) {
+        if (isNonZeroCountingSnapshot(rows[index])) {
+            return rows[index];
+        }
+    }
+
+    return latestSnapshot;
+};
+
+const calculateCounterDelta = (currentValue, previousValue) => {
+    const current = Math.max(0, Number(currentValue ?? 0));
+    if (previousValue == null) {
+        return {
+            delta: current,
+            resetDetected: false,
+        };
+    }
+
+    const previous = Math.max(0, Number(previousValue ?? 0));
+    if (current >= previous) {
+        return {
+            delta: current - previous,
+            resetDetected: false,
+        };
+    }
+
+    return {
+        delta: current,
+        resetDetected: true,
+    };
+};
+
+const calculateSnapshotDelta = (currentSnapshot, previousSnapshot) => {
+    const inResult = calculateCounterDelta(currentSnapshot?.total_in, previousSnapshot?.total_in);
+    const outResult = calculateCounterDelta(currentSnapshot?.total_out, previousSnapshot?.total_out);
+
+    return {
+        deltaIn: Math.max(0, Number(inResult.delta ?? 0)),
+        deltaOut: Math.max(0, Number(outResult.delta ?? 0)),
+        resetDetected: Boolean(inResult.resetDetected || outResult.resetDetected),
+    };
+};
+
+const buildTimeBuckets = (rangeStart, rangeEnd, bucket) => {
+    if (rangeStart == null || rangeEnd == null || rangeStart > rangeEnd) return [];
+
+    const bucketDurationMs = FLOW_BUCKET_DURATIONS_MS[bucket] || FLOW_BUCKET_DURATIONS_MS['1d'];
+    const firstBucketStartMs = getBucketStartMs(rangeStart, bucket);
+    const lastBucketStartMs = getBucketStartMs(rangeEnd, bucket);
+    const buckets = [];
+
+    for (let tsMs = firstBucketStartMs; tsMs <= lastBucketStartMs; tsMs += bucketDurationMs) {
+        buckets.push({
+            tsMs,
+            label: formatFlowBucketTick(tsMs, bucket),
+            fullLabel: formatFlowBucketRange(tsMs, bucket),
+            in: 0,
+            out: 0,
+            totalTraffic: 0,
+            occupancy: null,
+            peakOccupancy: 0,
+            resetDetected: false,
+            hasOccupancy: false,
+        });
+    }
+
+    return buckets;
+};
+
+const calculateInOutMovementChart = ({ snapshots, rangeStart = null, rangeEnd = null, bucket = '1d' }) => {
+    const normalizedRows = normalizeSnapshotRows(snapshots)
+        .filter((row) => row.camera_id)
+        .sort((a, b) => a.tsMs - b.tsMs);
+
+    if (normalizedRows.length === 0) {
+        return {
+            series: [],
+            totalIn: 0,
+            totalOut: 0,
+            totalTraffic: 0,
+            peakOccupancy: 0,
+            estimatedOccupancy: 0,
+            peakPeriodLabel: '-',
+            resetCount: 0,
+        };
+    }
+
+    const resolvedRangeStart = rangeStart ?? normalizedRows[0].tsMs;
+    const resolvedRangeEnd = rangeEnd ?? normalizedRows[normalizedRows.length - 1].tsMs;
+    if (resolvedRangeStart > resolvedRangeEnd) {
+        return {
+            series: [],
+            totalIn: 0,
+            totalOut: 0,
+            totalTraffic: 0,
+            peakOccupancy: 0,
+            estimatedOccupancy: 0,
+            peakPeriodLabel: '-',
+            resetCount: 0,
+        };
+    }
+
+    const bucketSeries = buildTimeBuckets(resolvedRangeStart, resolvedRangeEnd, bucket);
+    if (bucketSeries.length === 0) {
+        return {
+            series: [],
+            totalIn: 0,
+            totalOut: 0,
+            totalTraffic: 0,
+            peakOccupancy: 0,
+            estimatedOccupancy: 0,
+            peakPeriodLabel: '-',
+            resetCount: 0,
+        };
+    }
+
+    const bucketMap = new Map(bucketSeries.map((entry) => [entry.tsMs, entry]));
+    const groupedRows = new Map();
+    let hasInRangeSnapshot = false;
+    let resetCount = 0;
+
+    normalizedRows.forEach((row) => {
+        const existing = groupedRows.get(row.camera_id) || [];
+        existing.push(row);
+        groupedRows.set(row.camera_id, existing);
+    });
+
+    groupedRows.forEach((cameraRows) => {
+        const rowsByBucket = new Map();
+
+        cameraRows.forEach((row) => {
+            if (row.tsMs < resolvedRangeStart || row.tsMs > resolvedRangeEnd) return;
+            const bucketStartMs = getBucketStartMs(row.tsMs, bucket);
+            const existing = rowsByBucket.get(bucketStartMs) || [];
+            existing.push(row);
+            rowsByBucket.set(bucketStartMs, existing);
+            hasInRangeSnapshot = true;
+        });
+
+        let previousSnapshot = getLatestSnapshotAtOrBefore(cameraRows, resolvedRangeStart);
+
+        bucketSeries.forEach((bucketEntry) => {
+            const bucketRows = rowsByBucket.get(bucketEntry.tsMs);
+            if (!bucketRows || bucketRows.length === 0) return;
+
+            bucketRows.sort((a, b) => a.tsMs - b.tsMs);
+            const latestOccupancySnapshot = bucketRows[bucketRows.length - 1];
+            const movementSnapshot = pickLatestValidSnapshotInBucket(bucketRows);
+            const delta = calculateSnapshotDelta(movementSnapshot, previousSnapshot);
+            const chartPoint = bucketMap.get(bucketEntry.tsMs);
+
+            chartPoint.in += delta.deltaIn;
+            chartPoint.out += delta.deltaOut;
+            chartPoint.totalTraffic += delta.deltaIn + delta.deltaOut;
+            chartPoint.occupancy = Number(chartPoint.occupancy ?? 0) + Number(latestOccupancySnapshot.current_occupancy ?? 0);
+            chartPoint.hasOccupancy = true;
+            chartPoint.peakOccupancy = Math.max(
+                Number(chartPoint.peakOccupancy ?? 0),
+                Number(latestOccupancySnapshot.current_occupancy ?? 0),
+            );
+            chartPoint.resetDetected = chartPoint.resetDetected || delta.resetDetected;
+
+            if (delta.resetDetected) {
+                resetCount += 1;
+            }
+
+            previousSnapshot = movementSnapshot;
+        });
+    });
+
+    if (!hasInRangeSnapshot) {
+        return {
+            series: [],
+            totalIn: 0,
+            totalOut: 0,
+            totalTraffic: 0,
+            peakOccupancy: 0,
+            estimatedOccupancy: 0,
+            peakPeriodLabel: '-',
+            resetCount: 0,
+        };
+    }
+
+    const latestByCamera = new Map();
+    groupedRows.forEach((cameraRows, cameraId) => {
+        const latestSnapshot = getLatestSnapshotAtOrBefore(cameraRows, resolvedRangeEnd);
+        if (latestSnapshot) {
+            latestByCamera.set(cameraId, latestSnapshot);
+        }
+    });
+
+    const series = bucketSeries.map(({ hasOccupancy, ...entry }) => ({
+        ...entry,
+        occupancy: hasOccupancy ? entry.occupancy : null,
+    }));
+    const totalIn = series.reduce((sum, point) => sum + Number(point.in ?? 0), 0);
+    const totalOut = series.reduce((sum, point) => sum + Number(point.out ?? 0), 0);
+    const peakPeriod = series.reduce((best, point) => {
+        if (!best || point.totalTraffic > best.totalTraffic) return point;
+        return best;
+    }, null);
+    const peakOccupancyPeriod = series.reduce((best, point) => {
+        if (!best || Number(point.occupancy ?? 0) > Number(best.occupancy ?? 0)) return point;
+        return best;
+    }, null);
+    const estimatedOccupancy = Array.from(latestByCamera.values())
+        .reduce((sum, row) => sum + Number(row.current_occupancy ?? 0), 0);
+
+    return {
+        series,
+        totalIn,
+        totalOut,
+        totalTraffic: totalIn + totalOut,
+        peakOccupancy: series.reduce((peak, point) => Math.max(peak, Number(point.occupancy ?? 0)), 0),
+        peakOccupancyPeriodLabel: peakOccupancyPeriod?.fullLabel || '-',
+        estimatedOccupancy: Math.max(0, estimatedOccupancy),
+        peakPeriodLabel: peakPeriod?.fullLabel || '-',
+        resetCount,
+    };
+};
+
 const aggregateCountingFlow = (rows, { startMs = null, endMs = null, bucket = '1d' } = {}) => {
     const groupedRows = new Map();
     const bucketMap = new Map();
@@ -1045,7 +1291,7 @@ const aggregateTrafficAnalytics = (rows, { startMs = null, endMs = null, bucket 
     };
 };
 
-const aggregateBuildingFlow = (rows, { startMs = null, endMs = null, bucket = '1d' } = {}) => {
+const _aggregateBuildingFlow = (rows, { startMs = null, endMs = null, bucket = '1d' } = {}) => {
     const sortedRows = [...rows].sort((a, b) => (a.tsMs ?? 0) - (b.tsMs ?? 0));
     const bucketMap = new Map();
     let peakOccupancy = 0;
@@ -1091,7 +1337,11 @@ const aggregateBuildingFlow = (rows, { startMs = null, endMs = null, bucket = '1
 
     const series = Array.from(bucketMap.values())
         .sort((a, b) => a.tsMs - b.tsMs)
-        .map(({ sourceTsMs, ...point }) => point);
+        .map((point) => {
+            const nextPoint = { ...point };
+            delete nextPoint.sourceTsMs;
+            return nextPoint;
+        });
     const peakPeriod = series.reduce((best, point) => {
         if (!best || point.totalTraffic > best.totalTraffic) return point;
         return best;
@@ -1860,9 +2110,10 @@ const FlowTrendPanel = ({ snapshots, cameraLabel, startMs, endMs }) => {
                 resetCount: 0,
             };
         }
-        return aggregateCountingFlow(snapshots, {
-            startMs: rangeBounds.startMs,
-            endMs: rangeBounds.endMs,
+        return calculateInOutMovementChart({
+            snapshots,
+            rangeStart: rangeBounds.startMs,
+            rangeEnd: rangeBounds.endMs,
             bucket: effectiveBucket,
         });
     }, [effectiveBucket, rangeBounds.endMs, rangeBounds.startMs, rangeBounds.valid, snapshots]);
@@ -1877,10 +2128,10 @@ const FlowTrendPanel = ({ snapshots, cameraLabel, startMs, endMs }) => {
                     <div>
                         <CardTitle className="flex items-center gap-2">
                             <TrendingUp className="w-4 h-4" />
-                            In/Out Over Time
+                            IN/OUT Movement Over Time
                         </CardTitle>
                         <p className="mt-1 text-sm text-muted-foreground">
-                            {cameraLabel} flow trend with adaptive {effectiveBucket === '15m' ? '15-minute' : effectiveBucket === '1h' ? 'hourly' : 'daily'} buckets.
+                            {cameraLabel} movement trend with adaptive {effectiveBucket === '15m' ? '15-minute' : effectiveBucket === '1h' ? 'hourly' : 'daily'} buckets.
                         </p>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
@@ -1902,7 +2153,7 @@ const FlowTrendPanel = ({ snapshots, cameraLabel, startMs, endMs }) => {
                     </div>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                    This chart follows the global report date filter. Grouping controls whether the trend is combined into 15-minute, hourly, or daily points.
+                    Each bucket shows the reconstructed IN/OUT movement during that period, calculated from cumulative counting snapshots. Occupancy shows the latest saved occupancy within the bucket.
                 </p>
 
                 {/* {flowSummary.resetCount > 0 && (
@@ -1937,19 +2188,19 @@ const FlowTrendPanel = ({ snapshots, cameraLabel, startMs, endMs }) => {
                             <RechartsTooltip
                                 cursor={{ strokeDasharray: '3 3' }}
                                 labelFormatter={(_, payload) => payload?.[0]?.payload?.fullLabel || ''}
-                                formatter={(value, name) => [formatNumber(value), name]}
+                                formatter={(value, name) => [value == null ? '-' : formatNumber(value), name]}
                                 contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
                             />
                             <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
                             {isDailyView ? (
                                 <>
-                                    <Bar yAxisId="flow" dataKey="in" name="In" fill="#22c55e" radius={[4, 4, 0, 0]} maxBarSize={36} />
-                                    <Bar yAxisId="flow" dataKey="out" name="Out" fill="#ef4444" radius={[4, 4, 0, 0]} maxBarSize={36} />
+                                    <Bar yAxisId="flow" dataKey="in" name="IN Movement" fill="#22c55e" radius={[4, 4, 0, 0]} maxBarSize={36} />
+                                    <Bar yAxisId="flow" dataKey="out" name="OUT Movement" fill="#ef4444" radius={[4, 4, 0, 0]} maxBarSize={36} />
                                 </>
                             ) : (
                                 <>
-                                    <Line yAxisId="flow" type="monotone" dataKey="in" name="In" stroke="#22c55e" strokeWidth={2.5} dot={false} />
-                                    <Line yAxisId="flow" type="monotone" dataKey="out" name="Out" stroke="#ef4444" strokeWidth={2.5} dot={false} />
+                                    <Line yAxisId="flow" type="monotone" dataKey="in" name="IN Movement" stroke="#22c55e" strokeWidth={2.5} dot={false} />
+                                    <Line yAxisId="flow" type="monotone" dataKey="out" name="OUT Movement" stroke="#ef4444" strokeWidth={2.5} dot={false} />
                                 </>
                             )}
                             {showOccupancy && (
@@ -1957,7 +2208,7 @@ const FlowTrendPanel = ({ snapshots, cameraLabel, startMs, endMs }) => {
                                     yAxisId="occupancy"
                                     type="monotone"
                                     dataKey="occupancy"
-                                    name="Occupancy"
+                                    name="Latest Occupancy"
                                     stroke="#2563eb"
                                     strokeWidth={2}
                                     dot={false}
@@ -1968,7 +2219,7 @@ const FlowTrendPanel = ({ snapshots, cameraLabel, startMs, endMs }) => {
                     </ResponsiveContainer>
                 ) : (
                     <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
-                        {rangeBounds.valid ? 'No people-counting flow data available for the selected report range' : 'Choose a valid global date/time range to view flow'}
+                        {rangeBounds.valid ? 'No people-counting movement data available for the selected report range' : 'Choose a valid global date/time range to view movement'}
                     </div>
                 )}
             </CardContent>
@@ -2883,12 +3134,13 @@ const BuildingOccupancyPanel = ({
             };
         }
 
-        return aggregateBuildingFlow(scopedHistory, {
-            startMs: panelRangeBounds.startMs,
-            endMs: panelRangeBounds.endMs,
+        return calculateInOutMovementChart({
+            snapshots: buildingScopedCountingSnapshots,
+            rangeStart: panelRangeBounds.startMs,
+            rangeEnd: panelRangeBounds.endMs,
             bucket: effectiveBucket,
         });
-    }, [effectiveBucket, panelRangeBounds, scopedHistory]);
+    }, [buildingScopedCountingSnapshots, effectiveBucket, panelRangeBounds]);
 
     const buildingSnapshotFlowSummary = useMemo(() => aggregateCountingFlow(buildingScopedCountingSnapshots, {
         startMs: panelRangeBounds.valid ? panelRangeBounds.startMs : null,
@@ -2985,21 +3237,9 @@ const BuildingOccupancyPanel = ({
         : useDailyBuildingSnapshotTotals
             ? dailyScopedRangeOut
             : Number(buildingSnapshotFlowSummary.totalOut ?? 0);
-    const displayedFlowIn = useLatestBuildingSnapshotTotals
-        ? latestScopedRangeIn
-        : useDailyBuildingSnapshotTotals
-            ? dailyScopedRangeIn
-            : Number(buildingSnapshotFlowSummary.totalIn ?? 0);
-    const displayedFlowOut = useLatestBuildingSnapshotTotals
-        ? latestScopedRangeOut
-        : useDailyBuildingSnapshotTotals
-            ? dailyScopedRangeOut
-            : Number(buildingSnapshotFlowSummary.totalOut ?? 0);
-    const displayedFlowTraffic = useLatestBuildingSnapshotTotals
-        ? latestScopedRangeIn + latestScopedRangeOut
-        : useDailyBuildingSnapshotTotals
-            ? Number(dailyBuildingSnapshotSummary.totalTraffic ?? 0)
-            : Number(buildingSnapshotFlowSummary.totalTraffic ?? 0);
+    const displayedFlowIn = Number(flowSummary.totalIn ?? 0);
+    const displayedFlowOut = Number(flowSummary.totalOut ?? 0);
+    const displayedFlowTraffic = Number(flowSummary.totalTraffic ?? 0);
     const displayedBuildingOccupancy = useLatestBuildingSnapshotTotals
         ? Number(latestBuildingSnapshotSummary.estimatedOccupancy ?? 0)
         : (selectedBuildingId === 'all'
@@ -3221,7 +3461,7 @@ const BuildingOccupancyPanel = ({
                                     />
                                     <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
                                     <Line type="linear" dataKey="occupancy" name="Occupancy" stroke="#2563eb" strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
-                                    <Line type="linear" dataKey="rawOccupancy" name="Raw Occupancy" stroke="#94a3b8" strokeWidth={2} dot={false} activeDot={{ r: 4 }} strokeDasharray="6 4" />
+                                    {/* <Line type="linear" dataKey="rawOccupancy" name="Raw Occupancy" stroke="#94a3b8" strokeWidth={2} dot={false} activeDot={{ r: 4 }} strokeDasharray="6 4" /> */}
                                     <Brush
                                         dataKey="time"
                                         height={22}
@@ -3251,14 +3491,14 @@ const BuildingOccupancyPanel = ({
                     <div>
                         <CardTitle className="flex items-center gap-2">
                             <TrendingUp className="w-4 h-4" />
-                            In/Out Over Time
+                            IN/OUT Movement Over Time
                         </CardTitle>
                         <p className="mt-1 text-sm text-muted-foreground">
-                            Building-level flow trend with adaptive {effectiveBucket === '15m' ? '15-minute' : effectiveBucket === '1h' ? 'hourly' : 'daily'} buckets using latest saved building snapshots.
+                            Building-level movement trend with adaptive {effectiveBucket === '15m' ? '15-minute' : effectiveBucket === '1h' ? 'hourly' : 'daily'} buckets.
                         </p>
                     </div>
                     <p className="text-xs text-muted-foreground">
-                        Each bucket shows the latest settled building snapshot in that period instead of rebuilding flow from deltas.
+                        Each bucket shows the reconstructed IN/OUT movement during that period, calculated from cumulative counting snapshots. Occupancy shows the latest saved occupancy within the bucket.
                     </p>
                 </CardHeader>
                 <CardContent className="flex-1">
@@ -3317,26 +3557,26 @@ const BuildingOccupancyPanel = ({
                                     <RechartsTooltip
                                         cursor={{ strokeDasharray: '3 3' }}
                                         labelFormatter={(_, payload) => payload?.[0]?.payload?.fullLabel || ''}
-                                        formatter={(value, name) => [formatNumber(value), name]}
+                                        formatter={(value, name) => [value == null ? '-' : formatNumber(value), name]}
                                         contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
                                     />
                                     <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '10px' }} />
                                     {isDailyFlowView ? (
                                         <>
-                                            <Bar yAxisId="flow" dataKey="in" name="In" fill="#22c55e" radius={[4, 4, 0, 0]} maxBarSize={36} />
-                                            <Bar yAxisId="flow" dataKey="out" name="Out" fill="#ef4444" radius={[4, 4, 0, 0]} maxBarSize={36} />
+                                            <Bar yAxisId="flow" dataKey="in" name="IN Movement" fill="#22c55e" radius={[4, 4, 0, 0]} maxBarSize={36} />
+                                            <Bar yAxisId="flow" dataKey="out" name="OUT Movement" fill="#ef4444" radius={[4, 4, 0, 0]} maxBarSize={36} />
                                         </>
                                     ) : (
                                         <>
-                                            <Line yAxisId="flow" type="monotone" dataKey="in" name="In" stroke="#22c55e" strokeWidth={2.5} dot={false} />
-                                            <Line yAxisId="flow" type="monotone" dataKey="out" name="Out" stroke="#ef4444" strokeWidth={2.5} dot={false} />
+                                            <Line yAxisId="flow" type="monotone" dataKey="in" name="IN Movement" stroke="#22c55e" strokeWidth={2.5} dot={false} />
+                                            <Line yAxisId="flow" type="monotone" dataKey="out" name="OUT Movement" stroke="#ef4444" strokeWidth={2.5} dot={false} />
                                         </>
                                     )}
                                     <Line
                                         yAxisId="occupancy"
                                         type="monotone"
                                         dataKey="occupancy"
-                                        name="Occupancy"
+                                        name="Latest Occupancy"
                                         stroke="#2563eb"
                                         strokeWidth={2}
                                         dot={false}
@@ -3347,8 +3587,8 @@ const BuildingOccupancyPanel = ({
                         ) : (
                             <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
                                 {panelRangeBounds.valid
-                                    ? 'No building flow data available for the selected trend range'
-                                    : 'Choose a valid custom date/time range to view flow'}
+                                    ? 'No building movement data available for the selected trend range'
+                                    : 'Choose a valid custom date/time range to view movement'}
                             </div>
                         )}
                     </div>

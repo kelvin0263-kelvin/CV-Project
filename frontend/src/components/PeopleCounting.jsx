@@ -1103,6 +1103,27 @@ const PeopleCounting = () => {
     const selectedBuildingCapacitySummary = selectedCapacityBuildingId
         ? (buildingGroupSummaries[selectedCapacityBuildingId] || null)
         : null;
+    const displayedBuildingIn = selectedBuildingCapacitySummary
+        ? Number(selectedBuildingCapacitySummary.total_in ?? 0)
+        : Number(buildingSummary.raw_in ?? 0);
+    const displayedBuildingOut = selectedBuildingCapacitySummary
+        ? Number(selectedBuildingCapacitySummary.total_out ?? 0)
+        : Number(buildingSummary.raw_out ?? 0);
+    const displayedBuildingOccupancy = selectedBuildingCapacitySummary
+        ? Number(selectedBuildingCapacitySummary.occupancy ?? 0)
+        : Number(buildingSummary.occupancy ?? 0);
+    const displayedBuildingActiveCameraCount = selectedBuildingCapacitySummary
+        ? (Array.isArray(selectedBuildingCapacitySummary.camera_ids) ? selectedBuildingCapacitySummary.camera_ids.length : 0)
+        : Number(buildingSummary.active_camera_count ?? 0);
+    const displayedBuildingMaxCapacity = selectedBuildingCapacitySummary
+        ? selectedBuildingCapacitySummary.max_capacity
+        : buildingSummary.max_capacity;
+    const displayedBuildingCapacityExceeded = selectedBuildingCapacitySummary
+        ? Boolean(selectedBuildingCapacitySummary.capacity_exceeded)
+        : buildingCapacityExceeded;
+    const displayedExceededBuildingIds = selectedBuildingCapacitySummary
+        ? (selectedBuildingCapacitySummary.capacity_exceeded ? [selectedCapacityBuildingId] : [])
+        : exceededBuildingIds;
     const selectedBuildingRegistryRow = useMemo(() => {
         if (!selectedCapacityBuildingId) {
             return null;
@@ -1118,8 +1139,8 @@ const PeopleCounting = () => {
             canDelete: activeCameraCountForBuilding === 0,
         };
     }, [buildingCapacityById, buildingGroupSummaries, selectedCapacityBuildingId]);
-    const buildingUtilizationSubtitle = buildingSummary.max_capacity && Number(buildingSummary.max_capacity) > 0
-        ? `Utilization rate ${Math.round(((buildingSummary.occupancy ?? 0) / Number(buildingSummary.max_capacity)) * 100)}%`
+    const buildingUtilizationSubtitle = displayedBuildingMaxCapacity && Number(displayedBuildingMaxCapacity) > 0
+        ? `Utilization rate ${Math.round((displayedBuildingOccupancy / Number(displayedBuildingMaxCapacity)) * 100)}%`
         : null;
     const selectedCameraRole = crossCameraRole === 'primary' ? 'primary' : crossCameraRole === 'verifier' ? 'verifier' : 'single';
     const resolvedVerifierPrimaryCameraId = verifierPrimaryCameraIds.find((cameraId) => cameraId && cameraId !== selectedCamera) || pairedPrimaryCameraId || '';
@@ -1947,17 +1968,17 @@ const PeopleCounting = () => {
                                     />
                                 </div>
                                 <div className="grid gap-3 sm:grid-cols-3">
-                                    <StatTile label="Building In" value={buildingSummary.raw_in ?? 0} icon={ArrowDownToLine} tone="green" />
-                                    <StatTile label="Building Out" value={buildingSummary.raw_out ?? 0} icon={ArrowUpFromLine} tone="red" />
-                                    <StatTile label="Building Now" value={buildingSummary.occupancy ?? 0} icon={Building2} tone={buildingCapacityExceeded ? 'amber' : 'default'} subtitle={buildingUtilizationSubtitle} />
+                                    <StatTile label="Building In" value={displayedBuildingIn} icon={ArrowDownToLine} tone="green" />
+                                    <StatTile label="Building Out" value={displayedBuildingOut} icon={ArrowUpFromLine} tone="red" />
+                                    <StatTile label="Building Now" value={displayedBuildingOccupancy} icon={Building2} tone={displayedBuildingCapacityExceeded ? 'amber' : 'default'} subtitle={buildingUtilizationSubtitle} />
                                 </div>
                                 <div className="rounded-2xl border border-border/70 bg-background px-4 py-3 text-sm text-muted-foreground">
-                                    Active cameras: {buildingSummary.active_camera_count ?? 0} | Occupancy: {buildingSummary.raw_occupancy ?? 0}
+                                    Active cameras: {displayedBuildingActiveCameraCount} | Occupancy: {displayedBuildingOccupancy}
                                 </div>
-                                {buildingCapacityExceeded && (
+                                {displayedBuildingCapacityExceeded && (
                                     <div className="rounded-2xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-500">
-                                        {exceededBuildingIds.length > 0
-                                            ? `Capacity exceeded for: ${exceededBuildingIds.join(', ')}.`
+                                        {displayedExceededBuildingIds.length > 0
+                                            ? `Capacity exceeded for: ${displayedExceededBuildingIds.join(', ')}.`
                                             : 'Building capacity exceeded.'}
                                     </div>
                                 )}
@@ -2104,7 +2125,7 @@ const PeopleCounting = () => {
                                             <div className="mt-1 text-lg font-semibold">{occupancyLineCount}</div>
                                         </div>
                                         <div className="rounded-2xl border border-slate-200 bg-white px-3 py-2 shadow-sm">
-                                            <div className="text-[10px] font-medium uppercase tracking-[0.16em] text-muted-foreground">FT Lines</div>
+                                            <div className="text-[10px] font-medium uppercase tracking-[0.16em] text-muted-foreground">Foot Traffic Lines</div>
                                             <div className="mt-1 text-lg font-semibold">{footTrafficLineCount}</div>
                                         </div>
                                         <div className="rounded-2xl border border-slate-200 bg-white px-3 py-2 shadow-sm">
