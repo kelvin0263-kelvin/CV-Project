@@ -62,5 +62,6 @@ scripts/dataset_output
 scripts/prediction_runs
 scripts/training_runs
 
-*.log
-nginx-1.30.0/logs/
+
+nginx-1.30.0/logs
+nginx-1.30.0/temp

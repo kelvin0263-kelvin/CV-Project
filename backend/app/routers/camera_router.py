@@ -125,6 +125,7 @@ FISHEYE_VIEW_CONFIGS = [
 
 FISHEYE_UPLOAD_NAME_PATTERN = re.compile(r"^(?P<prefix>.+?)\s-\sView\s\d+\s*\([^)]*\)$")
 RTSP_URL_PATTERN = re.compile(r"^rtsps?://\S+$", re.IGNORECASE)
+RTSP_TEST_TIMEOUT_SEC = 6
 
 
 def _normalize_required_text(value: str | None, field_name: str) -> str:
@@ -750,12 +751,93 @@ def _is_usable_preview_frame(frame) -> bool:
         return False
 
 
+def _probe_rtsp_stream_with_ffmpeg(
+    source_path: str,
+    *,
+    enable_fisheye: bool = False,
+    selected_view: int | None = None,
+) -> dict:
+    command = [
+        FFMPEG_BIN,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-rtsp_transport",
+        "tcp",
+        "-i",
+        source_path,
+        "-frames:v",
+        "1",
+        "-an",
+        "-sn",
+        "-dn",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "mjpeg",
+        "-",
+    ]
+
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=RTSP_TEST_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "detail": "Connection test timed out."}
+    except OSError as exc:
+        return {"ok": False, "detail": f"Unable to run stream probe: {exc}"}
+
+    if completed.returncode != 0 or not completed.stdout:
+        return {"ok": False, "detail": "Unable to open stream."}
+
+    frame = _decode_image_buffer(completed.stdout)
+    if frame is None:
+        return {"ok": False, "detail": "Connected, but no frame was received."}
+
+    preview_source = _apply_fisheye_preview(frame, selected_view) if enable_fisheye else frame
+    height, width = preview_source.shape[:2]
+    preview = preview_source
+    max_preview_w = 960
+    if width > max_preview_w:
+        scale = max_preview_w / float(width)
+        preview = cv2.resize(
+            preview_source,
+            (max_preview_w, max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    ok_jpg, preview_buf = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    return {
+        "ok": True,
+        "detail": "Stream connection successful.",
+        "resolution": f"{width}x{height}",
+        "fps": 0.0,
+        "stream_kind": "rtsp",
+        "preview_view_index": _normalize_fisheye_view_index(selected_view) if enable_fisheye else None,
+        "preview_image": base64.b64encode(preview_buf).decode("utf-8") if ok_jpg else None,
+        "frame_width": int(width),
+        "frame_height": int(height),
+    }
+
+
 def _probe_stream(
     source_path: str,
     *,
     enable_fisheye: bool = False,
     selected_view: int | None = None,
 ) -> dict:
+    is_rtsp = is_rtsp_source(source_path)
+    if is_rtsp:
+        return _probe_rtsp_stream_with_ffmpeg(
+            source_path,
+            enable_fisheye=enable_fisheye,
+            selected_view=selected_view,
+        )
+
     cap = _open_probe_capture(source_path)
     try:
         if not cap.isOpened():

@@ -82,6 +82,7 @@ const SystemConfiguration = () => {
     const [isTestingConnection, setIsTestingConnection] = useState(false);
     const [isSaving, setIsSaving] = useState(false);
     const [testResult, setTestResult] = useState(null);
+    const [verifiedStreamSignature, setVerifiedStreamSignature] = useState(null);
     const [statusMessage, setStatusMessage] = useState(null);
     const [deleteConfirmation, setDeleteConfirmation] = useState(null);
     const [deletingCameraId, setDeletingCameraId] = useState('');
@@ -111,6 +112,29 @@ const SystemConfiguration = () => {
         resolution: '1080p',
         enabled: true,
     });
+
+    const buildStreamVerificationSignature = ({
+        streamUrl = formData.streamUrl,
+        fisheye = enableFisheye,
+        views = selectedViews,
+    } = {}) => {
+        const normalizedStreamUrl = String(streamUrl || '').trim();
+        const selectedView = fisheye
+            ? (Array.from(views || [])[0] ?? DEFAULT_FISHEYE_VIEW)
+            : null;
+        return JSON.stringify({
+            source_path: normalizedStreamUrl,
+            enable_fisheye: Boolean(fisheye),
+            selected_view: selectedView,
+        });
+    };
+
+    const currentStreamVerificationSignature = buildStreamVerificationSignature();
+    const isStreamConnectionVerified = Boolean(
+        verifiedStreamSignature
+        && verifiedStreamSignature === currentStreamVerificationSignature
+    );
+    const shouldShowSaveButton = showUpload || isEditMode || isStreamConnectionVerified;
 
     useEffect(() => {
         fetchCameras();
@@ -181,6 +205,7 @@ const SystemConfiguration = () => {
         setUploadMessage(null);
         setSelectedViews(new Set([DEFAULT_FISHEYE_VIEW]));
         setTestResult(null);
+        setVerifiedStreamSignature(null);
         setSourceRoi(null);
         setIsDrawingSourceRoi(false);
         setStreamPreview(null);
@@ -217,6 +242,7 @@ const SystemConfiguration = () => {
         setSourceRoi(cam.detection_roi || null);
         setIsDrawingSourceRoi(false);
         setStreamPreview(null);
+        setVerifiedStreamSignature(null);
         setSelectedCamera(cam);
         setActiveManagementTab('streams');
         setActiveStreamTab('form');
@@ -291,6 +317,9 @@ const SystemConfiguration = () => {
             setTestResult(null);
             setStreamPreview(null);
         }
+        if (name === 'streamUrl') {
+            setVerifiedStreamSignature(null);
+        }
     };
 
     const handleFileChange = (e) => {
@@ -356,6 +385,16 @@ const SystemConfiguration = () => {
 
     const handleSelectSingleView = (idx) => {
         setSelectedViews(new Set([idx]));
+        setTestResult(null);
+        setStreamPreview(null);
+        setVerifiedStreamSignature(null);
+    };
+
+    const handleStreamFisheyeChange = (checked) => {
+        setEnableFisheye(Boolean(checked));
+        setTestResult(null);
+        setStreamPreview(null);
+        setVerifiedStreamSignature(null);
     };
 
     const handleSave = async (e) => {
@@ -432,6 +471,11 @@ const SystemConfiguration = () => {
             }
 
             // Standard Add/Edit
+            if (!isEditMode && !isStreamConnectionVerified) {
+                setTestResult({ type: 'error', message: 'Test the stream successfully before saving.' });
+                return;
+            }
+
             const validatedStreamInputs = validateStreamInputs();
             if (!validatedStreamInputs) {
                 return;
@@ -605,6 +649,11 @@ const SystemConfiguration = () => {
                     ? `Connection successful. ${parts.join(' | ')}` 
                     : 'Connection successful.',
             });
+            setVerifiedStreamSignature(buildStreamVerificationSignature({
+                streamUrl: normalizedStreamUrl,
+                fisheye: enableFisheye,
+                views: selectedViews,
+            }));
             setStreamPreview(
                 data.preview_image
                     ? {
@@ -619,6 +668,7 @@ const SystemConfiguration = () => {
                 ? 'Connection test timed out.'
                 : (error?.message || 'Connection test failed.');
             setTestResult({ type: 'error', message });
+            setVerifiedStreamSignature(null);
             setStreamPreview(null);
         } finally {
             setIsTestingConnection(false);
@@ -1075,7 +1125,7 @@ const SystemConfiguration = () => {
                                                     id="stream-fisheye"
                                                     checked={enableFisheye}
                                                     disabled={isEditMode}
-                                                    onCheckedChange={setEnableFisheye}
+                                                    onCheckedChange={handleStreamFisheyeChange}
                                                 />
                                                 <Label htmlFor="stream-fisheye">Enable Fisheye Processing (Choose 1 Stream View)</Label>
                                             </div>
@@ -1151,18 +1201,20 @@ const SystemConfiguration = () => {
                                     {/* Footer Actions */}
                                     <div className="flex justify-end gap-2 pt-4">
                                         <Button type="button" variant="ghost" onClick={resetForm} disabled={isSaving || isUploading || isTestingConnection}>Cancel</Button>
-                                        <Button type="submit" disabled={isSaving || isUploading || isTestingConnection}>
-                                            {isUploading || isSaving ? (
-                                                <>
-                                                    <Loader2 className="w-4 h-4 mr-2 animate-spin" /> Processing...
-                                                </>
-                                            ) : (
-                                                <>
-                                                    <Save className="w-4 h-4 mr-2" />
-                                                    {showUpload ? "Upload & Create Sources" : "Save Configuration"}
-                                                </>
-                                            )}
-                                        </Button>
+                                        {shouldShowSaveButton && (
+                                            <Button type="submit" disabled={isSaving || isUploading || isTestingConnection}>
+                                                {isUploading || isSaving ? (
+                                                    <>
+                                                        <Loader2 className="w-4 h-4 mr-2 animate-spin" /> Processing...
+                                                    </>
+                                                ) : (
+                                                    <>
+                                                        <Save className="w-4 h-4 mr-2" />
+                                                        {showUpload ? "Upload & Create Sources" : "Save Configuration"}
+                                                    </>
+                                                )}
+                                            </Button>
+                                        )}
                                     </div>
                                 </form>
                             </CardContent>

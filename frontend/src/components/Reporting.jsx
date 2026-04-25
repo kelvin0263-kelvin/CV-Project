@@ -52,6 +52,7 @@ const getTimestampMs = (value) => parseApiTimestamp(value)?.getTime() ?? 0;
 // Currently unused.
 // const getTimestampIsoDate = (value) => parseApiTimestamp(value)?.toISOString().split('T')[0] ?? '';
 const formatTimestamp = (value) => parseApiTimestamp(value)?.toLocaleString() ?? '-';
+const clampPercent = (value) => Math.max(0, Math.min(100, Number(value) || 0));
 const getReportTimeValue = (row, preferredField = 'timestamp') => {
     if (!row) return null;
     if (preferredField === 'processed_at') {
@@ -79,16 +80,6 @@ const getReportSourceFilterKind = (item, cameraSourceKindById) => {
     if (mapped !== 'other') return mapped;
     if (item?.processed_at) return 'uploaded';
     return 'live';
-};
-const isSourceOnlySnapshotScope = (rows, cameraSourceKindById, expectedKind, fallbackSourceFilter = 'all') => {
-    if (fallbackSourceFilter === expectedKind) return true;
-    const cameraIds = Array.from(new Set(
-        (rows || [])
-            .map((row) => row?.camera_id)
-            .filter(Boolean),
-    ));
-    if (!cameraIds.length) return false;
-    return cameraIds.every((cameraId) => normalizeSourceFilterKind(cameraSourceKindById?.[cameraId]) === expectedKind);
 };
 
 const getCameraLabel = (item) => {
@@ -542,6 +533,92 @@ const summarizeLatestSnapshots = (rows, { startMs = null, endMs = null } = {}) =
     };
 };
 
+const summarizeDailyLatestSnapshots = (rows, { startMs = null, endMs = null } = {}) => {
+    const latestByDayAndCamera = new Map();
+
+    normalizeSnapshotRows(rows).forEach((row) => {
+        if (startMs != null && row.tsMs < startMs) return;
+        if (endMs != null && row.tsMs > endMs) return;
+        if (!row.camera_id) return;
+
+        const dayStartMs = getBucketStartMs(row.tsMs, '1d');
+        const key = `${dayStartMs}:${row.camera_id}`;
+        const existing = latestByDayAndCamera.get(key);
+        if (!existing || row.tsMs > existing.tsMs) {
+            latestByDayAndCamera.set(key, row);
+        }
+    });
+
+    const snapshots = Array.from(latestByDayAndCamera.values());
+    const latestSnapshotSummary = summarizeLatestSnapshots(rows, { startMs, endMs });
+    const byDay = new Map();
+
+    snapshots.forEach((row) => {
+        const dayStartMs = getBucketStartMs(row.tsMs, '1d');
+        const totalIn = Number(row.total_in ?? 0);
+        const totalOut = Number(row.total_out ?? 0);
+        const footTrafficLeft = Number(row.foot_traffic_left ?? 0);
+        const footTrafficRight = Number(row.foot_traffic_right ?? 0);
+        const footTrafficTotal = Number(row.foot_traffic_total ?? (footTrafficLeft + footTrafficRight));
+        const entry = byDay.get(dayStartMs) || {
+            tsMs: dayStartMs,
+            label: formatFlowBucketTick(dayStartMs, '1d'),
+            fullLabel: formatFlowBucketRange(dayStartMs, '1d'),
+            in: 0,
+            out: 0,
+            totalTraffic: 0,
+            occupancy: 0,
+            peakOccupancy: 0,
+            footTrafficLeft: 0,
+            footTrafficRight: 0,
+            footTrafficTotal: 0,
+        };
+
+        entry.in += totalIn;
+        entry.out += totalOut;
+        entry.totalTraffic += totalIn + totalOut;
+        entry.occupancy += Number(row.current_occupancy ?? 0);
+        entry.peakOccupancy = Math.max(entry.peakOccupancy, Number(row.current_occupancy ?? 0));
+        entry.footTrafficLeft += footTrafficLeft;
+        entry.footTrafficRight += footTrafficRight;
+        entry.footTrafficTotal += footTrafficTotal;
+        byDay.set(dayStartMs, entry);
+    });
+
+    const series = Array.from(byDay.values()).sort((a, b) => a.tsMs - b.tsMs);
+    const totalIn = series.reduce((sum, point) => sum + Number(point.in ?? 0), 0);
+    const totalOut = series.reduce((sum, point) => sum + Number(point.out ?? 0), 0);
+    const footTrafficLeft = series.reduce((sum, point) => sum + Number(point.footTrafficLeft ?? 0), 0);
+    const footTrafficRight = series.reduce((sum, point) => sum + Number(point.footTrafficRight ?? 0), 0);
+    const footTrafficTotal = series.reduce((sum, point) => sum + Number(point.footTrafficTotal ?? 0), 0);
+    const peakPeriod = series.reduce((best, point) => {
+        if (!best || point.totalTraffic > best.totalTraffic) return point;
+        return best;
+    }, null);
+
+    return {
+        snapshots,
+        series,
+        byCamera: latestSnapshotSummary.byCamera,
+        snapshotCount: snapshots.length,
+        totalIn,
+        totalOut,
+        totalTraffic: totalIn + totalOut,
+        estimatedOccupancy: Number(latestSnapshotSummary.estimatedOccupancy ?? 0),
+        peakOccupancy: series.reduce((peak, point) => Math.max(peak, Number(point.occupancy ?? 0)), 0),
+        peakPeriodLabel: peakPeriod?.fullLabel || '-',
+        footTrafficLeft,
+        footTrafficRight,
+        footTrafficTotal,
+        total_in: totalIn,
+        total_out: totalOut,
+        current_occupancy: Number(latestSnapshotSummary.estimatedOccupancy ?? 0),
+        foot_traffic_left: footTrafficLeft,
+        foot_traffic_right: footTrafficRight,
+        foot_traffic_total: footTrafficTotal,
+    };
+};
+
 const calculateCombinedPeakOccupancy = (rows, { startMs = null, endMs = null } = {}) => {
     const sortedRows = normalizeSnapshotRows(rows)
         .filter((row) => row.camera_id)
@@ -577,7 +654,7 @@ const calculateCombinedPeakOccupancy = (rows, { startMs = null, endMs = null } =
     return peakOccupancy;
 };
 
-const isWholeSingleLocalDayRange = (startValue, endValue) => {
+const isSingleLocalDayRangeStartingAtMidnight = (startValue, endValue) => {
     if (!startValue || !endValue) return false;
     const start = new Date(startValue);
     const end = new Date(endValue);
@@ -589,8 +666,7 @@ const isWholeSingleLocalDayRange = (startValue, endValue) => {
     if (!sameDay) return false;
 
     const startAtDayStart = start.getHours() === 0 && start.getMinutes() === 0;
-    const endAtDayEnd = end.getHours() === 23 && end.getMinutes() === 59;
-    return startAtDayStart && endAtDayEnd;
+    return startAtDayStart;
 };
 
 const buildEntranceContributionFromLatestSnapshots = ({
@@ -942,7 +1018,7 @@ const aggregateTrafficAnalytics = (rows, { startMs = null, endMs = null, bucket 
         .sort((a, b) => a.tsMs - b.tsMs)
         .map((point) => ({
             ...point,
-            captureRate: point.totalFootTraffic > 0 ? (point.entries / point.totalFootTraffic) * 100 : 0,
+            captureRate: clampPercent(point.totalFootTraffic > 0 ? (point.entries / point.totalFootTraffic) * 100 : 0),
         }));
 
     const peakTrafficPeriod = series.reduce((best, point) => {
@@ -962,7 +1038,7 @@ const aggregateTrafficAnalytics = (rows, { startMs = null, endMs = null, bucket 
         totalRightTraffic,
         totalFootTraffic,
         totalEntries,
-        captureRate: totalFootTraffic > 0 ? (totalEntries / totalFootTraffic) * 100 : 0,
+        captureRate: clampPercent(totalFootTraffic > 0 ? (totalEntries / totalFootTraffic) * 100 : 0),
         peakTrafficPeriodLabel: peakTrafficPeriod?.fullLabel || '-',
         peakConversionPeriodLabel: peakConversionPeriod?.fullLabel || '-',
         resetCount,
@@ -1039,90 +1115,87 @@ const aggregateBuildingFlow = (rows, { startMs = null, endMs = null, bucket = '1
     };
 };
 
-const aggregateBuildingRangeTotals = (rows, { startMs = null, endMs = null } = {}) => {
-    const sortedRows = [...rows].sort((a, b) => (a.tsMs ?? 0) - (b.tsMs ?? 0));
-    const latestByDay = new Map();
+const aggregateBuildingEntranceContribution = (
+    snapshots,
+    entranceSummaries,
+    { startMs = null, endMs = null } = {},
+) => {
+    const snapshotsByCamera = normalizeSnapshotRows(snapshots).reduce((acc, row) => {
+        if (!row?.camera_id) return acc;
+        const existing = acc.get(row.camera_id) || [];
+        existing.push(row);
+        acc.set(row.camera_id, existing);
+        return acc;
+    }, new Map());
 
-    sortedRows.forEach((row) => {
-        if (!row?.tsMs) return;
-        if (startMs != null && row.tsMs < startMs) return;
-        if (endMs != null && row.tsMs > endMs) return;
-
-        const dayStartMs = getBucketStartMs(row.tsMs, '1d');
-        const existing = latestByDay.get(dayStartMs);
-        if (!existing || row.tsMs > existing.tsMs) {
-            latestByDay.set(dayStartMs, row);
-        }
-    });
-
-    const latestRows = Array.from(latestByDay.values());
-    const totalIn = latestRows.reduce((sum, row) => sum + Number(row.raw_in ?? 0), 0);
-    const totalOut = latestRows.reduce((sum, row) => sum + Number(row.raw_out ?? 0), 0);
-
-    return {
-        totalIn,
-        totalOut,
-        totalTraffic: totalIn + totalOut,
-        dayCount: latestRows.length,
-    };
-};
-
-const aggregateBuildingEntranceContribution = (rows, { startMs = null, endMs = null } = {}) => {
-    const sortedRows = [...rows].sort((a, b) => (a.tsMs ?? 0) - (b.tsMs ?? 0));
-    let latestSnapshot = null;
-
-    sortedRows.forEach((row) => {
-        if (!row?.tsMs) return;
-        if (startMs != null && row.tsMs < startMs) return;
-        if (endMs != null && row.tsMs > endMs) {
-            return;
-        }
-        if (!latestSnapshot || row.tsMs > latestSnapshot.tsMs) {
-            latestSnapshot = row;
-        }
-    });
-
-    const snapshotEntries = Object.entries(latestSnapshot?.entrance_summaries || {})
+    const entries = Object.entries(entranceSummaries || {})
         .map(([entranceId, entrance]) => {
-            const cameras = Object.entries(entrance?.camera_summaries || {})
-                .map(([cameraId, camera]) => {
-                    const totalIn = Number(camera?.total_in ?? 0);
-                    const totalOut = Number(camera?.total_out ?? 0);
+            const cameraIds = Array.from(new Set([
+                ...(Array.isArray(entrance?.camera_ids) ? entrance.camera_ids : []),
+                ...Object.keys(entrance?.camera_summaries || {}),
+            ])).filter(Boolean);
+
+            const cameras = cameraIds
+                .map((cameraId) => {
+                    const summary = summarizeDailyLatestSnapshots(
+                        snapshotsByCamera.get(cameraId) || [],
+                        {
+                            startMs,
+                            endMs,
+                        },
+                    );
+
                     return {
                         id: cameraId,
-                        totalIn,
-                        totalOut,
-                        totalTraffic: totalIn + totalOut,
-                        currentOccupancy: Number(camera?.occupancy ?? 0),
+                        totalIn: Number(summary.totalIn ?? 0),
+                        totalOut: Number(summary.totalOut ?? 0),
+                        totalTraffic: Number(summary.totalTraffic ?? 0),
+                        currentOccupancy: Number(summary.estimatedOccupancy ?? 0),
                     };
                 })
-                .sort((a, b) => Number(b.totalTraffic || 0) - Number(a.totalTraffic || 0));
-            const totalIn = Number(entrance?.total_in ?? cameras.reduce((sum, camera) => sum + Number(camera.totalIn || 0), 0));
-            const totalOut = Number(entrance?.total_out ?? cameras.reduce((sum, camera) => sum + Number(camera.totalOut || 0), 0));
-            const totalTrafficForEntrance = totalIn + totalOut;
+                .sort((a, b) => {
+                    const trafficDelta = Number(b.totalTraffic || 0) - Number(a.totalTraffic || 0);
+                    if (trafficDelta !== 0) return trafficDelta;
+                    return String(a.id || '').localeCompare(String(b.id || ''));
+                });
+
+            const totalIn = cameras.reduce((sum, camera) => sum + Number(camera.totalIn || 0), 0);
+            const totalOut = cameras.reduce((sum, camera) => sum + Number(camera.totalOut || 0), 0);
+            const totalTraffic = cameras.reduce((sum, camera) => sum + Number(camera.totalTraffic || 0), 0);
+            const currentOccupancy = cameras.reduce((sum, camera) => sum + Number(camera.currentOccupancy || 0), 0);
+
             return {
                 name: entranceId,
                 totalIn,
                 totalOut,
-                totalTraffic: totalTrafficForEntrance,
-                currentOccupancy: Number(entrance?.occupancy ?? 0),
-                cameraCount: Array.isArray(entrance?.camera_ids) ? entrance.camera_ids.length : cameras.length,
+                totalTraffic,
+                currentOccupancy,
+                cameraCount: cameraIds.length,
                 cameras,
             };
         })
-        .sort((a, b) => Number(b.totalTraffic || 0) - Number(a.totalTraffic || 0));
-    const totalTraffic = snapshotEntries.reduce((sum, entry) => sum + Number(entry.totalTraffic || 0), 0);
-    const entries = snapshotEntries.map((entry) => ({
-        ...entry,
-        share: totalTraffic > 0 ? (Number(entry.totalTraffic || 0) / totalTraffic) * 100 : 0,
-        cameras: (entry.cameras || []).map((camera) => ({
-            ...camera,
-            share: Number(entry.totalTraffic || 0) > 0 ? (Number(camera.totalTraffic || 0) / Number(entry.totalTraffic || 0)) * 100 : 0,
-        })),
-    }));
+        .filter((entry) => (
+            entry.cameraCount > 0
+            || entry.totalTraffic > 0
+            || entry.currentOccupancy > 0
+        ))
+        .sort((a, b) => {
+            const trafficDelta = Number(b.totalTraffic || 0) - Number(a.totalTraffic || 0);
+            if (trafficDelta !== 0) return trafficDelta;
+            return String(a.name || '').localeCompare(String(b.name || ''));
+        });
+
+    const totalTraffic = entries.reduce((sum, entry) => sum + Number(entry.totalTraffic || 0), 0);
 
     return {
-        entries,
+        entries: entries.map((entry) => ({
+            ...entry,
+            share: totalTraffic > 0 ? (Number(entry.totalTraffic || 0) / totalTraffic) * 100 : 0,
+            cameras: (entry.cameras || []).map((camera) => ({
+                ...camera,
+                share: Number(entry.totalTraffic || 0) > 0 ? (Number(camera.totalTraffic || 0) / Number(entry.totalTraffic || 0)) * 100 : 0,
+            })),
+        })),
         totalTraffic,
         totalIn: entries.reduce((sum, entry) => sum + Number(entry.totalIn || 0), 0),
         totalOut: entries.reduce((sum, entry) => sum + Number(entry.totalOut || 0), 0),
@@ -1937,9 +2010,9 @@ const TrafficAnalyticsPanel = ({ snapshots, cameraLabel, startMs, endMs, isAllCa
       const displayedEntries = latestSnapshotTotals
           ? Number(latestSnapshotTotals.total_in ?? 0)
           : Number(trafficSummary.totalEntries ?? 0);
-      const displayedCaptureRate = displayedFootTraffic > 0
+      const displayedCaptureRate = clampPercent(displayedFootTraffic > 0
           ? (displayedEntries / displayedFootTraffic) * 100
-          : 0;
+          : 0);
 
       const isAdaptiveDaily = summaryBucket === '1d';
       const TrendChartComponent = isAdaptiveDaily ? ComposedChart : ComposedChart;
@@ -2099,10 +2172,10 @@ const TrafficAnalyticsPanel = ({ snapshots, cameraLabel, startMs, endMs, isAllCa
                     <CardContent className="flex-1 min-h-[260px]">
                         {trafficSummary.series.length > 0 ? (
                             <ResponsiveContainer width="100%" height="100%">
-                                <LineChart data={trafficSummary.series} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                                <LineChart data={trafficSummary.series} margin={{ top: 10, right: 10, left: 8, bottom: 0 }}>
                                     <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
                                     <XAxis dataKey="label" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
-                                    <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} domain={[0, 100]} tickFormatter={(value) => `${value}%`} />
+                                    <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} width={44} domain={[0, 100]} tickFormatter={(value) => `${value}%`} />
                                     <RechartsTooltip
                                         cursor={{ strokeDasharray: '3 3' }}
                                         labelFormatter={(_, payload) => payload?.[0]?.payload?.fullLabel || ''}
@@ -2160,10 +2233,10 @@ const TrafficAnalyticsPanel = ({ snapshots, cameraLabel, startMs, endMs, isAllCa
                     <div className="h-[260px]">
                         {dailyTrafficSeries.length > 0 ? (
                             <ResponsiveContainer width="100%" height="100%">
-                                <BarChart data={dailyTrafficSeries} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                                <BarChart data={dailyTrafficSeries} margin={{ top: 10, right: 10, left: 8, bottom: 0 }}>
                                     <CartesianGrid strokeDasharray="3 3" className="stroke-muted" vertical={false} />
                                     <XAxis dataKey="label" className="text-xs text-muted-foreground" tickLine={false} axisLine={false} />
-                                    <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} domain={[0, 100]} tickFormatter={(value) => `${value}%`} />
+                                    <YAxis className="text-xs text-muted-foreground" tickLine={false} axisLine={false} width={44} domain={[0, 100]} tickFormatter={(value) => `${value}%`} />
                                     <RechartsTooltip
                                         cursor={{ fill: 'transparent' }}
                                         formatter={(value, name) => [`${Number(value).toFixed(1)}%`, name]}
@@ -2667,6 +2740,24 @@ const BuildingOccupancyPanel = ({
         const durationMs = scopedHistory[scopedHistory.length - 1].tsMs - scopedHistory[0].tsMs;
         return durationMs <= OCCUPANCY_RANGE_LOOKBACK_MS['24h'] ? '24h' : '7d';
     }, [scopedHistory]);
+    const buildingScopedCameraIds = useMemo(() => (
+        Array.from(new Set(
+            Object.values(scopedBuildingSummary.entrance_summaries ?? {})
+                .flatMap((entrance) => [
+                    ...(Array.isArray(entrance?.camera_ids) ? entrance.camera_ids : []),
+                    ...Object.keys(entrance?.camera_summaries || {}),
+                ])
+                .filter(Boolean),
+        ))
+    ), [scopedBuildingSummary.entrance_summaries]);
+    const buildingScopedCountingSnapshots = useMemo(() => {
+        if (!buildingScopedCameraIds.length) {
+            return [];
+        }
+
+        const scopedCameraIdSet = new Set(buildingScopedCameraIds);
+        return countingSnapshots.filter((snapshot) => scopedCameraIdSet.has(snapshot.camera_id));
+    }, [buildingScopedCameraIds, countingSnapshots]);
 
     const chartRows = useMemo(() => {
         const collapsedRows = collapseRowsByTimestamp(scopedHistory, (currentBest, candidate) => {
@@ -2799,20 +2890,21 @@ const BuildingOccupancyPanel = ({
         });
     }, [effectiveBucket, panelRangeBounds, scopedHistory]);
 
-    const rangeSummary = useMemo(() => aggregateBuildingFlow(scopedHistory, {
+    const buildingSnapshotFlowSummary = useMemo(() => aggregateCountingFlow(buildingScopedCountingSnapshots, {
         startMs: panelRangeBounds.valid ? panelRangeBounds.startMs : null,
         endMs: panelRangeBounds.valid ? panelRangeBounds.endMs : null,
         bucket: effectiveBucket,
-    }), [effectiveBucket, panelRangeBounds, scopedHistory]);
-    const rangeTotalsSummary = useMemo(() => aggregateBuildingRangeTotals(scopedHistory, {
-        startMs: panelRangeBounds.valid ? panelRangeBounds.startMs : null,
-        endMs: panelRangeBounds.valid ? panelRangeBounds.endMs : null,
-    }), [panelRangeBounds, scopedHistory]);
+    }), [buildingScopedCountingSnapshots, effectiveBucket, panelRangeBounds]);
 
-    const latestBuildingSnapshotSummary = useMemo(() => summarizeLatestSnapshots(countingSnapshots, {
+    const latestBuildingSnapshotSummary = useMemo(() => summarizeLatestSnapshots(buildingScopedCountingSnapshots, {
         startMs: panelRangeBounds.valid ? panelRangeBounds.startMs : null,
         endMs: panelRangeBounds.valid ? panelRangeBounds.endMs : null,
-    }), [countingSnapshots, panelRangeBounds]);
+    }), [buildingScopedCountingSnapshots, panelRangeBounds]);
+
+    const dailyBuildingSnapshotSummary = useMemo(() => summarizeDailyLatestSnapshots(buildingScopedCountingSnapshots, {
+        startMs: panelRangeBounds.valid ? panelRangeBounds.startMs : null,
+        endMs: panelRangeBounds.valid ? panelRangeBounds.endMs : null,
+    }), [buildingScopedCountingSnapshots, panelRangeBounds]);
 
     const latestBuildingEntranceContribution = useMemo(() => (
         buildEntranceContributionFromLatestSnapshots({
@@ -2822,10 +2914,14 @@ const BuildingOccupancyPanel = ({
     ), [latestBuildingSnapshotSummary, scopedBuildingSummary.entrance_summaries]);
 
     const entranceContribution = useMemo(() => {
-        const aggregated = aggregateBuildingEntranceContribution(scopedHistory, {
-            startMs: panelRangeBounds.valid ? panelRangeBounds.startMs : null,
-            endMs: panelRangeBounds.valid ? panelRangeBounds.endMs : null,
-        });
+        const aggregated = aggregateBuildingEntranceContribution(
+            buildingScopedCountingSnapshots,
+            scopedBuildingSummary.entrance_summaries,
+            {
+                startMs: panelRangeBounds.valid ? panelRangeBounds.startMs : null,
+                endMs: panelRangeBounds.valid ? panelRangeBounds.endMs : null,
+            },
+        );
         if (aggregated.entries.length > 0) {
             return aggregated;
         }
@@ -2866,103 +2962,49 @@ const BuildingOccupancyPanel = ({
             totalOut: entries.reduce((sum, entry) => sum + Number(entry.totalOut || 0), 0),
             busiestEntrance: entries[0] || null,
         };
-    }, [panelRangeBounds, scopedBuildingSummary.entrance_summaries, scopedHistory]);
-    const deltaEntranceContributionWithCameraBreakdown = useMemo(() => {
-        const entries = entranceContribution.entries.map((entry) => {
-            const configuredCameraIds = Array.isArray(scopedBuildingSummary.entrance_summaries?.[entry.name]?.camera_ids)
-                ? scopedBuildingSummary.entrance_summaries[entry.name].camera_ids
-                : [];
-
-            if (!configuredCameraIds.length) {
-                return entry;
-            }
-
-            const existingCameras = Array.isArray(entry.cameras) ? entry.cameras : [];
-            const existingCameraTraffic = existingCameras.reduce((sum, camera) => sum + Number(camera.totalTraffic || 0), 0);
-
-            const cameras = (existingCameraTraffic > 0
-                ? existingCameras
-                : configuredCameraIds.map((cameraId) => {
-                    const summary = aggregateCountingFlow(
-                        countingSnapshots.filter((snapshot) => snapshot.camera_id === cameraId),
-                        {
-                            startMs: panelRangeBounds.valid ? panelRangeBounds.startMs : null,
-                            endMs: panelRangeBounds.valid ? panelRangeBounds.endMs : null,
-                            bucket: '1h',
-                        },
-                    );
-
-                    return {
-                        id: cameraId,
-                        totalIn: summary.totalIn,
-                        totalOut: summary.totalOut,
-                        totalTraffic: summary.totalTraffic,
-                        currentOccupancy: summary.estimatedOccupancy,
-                    };
-                }))
-                .sort((a, b) => {
-                    const trafficDelta = Number(b.totalTraffic || 0) - Number(a.totalTraffic || 0);
-                    if (trafficDelta !== 0) return trafficDelta;
-                    return String(a.id || '').localeCompare(String(b.id || ''));
-                });
-
-            const cameraTrafficBase = cameras.reduce((sum, camera) => sum + Number(camera.totalTraffic || 0), 0);
-
-            return {
-                ...entry,
-                cameraCount: Math.max(entry.cameraCount, cameras.length),
-                cameras: cameras.map((camera) => ({
-                    ...camera,
-                    share: cameraTrafficBase > 0 ? (Number(camera.totalTraffic || 0) / cameraTrafficBase) * 100 : 0,
-                })),
-            };
-        });
-
-        return {
-            ...entranceContribution,
-            entries,
-            busiestEntrance: entries[0] || null,
-        };
-    }, [countingSnapshots, entranceContribution, panelRangeBounds, scopedBuildingSummary.entrance_summaries]);
+    }, [buildingScopedCountingSnapshots, panelRangeBounds, scopedBuildingSummary.entrance_summaries]);
     const latestScopedHistoryRow = scopedHistory.length > 0 ? scopedHistory[scopedHistory.length - 1] : null;
-    const useLatestBuildingSnapshotTotals = selectedBuildingId === 'all' && preferLatestSnapshotTotals && latestBuildingSnapshotSummary.snapshotCount > 0;
-    const useLatestBuildingRangeTotals = preferLatestSnapshotTotals && (
-        selectedBuildingId === 'all'
-            ? latestBuildingSnapshotSummary.snapshotCount > 0
-            : Boolean(latestScopedHistoryRow)
-    );
-    const entranceContributionWithCameraBreakdown = selectedBuildingId === 'all' && useLatestBuildingSnapshotTotals
+    const useLatestBuildingSnapshotTotals = preferLatestSnapshotTotals && latestBuildingSnapshotSummary.snapshotCount > 0;
+    const useDailyBuildingSnapshotTotals = !useLatestBuildingSnapshotTotals && dailyBuildingSnapshotSummary.snapshotCount > 0;
+    const entranceContributionWithCameraBreakdown = useLatestBuildingSnapshotTotals
         ? latestBuildingEntranceContribution
-        : deltaEntranceContributionWithCameraBreakdown;
-    const latestScopedRangeIn = selectedBuildingId === 'all'
-        ? Number(latestBuildingSnapshotSummary.totalIn ?? 0)
-        : Number(latestScopedHistoryRow?.raw_in ?? 0);
-    const latestScopedRangeOut = selectedBuildingId === 'all'
-        ? Number(latestBuildingSnapshotSummary.totalOut ?? 0)
-        : Number(latestScopedHistoryRow?.raw_out ?? 0);
-    const displayedRangeIn = useLatestBuildingRangeTotals
+        : (entranceContribution.entries.length > 0
+            ? entranceContribution
+            : latestBuildingEntranceContribution);
+    const latestScopedRangeIn = Number(latestBuildingSnapshotSummary.totalIn ?? 0);
+    const latestScopedRangeOut = Number(latestBuildingSnapshotSummary.totalOut ?? 0);
+    const dailyScopedRangeIn = Number(dailyBuildingSnapshotSummary.totalIn ?? 0);
+    const dailyScopedRangeOut = Number(dailyBuildingSnapshotSummary.totalOut ?? 0);
+    const displayedRangeIn = useLatestBuildingSnapshotTotals
         ? latestScopedRangeIn
-        : Number(rangeTotalsSummary.totalIn ?? 0);
-    const displayedRangeOut = useLatestBuildingRangeTotals
+        : useDailyBuildingSnapshotTotals
+            ? dailyScopedRangeIn
+            : Number(buildingSnapshotFlowSummary.totalIn ?? 0);
+    const displayedRangeOut = useLatestBuildingSnapshotTotals
         ? latestScopedRangeOut
-        : Number(rangeTotalsSummary.totalOut ?? 0);
-    const displayedFlowIn = useLatestBuildingRangeTotals
+        : useDailyBuildingSnapshotTotals
+            ? dailyScopedRangeOut
+            : Number(buildingSnapshotFlowSummary.totalOut ?? 0);
+    const displayedFlowIn = useLatestBuildingSnapshotTotals
         ? latestScopedRangeIn
-        : Number(rangeTotalsSummary.totalIn ?? 0);
-    const displayedFlowOut = useLatestBuildingRangeTotals
+        : useDailyBuildingSnapshotTotals
+            ? dailyScopedRangeIn
+            : Number(buildingSnapshotFlowSummary.totalIn ?? 0);
+    const displayedFlowOut = useLatestBuildingSnapshotTotals
         ? latestScopedRangeOut
-        : Number(rangeTotalsSummary.totalOut ?? 0);
-    const displayedFlowTraffic = useLatestBuildingRangeTotals
+        : useDailyBuildingSnapshotTotals
+            ? dailyScopedRangeOut
+            : Number(buildingSnapshotFlowSummary.totalOut ?? 0);
+    const displayedFlowTraffic = useLatestBuildingSnapshotTotals
         ? latestScopedRangeIn + latestScopedRangeOut
-        : Number(rangeTotalsSummary.totalTraffic ?? 0);
-    const displayedBuildingOccupancy = selectedBuildingId === 'all'
-        ? (useLatestBuildingSnapshotTotals
-            ? Math.max(
-                0,
-                Number(latestBuildingSnapshotSummary.totalIn ?? 0) - Number(latestBuildingSnapshotSummary.totalOut ?? 0),
-            )
-            : Number(scopedBuildingSummary.occupancy ?? 0))
-        : Number(latestScopedHistoryRow?.occupancy ?? scopedBuildingSummary.occupancy ?? 0);
+        : useDailyBuildingSnapshotTotals
+            ? Number(dailyBuildingSnapshotSummary.totalTraffic ?? 0)
+            : Number(buildingSnapshotFlowSummary.totalTraffic ?? 0);
+    const displayedBuildingOccupancy = useLatestBuildingSnapshotTotals
+        ? Number(latestBuildingSnapshotSummary.estimatedOccupancy ?? 0)
+        : (selectedBuildingId === 'all'
+            ? Number(scopedBuildingSummary.occupancy ?? 0)
+            : Number(latestScopedHistoryRow?.occupancy ?? scopedBuildingSummary.occupancy ?? 0));
 
     const capacityUtilization = scopedBuildingSummary.max_capacity
         ? (displayedBuildingOccupancy / Number(scopedBuildingSummary.max_capacity)) * 100
@@ -3508,7 +3550,6 @@ const AllOverviewPanel = ({
     cameraOptions,
     cameraFilter,
     preferLatestSnapshotTotals = false,
-    useSnapshotCountingTotals = false,
 }) => {
     const summaryBucket = useMemo(() => {
         const nowMs = Date.now();
@@ -3532,29 +3573,37 @@ const AllOverviewPanel = ({
         startMs,
         endMs,
     }), [endMs, snapshots, startMs]);
-    const useLatestSnapshotTotals = (
-        (preferLatestSnapshotTotals || useSnapshotCountingTotals)
-        && latestSnapshotSummary.snapshotCount > 0
-    );
-    const displayedOverviewOccupancy = useLatestSnapshotTotals
+    const dailySnapshotSummary = useMemo(() => summarizeDailyLatestSnapshots(snapshots, {
+        startMs,
+        endMs,
+    }), [endMs, snapshots, startMs]);
+    const useLatestSnapshotTotals = preferLatestSnapshotTotals && latestSnapshotSummary.snapshotCount > 0;
+    const useDailySnapshotTotals = !useLatestSnapshotTotals
+        && dailySnapshotSummary.snapshotCount > 0;
+    const snapshotTotalsSummary = useLatestSnapshotTotals
+        ? latestSnapshotSummary
+        : useDailySnapshotTotals
+            ? dailySnapshotSummary
+            : null;
+    const displayedOverviewOccupancy = snapshotTotalsSummary
         ? Number(latestSnapshotSummary.estimatedOccupancy ?? 0)
         : Number(peopleSummary.estimatedOccupancy ?? 0);
-    const displayedOverviewTraffic = useLatestSnapshotTotals
-        ? Number(latestSnapshotSummary.totalTraffic ?? 0)
+    const displayedOverviewTraffic = snapshotTotalsSummary
+        ? Number(snapshotTotalsSummary.totalTraffic ?? 0)
         : Number(peopleSummary.totalTraffic ?? 0);
-    const displayedOverviewIn = useLatestSnapshotTotals
-        ? Number(latestSnapshotSummary.totalIn ?? 0)
+    const displayedOverviewIn = snapshotTotalsSummary
+        ? Number(snapshotTotalsSummary.totalIn ?? 0)
         : Number(peopleSummary.totalIn ?? 0);
-    const displayedOverviewOut = useLatestSnapshotTotals
-        ? Number(latestSnapshotSummary.totalOut ?? 0)
+    const displayedOverviewOut = snapshotTotalsSummary
+        ? Number(snapshotTotalsSummary.totalOut ?? 0)
         : Number(peopleSummary.totalOut ?? 0);
-    const displayedOverviewCaptureRate = useLatestSnapshotTotals
-        ? (
-            Number(latestSnapshotSummary.footTrafficTotal ?? 0) > 0
-                ? (Number(latestSnapshotSummary.totalIn ?? 0) / Number(latestSnapshotSummary.footTrafficTotal ?? 0)) * 100
+    const displayedOverviewCaptureRate = snapshotTotalsSummary
+        ? clampPercent(
+            Number(snapshotTotalsSummary.footTrafficTotal ?? 0) > 0
+                ? (Number(snapshotTotalsSummary.totalIn ?? 0) / Number(snapshotTotalsSummary.footTrafficTotal ?? 0)) * 100
                 : 0
         )
-        : Number(trafficSummary.captureRate ?? 0);
+        : clampPercent(Number(trafficSummary.captureRate ?? 0));
     const displayedOverviewPeakOccupancy = useMemo(() => (
         cameraFilter === 'all'
             ? calculateCombinedPeakOccupancy(snapshots, { startMs, endMs })
@@ -3784,7 +3833,7 @@ const Reporting = () => {
     const effectiveEndDate = effectiveDateRange.endDate;
     const shouldPreferSnapshotTotalsForAppliedRange = useMemo(() => (
         selectedQuickRange === 'today'
-        || isWholeSingleLocalDayRange(effectiveStartDate, effectiveEndDate)
+        || isSingleLocalDayRangeStartingAtMidnight(effectiveStartDate, effectiveEndDate)
     ), [effectiveEndDate, effectiveStartDate, selectedQuickRange]);
     const isCustomQuickRange = selectedQuickRange === 'custom';
     const draftDateBounds = useMemo(
@@ -4088,11 +4137,14 @@ const Reporting = () => {
         startMs: reportingDateBounds.startMs,
         endMs: reportingDateBounds.endMs,
     }), [reportingDateBounds.endMs, reportingDateBounds.startMs, selectedCountingSnapshots]);
+    const dailySelectedSnapshotSummary = useMemo(() => summarizeDailyLatestSnapshots(selectedCountingSnapshots, {
+        startMs: reportingDateBounds.startMs,
+        endMs: reportingDateBounds.endMs,
+    }), [reportingDateBounds.endMs, reportingDateBounds.startMs, selectedCountingSnapshots]);
     const dailyFlowSeries = useMemo(() => (
-        aggregateCountingFlow(selectedCountingSnapshots, {
+        summarizeDailyLatestSnapshots(selectedCountingSnapshots, {
             startMs: reportingDateBounds.startMs,
             endMs: reportingDateBounds.endMs,
-            bucket: '1d',
         }).series
     ), [reportingDateBounds.endMs, reportingDateBounds.startMs, selectedCountingSnapshots]);
     const dailyDetectionSeries = useMemo(() => {
@@ -4120,29 +4172,24 @@ const Reporting = () => {
             .sort((a, b) => a.tsMs - b.tsMs)
             .map(({ tsMs, ...point }) => point);
     }, [filteredEvents]);
-    const shouldUseRtspSnapshotTotals = useMemo(() => (
-        isSourceOnlySnapshotScope(selectedCountingSnapshots, cameraSourceKindById, 'live', effectiveSourceFilter)
-    ), [cameraSourceKindById, effectiveSourceFilter, selectedCountingSnapshots]);
-    const shouldUseUploadedSnapshotTotals = useMemo(() => (
-        isSourceOnlySnapshotScope(selectedCountingSnapshots, cameraSourceKindById, 'uploaded', effectiveSourceFilter)
-    ), [cameraSourceKindById, effectiveSourceFilter, selectedCountingSnapshots]);
-    const shouldUseSnapshotCountingTotals = shouldUseRtspSnapshotTotals || shouldUseUploadedSnapshotTotals;
-    const shouldUseRangeScopedSnapshotCountingTotals = (
-        shouldPreferSnapshotTotalsForAppliedRange
-        && shouldUseSnapshotCountingTotals
-    );
     const shouldUseLatestSnapshotTotals = shouldPreferSnapshotTotalsForAppliedRange
         && latestSelectedSnapshotSummary.snapshotCount > 0;
-    const displayedPeopleCountingTotalIn = shouldUseRangeScopedSnapshotCountingTotals
-        ? Number(latestSelectedSnapshotSummary.totalIn ?? 0)
+    const selectedSnapshotTotalsSummary = shouldUseLatestSnapshotTotals
+        ? latestSelectedSnapshotSummary
+        : dailySelectedSnapshotSummary.snapshotCount > 0
+            ? dailySelectedSnapshotSummary
+            : null;
+    const shouldUseSnapshotTotalCards = Boolean(selectedSnapshotTotalsSummary);
+    const displayedPeopleCountingTotalIn = shouldUseSnapshotTotalCards
+        ? Number(selectedSnapshotTotalsSummary.totalIn ?? 0)
         : Number(peopleCountingSummary.totalIn ?? 0);
-    const displayedPeopleCountingTotalOut = shouldUseRangeScopedSnapshotCountingTotals
-        ? Number(latestSelectedSnapshotSummary.totalOut ?? 0)
+    const displayedPeopleCountingTotalOut = shouldUseSnapshotTotalCards
+        ? Number(selectedSnapshotTotalsSummary.totalOut ?? 0)
         : Number(peopleCountingSummary.totalOut ?? 0);
-    const displayedPeopleCountingTotalTraffic = shouldUseRangeScopedSnapshotCountingTotals
-        ? Number(latestSelectedSnapshotSummary.totalTraffic ?? 0)
+    const displayedPeopleCountingTotalTraffic = shouldUseSnapshotTotalCards
+        ? Number(selectedSnapshotTotalsSummary.totalTraffic ?? 0)
         : Number(peopleCountingSummary.totalTraffic ?? 0);
-    const displayedPeopleCountingOccupancy = (shouldUseLatestSnapshotTotals || shouldUseRangeScopedSnapshotCountingTotals)
+    const displayedPeopleCountingOccupancy = (shouldUseLatestSnapshotTotals || shouldUseSnapshotTotalCards)
         ? Number(latestSelectedSnapshotSummary.estimatedOccupancy ?? 0)
         : Number(peopleCountingSummary.estimatedOccupancy ?? 0);
     const displayedPeopleCountingPeakOccupancy = useMemo(() => (
@@ -4647,7 +4694,6 @@ const Reporting = () => {
                         cameraOptions={cameraOptions}
                         cameraFilter={selectedCameraFilter}
                         preferLatestSnapshotTotals={shouldPreferSnapshotTotalsForAppliedRange}
-                        useSnapshotCountingTotals={shouldUseRangeScopedSnapshotCountingTotals}
                     />
                 )}
 
@@ -4762,7 +4808,7 @@ const Reporting = () => {
                                   startMs={reportingDateBounds.startMs}
                                   endMs={reportingDateBounds.endMs}
                                   isAllCameras={selectedCameraFilter === 'all'}
-                                  latestSnapshotTotals={(shouldUseLatestSnapshotTotals || shouldUseRangeScopedSnapshotCountingTotals) ? latestSelectedSnapshotSummary : null}
+                                  latestSnapshotTotals={shouldUseSnapshotTotalCards ? selectedSnapshotTotalsSummary : null}
                               />
                         )}
 

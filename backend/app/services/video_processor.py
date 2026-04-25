@@ -97,6 +97,8 @@ DRESSCODE_VIOLATION_WINDOW_SEC = 5.0
 
 PERF_LOG_INTERVAL_FRAMES = 30
 PERF_STAGE_LOGS = True
+FALL_POSE_HIT_WINDOW_SECONDS = 1.25
+FALL_POSE_MISS_GRACE_SECONDS = 0.75
 
 MULTI_STREAM_BATCH_INFER = True
 BATCH_INFER_WINDOW_MS = 2
@@ -2446,7 +2448,7 @@ def video_producer(
             track_id = det.get("track_id")
             person_bbox = det.get("person_bbox")
             keypoints_data = det.get("keypoints_data")
-            fall_pose = bool(
+            raw_fall_pose = bool(
                 person_bbox
                 and keypoints_data is not None
                 and _is_person_in_fall_pose_compat(
@@ -2455,16 +2457,36 @@ def video_producer(
                     detection_sensitivity,
                 )
             )
-            det["fall_pose"] = fall_pose
+            fall_pose = raw_fall_pose
             det["fall_detected"] = False
 
             if track_id is None:
+                det["fall_pose"] = fall_pose
                 det["fall_detected"] = bool(fall_pose)
                 continue
 
-            if track_id not in track_state:
-                track_state[track_id] = {"violation_saved": False}
-            ts = track_state[track_id]
+            fall_state_key = f"fall||{view_key}||{track_id}"
+            if fall_state_key not in track_state:
+                track_state[fall_state_key] = {}
+            ts = track_state[fall_state_key]
+
+            hit_times = ts.get("fall_hit_times")
+            if not isinstance(hit_times, list):
+                hit_times = []
+            hit_window_start = now_ts - FALL_POSE_HIT_WINDOW_SECONDS
+            hit_times = [float(t) for t in hit_times if float(t) >= hit_window_start]
+            if raw_fall_pose:
+                hit_times.append(now_ts)
+                ts["last_fall_pose_at"] = now_ts
+            ts["fall_hit_times"] = hit_times
+
+            last_fall_pose_at = ts.get("last_fall_pose_at")
+            within_miss_grace = (
+                last_fall_pose_at is not None
+                and (now_ts - float(last_fall_pose_at)) <= FALL_POSE_MISS_GRACE_SECONDS
+            )
+            fall_pose = bool(raw_fall_pose or within_miss_grace)
+            det["fall_pose"] = fall_pose
 
             if not fall_pose:
                 ts.pop("fall_started_at", None)
@@ -2476,7 +2498,10 @@ def video_producer(
                 started_at = now_ts
                 ts["fall_started_at"] = started_at
 
-            fall_confirmed = (now_ts - started_at) >= inactivity_timer_seconds
+            fall_confirmed = (
+                inactivity_timer_seconds <= 0.1
+                or (now_ts - started_at) >= inactivity_timer_seconds
+            )
             if ts.get("fall_saved", False):
                 fall_confirmed = True
 

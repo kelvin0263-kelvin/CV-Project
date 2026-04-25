@@ -134,8 +134,33 @@ def _should_skip_missing_foot_zone_keypoints(
     if bw >= bh * 1.32:
         return False
 
-    bottom_band_top = y2 - 0.15 * bh
     thr = confidence_threshold
+    # High-angle CCTV can make a fallen body roughly square instead of wide.
+    # If torso and lower-body joints are present, let the later fall checks decide.
+    if bw >= bh * 0.86:
+        has_shoulder = (
+            float(keypoints_data[5][2]) >= thr
+            or float(keypoints_data[6][2]) >= thr
+        )
+        has_hip = (
+            float(keypoints_data[11][2]) >= thr
+            or float(keypoints_data[12][2]) >= thr
+        )
+        has_lower_body = any(
+            float(keypoints_data[i][2]) >= thr for i in (13, 14, 15, 16)
+        )
+        confident_points = [
+            (float(keypoints_data[i][0]), float(keypoints_data[i][1]))
+            for i in _TORSO_LIMB_IDX
+            if float(keypoints_data[i][2]) >= thr
+        ]
+        if has_shoulder and has_hip and has_lower_body and len(confident_points) >= 5:
+            xs = [p[0] for p in confident_points]
+            ys = [p[1] for p in confident_points]
+            if (max(xs) - min(xs)) >= 0.32 * bw or (max(ys) - min(ys)) >= 0.30 * bh:
+                return False
+
+    bottom_band_top = y2 - 0.15 * bh
     for i in range(17):
         if float(keypoints_data[i][2]) < thr:
             continue
@@ -246,6 +271,11 @@ def _bbox_and_leg_keypoints_plausible_for_fall(
     if room_below_hip < 0.19 * bh:
         return False
 
+    floor_like_spread = (
+        bw >= 0.78 * bh
+        and bw <= 1.62 * bh
+        and _has_floor_body_spread(keypoints_data, person_bbox, confidence_threshold)
+    )
     margin = 0.03 * max(bw, bh)
     hip_band = 0.05 * bh
     for i in (13, 14, 15, 16):
@@ -255,7 +285,7 @@ def _bbox_and_leg_keypoints_plausible_for_fall(
         px, py = float(kp[0]), float(kp[1])
         if not (x1 - margin <= px <= x2 + margin and y1 - margin <= py <= y2 + margin):
             return False
-        if py < hip_y - hip_band:
+        if py < hip_y - hip_band and not floor_like_spread:
             return False
 
     return True
@@ -678,6 +708,68 @@ def _head_face_near_floor_prone_fall(
     return False
 
 
+def _has_long_vertical_leg_support(
+    keypoints_data: np.ndarray,
+    confidence_threshold: float,
+    bbox_height: float,
+) -> bool:
+    """Standing/stooping support: ankles clearly below hips in image Y."""
+    if bbox_height <= 1e-6:
+        return False
+
+    hip_ys = [
+        float(keypoints_data[i][1])
+        for i in (11, 12)
+        if float(keypoints_data[i][2]) >= confidence_threshold
+    ]
+    ankle_ys = [
+        float(keypoints_data[i][1])
+        for i in (15, 16)
+        if float(keypoints_data[i][2]) >= confidence_threshold
+    ]
+    if not hip_ys or not ankle_ys:
+        return False
+
+    hip_y = sum(hip_ys) / len(hip_ys)
+    ankle_y = sum(ankle_ys) / len(ankle_ys)
+    return bool((ankle_y - hip_y) >= 0.28 * bbox_height)
+
+
+def _has_floor_body_spread(
+    keypoints_data: np.ndarray,
+    person_bbox: list[float],
+    confidence_threshold: float,
+) -> bool:
+    """
+    Floor/body evidence for top-down CCTV when face keypoints are weak.
+
+    A real lying pose should spread torso/limb joints across a meaningful part of
+    the bbox. A standing bend usually keeps most body joints in a narrow vertical
+    support column and is filtered later by leg-support checks.
+    """
+    x1, y1, x2, y2 = map(float, person_bbox)
+    bw, bh = x2 - x1, y2 - y1
+    if bw <= 1e-6 or bh <= 1e-6:
+        return False
+
+    points = [
+        (float(keypoints_data[i][0]), float(keypoints_data[i][1]))
+        for i in _TORSO_LIMB_IDX
+        if float(keypoints_data[i][2]) >= confidence_threshold
+    ]
+    if len(points) < 5:
+        return False
+
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    x_span = max(xs) - min(xs)
+    y_span = max(ys) - min(ys)
+
+    if x_span >= 0.52 * bw:
+        return True
+    return bool(x_span >= 0.36 * bw and y_span >= 0.22 * bh)
+
+
 def is_person_in_fall_pose(
     person_bbox: list[float],
     keypoints_data: Optional[np.ndarray],
@@ -737,17 +829,6 @@ def is_person_in_fall_pose(
     if h <= 0 or w <= 0:
         return False
 
-    # Face / head near ground: skip pelvis–wrist "support" (hands on floor look like standing).
-    if _head_face_near_floor_prone_fall(
-        keypoints_data, person_bbox, CONFIDENCE_THRESHOLD
-    ):
-        return True
-
-    if _pelvis_above_feet_suppresses_fall(
-        keypoints_data, person_bbox, CONFIDENCE_THRESHOLD
-    ):
-        return False
-
     ratio = w / h
 
     l_shoulder = keypoints_data[5]
@@ -782,6 +863,18 @@ def is_person_in_fall_pose(
     hip_mid = (h_x / h_count, h_y / h_count)
 
     current_angle = calculate_angle(shoulder_mid, hip_mid)
+    head_floor_fall = _head_face_near_floor_prone_fall(
+        keypoints_data, person_bbox, CONFIDENCE_THRESHOLD
+    )
+    collapsed_ground = _collapsed_on_ground_do_not_treat_as_standing_bend(
+        person_bbox, shoulder_mid[1], hip_mid[1], ratio
+    )
+    has_long_vertical_leg_support = _has_long_vertical_leg_support(
+        keypoints_data, CONFIDENCE_THRESHOLD, h
+    )
+    floor_body_spread = _has_floor_body_spread(
+        keypoints_data, person_bbox, CONFIDENCE_THRESHOLD
+    )
 
     ang = 12.0 * sens01
     r_loose = 0.12 * sens01
@@ -792,18 +885,42 @@ def is_person_in_fall_pose(
     condition_sprawl = (
         current_angle < (52 + ang * 0.45)
         and 0.78 <= ratio <= 1.30
-        and _collapsed_on_ground_do_not_treat_as_standing_bend(
-            person_bbox, shoulder_mid[1], hip_mid[1], ratio
-        )
+        and collapsed_ground
+    )
+    condition_floor_body = (
+        collapsed_ground
+        and floor_body_spread
+        and 0.78 <= ratio <= 1.48
+        and not has_long_vertical_leg_support
     )
 
-    would_fall = bool(condition1 or condition2 or condition3 or condition_sprawl)
+    would_fall = bool(
+        head_floor_fall
+        or condition1
+        or condition2
+        or condition3
+        or condition_sprawl
+        or condition_floor_body
+    )
     if not would_fall:
         return False
 
-    collapsed_ground = _collapsed_on_ground_do_not_treat_as_standing_bend(
-        person_bbox, shoulder_mid[1], hip_mid[1], ratio
+    floor_like_pose = collapsed_ground or (
+        ratio >= 1.75 and current_angle < min(72.0, 58.0 + ang * 0.45)
     )
+    floor_prone_without_leg_support = (
+        collapsed_ground
+        and (head_floor_fall or floor_body_spread)
+        and 0.80 <= ratio <= 1.35
+        and not has_long_vertical_leg_support
+    )
+    if floor_prone_without_leg_support:
+        return True
+
+    if not floor_like_pose and _pelvis_above_feet_suppresses_fall(
+        keypoints_data, person_bbox, CONFIDENCE_THRESHOLD
+    ):
+        return False
 
     if _horizontal_torso_but_limbs_below_hips_not_fall(
         keypoints_data,
@@ -817,27 +934,24 @@ def is_person_in_fall_pose(
     ):
         return False
 
-    # On the ground, one leg may be kicked up: averaged ankles still look "below" hips like a
-    # stoop — these suppressors are for standing weight-bearing only.
-    if not collapsed_ground:
-        if _likely_squat_crouch_or_sit_not_fall(
-            keypoints_data, CONFIDENCE_THRESHOLD, h, ratio
-        ):
-            return False
+    if _likely_squat_crouch_or_sit_not_fall(
+        keypoints_data, CONFIDENCE_THRESHOLD, h, ratio
+    ):
+        return False
 
-        if _likely_stoop_straight_legs_not_fall(
-            keypoints_data, CONFIDENCE_THRESHOLD, h, ratio
-        ):
-            return False
+    if _likely_stoop_straight_legs_not_fall(
+        keypoints_data, CONFIDENCE_THRESHOLD, h, ratio
+    ):
+        return False
 
-        if _likely_standing_bent_weight_bearing_not_fall(
-            keypoints_data,
-            CONFIDENCE_THRESHOLD,
-            h,
-            shoulder_mid[1],
-            ratio,
-        ):
-            return False
+    if _likely_standing_bent_weight_bearing_not_fall(
+        keypoints_data,
+        CONFIDENCE_THRESHOLD,
+        h,
+        shoulder_mid[1],
+        ratio,
+    ):
+        return False
 
     return True
 
