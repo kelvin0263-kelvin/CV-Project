@@ -2,6 +2,9 @@
 
 Entrance-Analysis-System is a full-stack computer-vision monitoring dashboard for camera streams and uploaded videos. It combines a FastAPI backend, a Vite/React frontend, PostgreSQL persistence, WebSocket video streaming, and YOLO-based analysis for people counting, building occupancy, dress-code violations, and fall detection.
 
+## Demo Video
+
+[Watch Demo Video](https://drive.google.com/file/d/1gc7Vm0vKuzpe4zXajgKKWc-f1Y-wRE3h/view?usp=sharing)
 ## Features
 
 - Authenticated monitoring dashboard with admin and staff users
