@@ -5,6 +5,11 @@ Entrance-Analysis-System is a full-stack computer-vision monitoring dashboard fo
 ## Demo Video
 
 [Watch Demo Video](https://drive.google.com/file/d/1gc7Vm0vKuzpe4zXajgKKWc-f1Y-wRE3h/view?usp=sharing)
+
+## Project Poster
+
+<img src="Project-Poster.jpg" width="700">
+
 ## Features
 
 - Authenticated monitoring dashboard with admin and staff users
